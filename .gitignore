@@ -1,0 +1,24 @@
+# Build directories and outputs
+build/
+*.bin
+*.elf
+*.o
+*.a
+*.so
+*.d
+
+# Virtual disk images
+*.img
+*.iso
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Editor and system files
+.vscode/
+.idea/
+*.swp
+*~
+*.log
+

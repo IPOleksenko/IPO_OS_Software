@@ -5,8 +5,12 @@
 .PHONY: applications apps clean-applications clean-apps
 
 APPS_SRCS_RAW    := $(shell find $(APPS_DIR) -maxdepth 2 -name "*.c" -type f)
-GENERIC_APP_SRCS := $(filter-out $(APPS_DIR)/tcc/% $(APPS_DIR)/lua/% $(APPS_DIR)/micropython/% $(APPS_DIR)/nasm/% $(APPS_DIR)/doom/% $(APPS_DIR)/lib/% $(APPS_DIR)/dltest/plugin_sample.c, $(APPS_SRCS_RAW))
-APPS_BINS        := $(patsubst $(APPS_DIR)/%.c, $(APPS_BUILD)/%.bin, $(GENERIC_APP_SRCS)) $(APPS_BUILD)/tcc/tcc.bin $(APPS_BUILD)/doom/doom.bin
+GENERIC_APP_SRCS := $(filter-out $(APPS_DIR)/tcc/% $(APPS_DIR)/lua/% $(APPS_DIR)/micropython/% $(APPS_DIR)/nasm/% $(APPS_DIR)/doom/% $(APPS_DIR)/lib/% $(APPS_DIR)/dltest/plugin_sample.c $(APPS_DIR)/binfmt/% $(APPS_DIR)/elf_loader/%, $(APPS_SRCS_RAW))
+APPS_BINS        := $(patsubst $(APPS_DIR)/%.c, $(APPS_BUILD)/%.bin, $(GENERIC_APP_SRCS)) \
+                    $(APPS_BUILD)/tcc/tcc.bin \
+                    $(APPS_BUILD)/doom/doom.bin \
+                    $(APPS_BUILD)/binfmt/binfmt.bin \
+                    $(APPS_BUILD)/elf_loader/elf_loader.bin
 
 APP_ENTRY_OBJ    := $(APPS_BUILD)/entry.o
 
@@ -31,11 +35,10 @@ $(APPS_BUILD)/tcc/tcc.o: $(APPS_DIR)/tcc/tcc.c $(APPS_DIR)/tcc/libtcc.c $(APPS_D
 $(APPS_BUILD)/tcc/tcc.bin: $(APPS_BUILD)/tcc/tcc.o $(APPS_BUILD)/tcc/setjmp.o $(APP_ENTRY_OBJ) $(APP_LIB_A) $(USER_LIBC_A) $(USER_LIBM_A)
 	@mkdir -p $(dir $@)
 	@echo "[applications] Building official TinyCC: $(APPS_DIR)/tcc/tcc.c → $@"
-	@$(CC) $(APPS_CFLAGS) -no-pie -Wl,-T,$(APPS_DIR)/app.ld \
+	@$(CC) $(APPS_CFLAGS) -no-pie -Wl,-T,$(APPS_DIR)/app.ld -Wl,-q \
 		$(APP_ENTRY_OBJ) $(APPS_BUILD)/tcc/tcc.o $(APPS_BUILD)/tcc/setjmp.o \
 		-Wl,--start-group $(USER_LIBC_A) $(USER_LIBM_A) $(APP_LIB_A) -lgcc -Wl,--end-group -o $@.elf -nostdlib -nostartfiles 2>&1 | grep -v "PIE\|relocation" || true
-	@$(OBJCOPY) --set-section-flags .bss=alloc,load,contents \
-		-j .text -j .rodata -j .data -j .bss -O binary $@.elf $@
+	@cp $@.elf $@
 	@rm -f $@.elf
 	@SIZE=$$(stat -c%s "$@" 2>/dev/null || stat -f%z "$@" 2>/dev/null); \
 	echo "[applications] ✓ Created: $@ ($$SIZE bytes)"
@@ -139,10 +142,54 @@ $(APPS_BUILD)/doom/%.o: $(APPS_DIR)/doom/%.c
 $(APPS_BUILD)/doom/doom.bin: $(DOOM_OBJS) $(APP_ENTRY_OBJ) $(APP_LIB_A) $(USER_LIBC_A) $(USER_LIBM_A)
 	@mkdir -p $(dir $@)
 	@echo "[applications] Building DOOM: $(DOOM_DIR) → $@"
-	@$(CC) $(DOOM_CFLAGS) -Wl,-T,$(APPS_DIR)/app.ld \
+	@$(CC) $(DOOM_CFLAGS) -Wl,-T,$(APPS_DIR)/app.ld -Wl,-q \
 		$(APP_ENTRY_OBJ) $(DOOM_OBJS) \
 		-Wl,--allow-multiple-definition \
 		-Wl,--start-group $(USER_LIBC_A) $(USER_LIBM_A) $(APP_LIB_A) -lgcc -Wl,--end-group -o $@.elf -nostdlib -nostartfiles 2>&1 | grep -v "PIE\|relocation" || true
+	@cp $@.elf $@
+	@rm -f $@.elf
+	@SIZE=$$(stat -c%s "$@" 2>/dev/null || stat -f%z "$@" 2>/dev/null); \
+	echo "[applications] ✓ Created: $@ ($$SIZE bytes)"
+
+# ------------------------------------------------------------------------------
+# Dynamic Binary Format Manager (binfmt)
+# ------------------------------------------------------------------------------
+$(APPS_BUILD)/binfmt/binfmt_entry.o: $(APPS_DIR)/binfmt/binfmt_entry.s
+	@mkdir -p $(dir $@)
+	$(CC) -m32 -fno-pic -fno-pie -c $< -o $@
+
+$(APPS_BUILD)/binfmt/binfmt.o: $(APPS_DIR)/binfmt/binfmt.c
+	@mkdir -p $(dir $@)
+	$(CC) -c $< -o $@ -std=gnu11 -g $(APPS_CFLAGS)
+
+$(APPS_BUILD)/binfmt/binfmt.bin: $(APPS_BUILD)/binfmt/binfmt.o $(APPS_BUILD)/binfmt/binfmt_entry.o $(APPS_DIR)/binfmt/binfmt.ld $(APP_LIB_A) $(USER_LIBC_A) $(USER_LIBM_A)
+	@mkdir -p $(dir $@)
+	@echo "[applications] Building binfmt: $< → $@"
+	@$(CC) $(APPS_CFLAGS) -pie -Wl,--no-dynamic-linker -Wl,-z,notext -Wl,-T,$(APPS_DIR)/binfmt/binfmt.ld \
+		$(APPS_BUILD)/binfmt/binfmt_entry.o $< \
+		-Wl,--allow-multiple-definition \
+		-Wl,--start-group $(USER_LIBC_A) $(USER_LIBM_A) $(APP_LIB_A) -lgcc -Wl,--end-group -o $@.elf -nostdlib -nostartfiles 2>&1 | grep -v "PIE\|relocation\|RWX\|build-id" || true
+	@$(OBJCOPY) --set-section-flags .bss=alloc,load,contents \
+		-j .text -j .rodata -j .data -j .rel.dyn -j .bss -O binary $@.elf $@
+	@rm -f $@.elf
+	@SIZE=$$(stat -c%s "$@" 2>/dev/null || stat -f%z "$@" 2>/dev/null); \
+	echo "[applications] ✓ Created: $@ ($$SIZE bytes)"
+
+# ------------------------------------------------------------------------------
+# Position-Independent Bare-Metal ELF Runner (elf_loader)
+# ------------------------------------------------------------------------------
+$(APPS_BUILD)/elf_loader/loader_entry.o: $(APPS_DIR)/elf_loader/loader_entry.s
+	@mkdir -p $(dir $@)
+	$(CC) -m32 -c $< -o $@ -fno-pic -fno-pie
+
+$(APPS_BUILD)/elf_loader/elf_loader.o: $(APPS_DIR)/elf_loader/elf_loader.c
+	@mkdir -p $(dir $@)
+	$(CC) -m32 -O2 -fno-pic -fno-pie -fno-jump-tables -fno-stack-protector -ffreestanding -fno-builtin -nostdlib -nostdinc -I$(INCLUDE_DIR) -c $< -o $@
+
+$(APPS_BUILD)/elf_loader/elf_loader.bin: $(APPS_BUILD)/elf_loader/loader_entry.o $(APPS_BUILD)/elf_loader/elf_loader.o $(APPS_DIR)/elf_loader/loader.ld
+	@mkdir -p $(dir $@)
+	@echo "[applications] Building elf_loader: $< → $@"
+	@$(LD) -m elf_i386 -T $(APPS_DIR)/elf_loader/loader.ld $(APPS_BUILD)/elf_loader/loader_entry.o $(APPS_BUILD)/elf_loader/elf_loader.o $(LIBGCC_A) -o $@.elf
 	@$(OBJCOPY) --set-section-flags .bss=alloc,load,contents \
 		-j .text -j .rodata -j .data -j .bss -O binary $@.elf $@
 	@rm -f $@.elf
@@ -150,7 +197,7 @@ $(APPS_BUILD)/doom/doom.bin: $(DOOM_OBJS) $(APP_ENTRY_OBJ) $(APP_LIB_A) $(USER_L
 	echo "[applications] ✓ Created: $@ ($$SIZE bytes)"
 
 # ------------------------------------------------------------------------------
-# Generic Userland Applications
+# Generic Userland Applications (ELF32)
 # ------------------------------------------------------------------------------
 $(APPS_BUILD)/%.o: $(APPS_DIR)/%.c
 	@mkdir -p $(dir $@)
@@ -159,7 +206,7 @@ $(APPS_BUILD)/%.o: $(APPS_DIR)/%.c
 $(APPS_BUILD)/%.bin: $(APPS_BUILD)/%.o $(APP_ENTRY_OBJ) $(APP_LIB_A) $(USER_LIBC_A) $(USER_LIBM_A)
 	@mkdir -p $(dir $@)
 	@echo "[applications] Building: $*.c → $@"
-	@$(CC) $(APPS_CFLAGS) -no-pie -Wl,-T,$(APPS_DIR)/app.ld \
+	@$(CC) $(APPS_CFLAGS) -no-pie -Wl,-T,$(APPS_DIR)/app.ld -Wl,-q \
 		$(APP_ENTRY_OBJ) $< \
 		-Wl,--allow-multiple-definition \
 		-Wl,--start-group $(USER_LIBC_A) $(USER_LIBM_A) $(APP_LIB_A) -lgcc -Wl,--end-group -o $@.elf -nostdlib -nostartfiles 2>&1 | grep -v "PIE\|relocation" || true

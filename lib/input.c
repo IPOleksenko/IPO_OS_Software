@@ -99,6 +99,36 @@ void mouse_get_state(mouse_state_t *out_state) {
     ipo_syscall(IPO_SYSCALL_MOUSE_GET_STATE, 1u, &arg);
 }
 
+void mouse_get_position(int32_t *out_x, int32_t *out_y) {
+    mouse_state_t ms;
+    mouse_get_state(&ms);
+    if (out_x) *out_x = ms.x;
+    if (out_y) *out_y = ms.y;
+}
+
+bool mouse_is_pressed(int button) {
+    mouse_state_t ms;
+    mouse_get_state(&ms);
+    if (button == MOUSE_BTN_LEFT) return ms.left_button;
+    if (button == MOUSE_BTN_RIGHT) return ms.right_button;
+    if (button == MOUSE_BTN_MIDDLE) return ms.middle_button;
+    return (ms.buttons & (uint32_t)button) != 0;
+}
+
+bool mouse_is_in_region(int32_t x, int32_t y, int32_t w, int32_t h) {
+    mouse_state_t ms;
+    mouse_get_state(&ms);
+    return (ms.x >= x && ms.x < (x + w) && ms.y >= y && ms.y < (y + h));
+}
+
+bool mouse_is_clicked_in_region(int32_t x, int32_t y, int32_t w, int32_t h, int button) {
+    return mouse_is_in_region(x, y, w, h) && mouse_is_pressed(button);
+}
+
+bool mouse_check_click(int32_t x, int32_t y, int32_t w, int32_t h) {
+    return mouse_is_clicked_in_region(x, y, w, h, MOUSE_BTN_LEFT);
+}
+
 /* Dynamic Keymap API */
 void dynamic_keymap_set_app_mode(bool is_app) {
     (void)is_app;

@@ -294,7 +294,7 @@ int main(int argc, char **argv) {
     const char *final_out = outfile ? outfile : "a.out";
     dyn_str_t link_cmd;
     dyn_str_init(&link_cmd);
-    dyn_str_append(&link_cmd, "ld -m elf_i386");
+    dyn_str_append(&link_cmd, "ld -m elf_i386 --emit-relocs");
 
     FILE *fld = fopen("/lib/linker.ld", "rb");
     if (fld) {
@@ -360,11 +360,12 @@ int main(int argc, char **argv) {
     if (flag_verbose) printf("%s\n", link_cmd.data);
     int ret = system(link_cmd.data);
     if (ret == 127 || ret < 0) {
-        // Fallback to /applications/ld if ld was not in path
+        /* Fallback: replace leading "ld" with "/applications/ld" */
         dyn_str_t fallback_link;
         dyn_str_init(&fallback_link);
-        dyn_str_append(&fallback_link, "/applications/");
-        dyn_str_append(&fallback_link, link_cmd.data);
+        dyn_str_append(&fallback_link, "/applications/ld");
+        /* skip the 2 chars "ld" at start, keep flags and arguments */
+        dyn_str_append(&fallback_link, link_cmd.data + 2);
         ret = system(fallback_link.data);
         dyn_str_free(&fallback_link);
     }

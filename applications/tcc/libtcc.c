@@ -970,6 +970,10 @@ LIBTCCAPI int tcc_set_output_type(TCCState *s, int output_type)
 #endif
     s->output_type = output_type;
 
+    /* IPO_OS: always link statically — no dynamic linker available */
+    if (output_type == TCC_OUTPUT_EXE)
+        s->static_link = 1;
+
     if (!s->nostdinc) {
         /* default include paths */
         /* -isystem paths have already been handled */
@@ -1204,7 +1208,12 @@ static int guess_filetype(const char *filename)
                 filetype = AFF_TYPE_ASM;
             else if (!PATHCMP(ext, "c")
                      || !PATHCMP(ext, "h")
-                     || !PATHCMP(ext, "i"))
+                     || !PATHCMP(ext, "i")
+                     || !PATHCMP(ext, "cpp")
+                     || !PATHCMP(ext, "cc")
+                     || !PATHCMP(ext, "cxx")
+                     || !PATHCMP(ext, "C")
+                     || !PATHCMP(ext, "CPP"))
                 filetype = AFF_TYPE_C;
             else
                 filetype |= AFF_TYPE_BIN;

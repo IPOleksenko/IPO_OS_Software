@@ -1,0 +1,4 @@
+# IPO_OS Autorun Script
+# Automatically registers executable formats on boot
+/applications/binfmt
+

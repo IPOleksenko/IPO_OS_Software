@@ -8,6 +8,7 @@ headers, runtime scripts, and fonts.
 import argparse
 import os
 import sys
+import subprocess
 from pathlib import Path
 
 # Add current tools directory to sys.path so disk_editor can be imported

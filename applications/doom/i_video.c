@@ -67,6 +67,10 @@ void I_InitGraphics(void) {
 
     /* Switch to 320x200 256-color Mode 13h */
     vga_set_mode_13h();
+    /* Hide overlay Close button in DOOM so it does not obstruct the HUD / game view */
+    vga_hide_close_button();
+    /* Hide overlay mouse cursor since DOOM renders full screen */
+    vga_hide_overlay_cursor();
     keyboard_set_app_input_mode(true);
     keyboard_flush_app_queue();
 
@@ -103,6 +107,9 @@ void I_ShutdownGraphics(void) {
     keyboard_flush_queue();
     keyboard_flush_app_queue();
     keyboard_flush_hardware();
+
+    /* Restore overlay visibility defaults */
+    vga_set_overlay_flags(VGA_OVERLAY_SHOW_ALL);
 
     vga_set_mode_text();
 

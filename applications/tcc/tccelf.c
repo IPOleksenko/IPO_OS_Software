@@ -112,7 +112,8 @@ ST_FUNC void tccelf_new(TCCState *s)
 #endif
 
 #ifndef ELF_OBJ_ONLY
-    if (NULL == s->elfint && s1->output_type != TCC_OUTPUT_OBJ) {
+    /* IPO_OS: do not set ELF interpreter for static executables */
+    if (NULL == s->elfint && s1->output_type != TCC_OUTPUT_OBJ && !s1->static_link) {
         const char *p = CONFIG_TCC_ELFINTERP;
 #if defined TCC_TARGET_ARM && defined CONFIG_TCC_ELFINTERP_ARMHF
         if (s->float_abi == ARM_HARD_FLOAT)
@@ -2217,6 +2218,10 @@ static int set_sec_sizes(TCCState *s1)
                     if (s1->sections[s->sh_info]->sh_flags & SHF_EXECINSTR)
                         textrel += count;
                 }
+            } else if (s1->static_link && s->data_offset > 0) {
+                /* IPO_OS: retain input relocations for static EXE so
+                   elf_loader can patch staging buffers at load time */
+                s->sh_size = s->data_offset;
             }
         } else if ((s->sh_flags & SHF_ALLOC)
 #ifdef TCC_TARGET_ARM

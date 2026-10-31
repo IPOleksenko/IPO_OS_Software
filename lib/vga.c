@@ -40,9 +40,35 @@ void vga_gfx_set_palette(uint8_t idx, uint8_t r, uint8_t g, uint8_t b) {
     ipo_syscall(IPO_SYSCALL_VGA_SET_PALETTE, 4u, args);
 }
 
+void vga_set_overlay_flags(uint32_t flags) {
+    uint32_t arg = flags;
+    ipo_syscall(IPO_SYSCALL_VGA_SET_OVERLAY_FLAGS, 1u, &arg);
+}
+
+uint32_t vga_get_overlay_flags(void) {
+    return (uint32_t)ipo_syscall(IPO_SYSCALL_VGA_GET_OVERLAY_FLAGS, 0u, NULL);
+}
+
+void vga_hide_close_button(void) {
+    vga_set_overlay_flags(vga_get_overlay_flags() | VGA_OVERLAY_HIDE_BUTTON);
+}
+
+void vga_show_close_button(void) {
+    vga_set_overlay_flags(vga_get_overlay_flags() & ~VGA_OVERLAY_HIDE_BUTTON);
+}
+
+void vga_hide_overlay_cursor(void) {
+    vga_set_overlay_flags(vga_get_overlay_flags() | VGA_OVERLAY_HIDE_CURSOR);
+}
+
+void vga_show_overlay_cursor(void) {
+    vga_set_overlay_flags(vga_get_overlay_flags() & ~VGA_OVERLAY_HIDE_CURSOR);
+}
+
 void vga_gfx_flip(const uint8_t *buf) {
     if (buf) {
-        memcpy((void *)0xA0000, buf, 320 * 200);
+        uint32_t args[2] = { 2u, (uint32_t)(uintptr_t)buf };
+        ipo_syscall(IPO_SYSCALL_VGA_SET_MODE, 2u, args);
     }
 }
 

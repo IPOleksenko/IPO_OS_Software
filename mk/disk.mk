@@ -57,7 +57,7 @@ format-disk: require-disk create-disk
 # ------------------------------------------------------------------------------
 load-apps: require-disk font-databases
 	@echo "[disk] Loading applications onto target disk: $(DISK)"
-	@$(PYTHON) $(TOOLS_DIR)/load_applications.py --disk "$(DISK)" --start-lba $(START_LBA)
+	@$(PYTHON) $(TOOLS_DIR)/load_applications.py --disk "$(DISK)" --start-lba $(START_LBA) --format
 
 install-disk: load-apps
 make-apps: load-apps

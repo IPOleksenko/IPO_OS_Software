@@ -83,7 +83,6 @@ int main(int argc, char **argv) {
     opt.w = WIN_W;
     opt.h = WIN_H;
     opt.decor_style = WM_DECOR_DEFAULT;
-    opt.event_cb = on_window_event;
 
     wm_window_t *win = wm_create_window(&opt);
     if (!win) return 1;
@@ -121,13 +120,22 @@ int main(int argc, char **argv) {
     float angle = 0.0f;
 
     while (app_running && wm_session_active() && !system_is_interrupted() && wm_is_window_valid(win)) {
-        uint32_t frame_start = timer_millis();
+        wm_event_t ev;
+        while (wm_poll_event(win, &ev)) {
+            on_window_event(win, ev.type, ev.data);
+        }
+        if (!app_running || !wm_is_window_valid(win)) break;
 
-        gl_make_current(gl);
-        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        uint32_t frame_start = timer_millis();
 
         int cur_w = (win && win->w > 0) ? (int)win->w : WIN_W;
         int cur_h = (win && win->h > 0) ? (int)win->h : WIN_H;
+        if (cur_w != gl->width || cur_h != gl->height) {
+            gl_resize_context(gl, cur_w, cur_h);
+        }
+
+        gl_make_current(gl);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
         glViewport(0, 0, cur_w, cur_h);
 
         glMatrixMode(GL_PROJECTION);
@@ -158,10 +166,9 @@ int main(int argc, char **argv) {
         gl_swap_buffers(gl, win);
         angle += 2.0f;
 
-        /* Limit to 30 FPS */
-        do {
-            ipo_syscall(IPO_SYSCALL_PROCESS_YIELD, 0, NULL);
-        } while (timer_elapsed_ms(frame_start) < 33);
+        /* Uncapped frame processing: cooperative single yield per frame */
+        (void)frame_start;
+        ipo_syscall(IPO_SYSCALL_PROCESS_YIELD, 0, NULL);
     }
 
     gl_destroy_context(gl);

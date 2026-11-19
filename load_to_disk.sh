@@ -17,8 +17,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 if [ $# -eq 0 ] && [ -z "${DISK:-}" ] && [ -z "${IPO_DISK:-}" ]; then
     echo "================================================================="
-    echo " ОШИБКА: Путь к образу диска не указан!"
-    echo " Укажите путь к целевому диску явно:"
+    echo " ERROR: Target disk image path was not specified."
+    echo " Specify the target disk explicitly:"
     echo "   ./load_to_disk.sh /path/to/disk.img"
     echo "   ./load_to_disk.sh /path/to/disk.img --format"
     echo "   ./load_to_disk.sh --disk /path/to/disk.img"

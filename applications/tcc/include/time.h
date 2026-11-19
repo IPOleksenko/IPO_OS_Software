@@ -3,7 +3,7 @@
 
 #include <stdint.h>
 
-typedef long time_t;
+typedef int64_t time_t;
 
 struct tm {
     int tm_sec;

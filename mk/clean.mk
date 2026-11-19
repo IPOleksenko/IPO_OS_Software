@@ -1,10 +1,10 @@
 # ==============================================================================
-# IPO_Applications - Clean Rules
+# IPO_OS_Software - Clean Rules
 # ==============================================================================
 
-.PHONY: clean clean-all clean-lib clean-applications clean-toolchain
+.PHONY: clean clean-all clean-lib clean-drivers clean-applications clean-toolchain
 
-clean: clean-lib clean-applications clean-toolchain
+clean: clean-lib clean-drivers clean-applications clean-toolchain
 	@echo "[clean] Cleaning build artifacts..."
 	@rm -rf $(BUILD)
 

@@ -24,9 +24,31 @@
 #include <system/state.h>
 #include <driver/input/keyboard.h>
 #include <driver/input/mouse.h>
+#include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "freeglut_teapot_data.h"
+
+static char *teapot_alloc_printf(const char *fmt, ...) {
+    va_list ap, aq;
+    va_start(ap, fmt);
+    va_copy(aq, ap);
+    int len = vsnprintf(NULL, 0, fmt, aq);
+    va_end(aq);
+    if (len < 0) {
+        va_end(ap);
+        return NULL;
+    }
+    char *buf = (char *)malloc((size_t)len + 1u);
+    if (!buf) {
+        va_end(ap);
+        return NULL;
+    }
+    vsnprintf(buf, (size_t)len + 1u, fmt, ap);
+    va_end(ap);
+    return buf;
+}
 
 #define DEFAULT_WIN_W 200
 #define DEFAULT_WIN_H 150
@@ -118,9 +140,7 @@ static void on_window_event(wm_window_t *w, uint32_t event, uint32_t data) {
         app_running = false;
     } else if (event == WM_EVENT_KEY_DOWN) {
         uint8_t sc = (uint8_t)(data & 0xFF);
-        if (sc == SC_ESC || sc == SC_Q) {
-            app_running = false;
-        } else if (sc == SC_LEFT) {
+        if (sc == SC_LEFT) {
             rot_y -= 6.0f;
             auto_spin = false;
         } else if (sc == SC_RIGHT) {
@@ -466,9 +486,16 @@ static void draw_ground_pedestal(int vp_w, int vp_h) {
     project_point(0.0f, -1.35f, 0.0f, mv, pj, half_w, half_h, &v_center);
     v_center.color[0] = 0.50f; v_center.color[1] = 0.52f; v_center.color[2] = 0.56f; v_center.color[3] = 1.0f;
 
-    gl_vertex_t v_top[11];
-    gl_vertex_t v_bot[11];
-    for (int i = 0; i <= 10; i++) {
+    int ped_n = (int)(sizeof(ped_table) / sizeof(ped_table[0]));
+    int ped_segs = ped_n - 1;
+    gl_vertex_t *v_top = (gl_vertex_t *)malloc((size_t)ped_n * sizeof(gl_vertex_t));
+    gl_vertex_t *v_bot = (gl_vertex_t *)malloc((size_t)ped_n * sizeof(gl_vertex_t));
+    if (!v_top || !v_bot) {
+        free(v_top);
+        free(v_bot);
+        return;
+    }
+    for (int i = 0; i <= ped_segs; i++) {
         float x = ped_table[i][0] * 2.8f;
         float z = ped_table[i][1] * 2.8f;
         project_point(x, -1.35f, z, mv, pj, half_w, half_h, &v_top[i]);
@@ -478,21 +505,27 @@ static void draw_ground_pedestal(int vp_w, int vp_h) {
     }
 
     /* Top fan - solid circular pedestal surface */
-    for (int i = 0; i < 10; i++) {
+    for (int i = 0; i < ped_segs; i++) {
         rasterize_fast_gouraud(ctx, &v_center, &v_top[i], &v_top[i+1], NULL, NULL, NULL);
     }
     /* Side rim */
-    for (int i = 0; i < 10; i++) {
+    for (int i = 0; i < ped_segs; i++) {
         rasterize_fast_gouraud(ctx, &v_top[i], &v_bot[i], &v_top[i+1], NULL, NULL, NULL);
         rasterize_fast_gouraud(ctx, &v_top[i+1], &v_bot[i], &v_bot[i+1], NULL, NULL, NULL);
     }
+    free(v_top);
+    free(v_bot);
 }
 
-static float s_teapot_verts[530][3];
+static float (*s_teapot_verts)[3] = NULL;
 static bool s_teapot_inited = false;
 
 static void init_teapot_mesh(void) {
     if (s_teapot_inited) return;
+    if (!s_teapot_verts) {
+        s_teapot_verts = (float (*)[3])malloc((size_t)numVertices * sizeof(*s_teapot_verts));
+        if (!s_teapot_verts) return;
+    }
     for (int i = 0; i < numVertices; i++) {
         s_teapot_verts[i][0] = vertices[i][0] * 0.4334f - 0.139f;
         s_teapot_verts[i][1] = vertices[i][1] * 0.4334f - 0.91f;
@@ -501,10 +534,15 @@ static void init_teapot_mesh(void) {
     s_teapot_inited = true;
 }
 
-static gl_vertex_t s_cached_shadow_verts[530];
+static gl_vertex_t *s_cached_shadow_verts = NULL;
 
 static void draw_shadow_mesh(int vp_w, int vp_h, float rot_y, const float shadow_mat[16]) {
     init_teapot_mesh();
+    if (!s_teapot_inited) return;
+    if (!s_cached_shadow_verts) {
+        s_cached_shadow_verts = (gl_vertex_t *)malloc((size_t)numVertices * sizeof(gl_vertex_t));
+        if (!s_cached_shadow_verts) return;
+    }
     GLContext *ctx = gl_get_current_context();
     if (!ctx) return;
 
@@ -555,11 +593,19 @@ static void draw_shadow_mesh(int vp_w, int vp_h, float rot_y, const float shadow
     }
 }
 
-static gl_vertex_t s_cached_verts[530];
-static float s_normal_colors[530][4];
+static gl_vertex_t *s_cached_verts = NULL;
+static float (*s_normal_colors)[4] = NULL;
 
 static void draw_teapot_mesh(int vp_w, int vp_h) {
     init_teapot_mesh();
+    if (!s_teapot_inited) return;
+    if (!s_cached_verts) {
+        s_cached_verts = (gl_vertex_t *)malloc((size_t)numVertices * sizeof(gl_vertex_t));
+    }
+    if (!s_normal_colors) {
+        s_normal_colors = (float (*)[4])malloc((size_t)numNormals * sizeof(*s_normal_colors));
+    }
+    if (!s_cached_verts || !s_normal_colors) return;
     GLContext *ctx = gl_get_current_context();
     if (!ctx) return;
 
@@ -665,6 +711,36 @@ static void draw_teapot_mesh(int vp_w, int vp_h) {
     }
 }
 
+/**
+ * Render a custom 3D viewport crosshair cursor into the teapot client buffer.
+ */
+static void draw_teapot_cursor(uint8_t *buf, uint16_t bw, uint16_t bh,
+                               int cx, int cy, bool active) {
+    if (!buf) return;
+    uint8_t accent = active ? 14u : 11u; /* Gold while dragging, cyan while hovering */
+    static const int arm_offsets[] = { -5, -4, -3, -2, 2, 3, 4, 5 };
+    for (size_t i = 0; i < sizeof(arm_offsets) / sizeof(arm_offsets[0]); i++) {
+        int d = arm_offsets[i];
+        wm_buf_put_pixel(buf, bw, bh, cx + d, cy - 1, 0u);
+        wm_buf_put_pixel(buf, bw, bh, cx + d, cy + 1, 0u);
+        wm_buf_put_pixel(buf, bw, bh, cx + d, cy, accent);
+
+        wm_buf_put_pixel(buf, bw, bh, cx - 1, cy + d, 0u);
+        wm_buf_put_pixel(buf, bw, bh, cx + 1, cy + d, 0u);
+        wm_buf_put_pixel(buf, bw, bh, cx, cy + d, accent);
+    }
+    wm_buf_put_pixel(buf, bw, bh, cx - 6, cy, 0u);
+    wm_buf_put_pixel(buf, bw, bh, cx + 6, cy, 0u);
+    wm_buf_put_pixel(buf, bw, bh, cx, cy - 6, 0u);
+    wm_buf_put_pixel(buf, bw, bh, cx, cy + 6, 0u);
+
+    wm_buf_put_pixel(buf, bw, bh, cx - 1, cy - 1, accent);
+    wm_buf_put_pixel(buf, bw, bh, cx + 1, cy - 1, accent);
+    wm_buf_put_pixel(buf, bw, bh, cx - 1, cy + 1, accent);
+    wm_buf_put_pixel(buf, bw, bh, cx + 1, cy + 1, accent);
+    wm_buf_put_pixel(buf, bw, bh, cx, cy, 15u);
+}
+
 int main(int argc, char **argv) {
     (void)argc; (void)argv;
 
@@ -679,10 +755,10 @@ int main(int argc, char **argv) {
     opt.w = DEFAULT_WIN_W;
     opt.h = DEFAULT_WIN_H;
     opt.decor_style = WM_DECOR_DEFAULT;
-    opt.event_cb = on_window_event;
 
     wm_window_t *win = wm_create_window(&opt);
     if (!win) return 1;
+    wm_set_cursor_visible(win, false);
 
     int cur_w = win->w;
     int cur_h = win->h;
@@ -734,7 +810,6 @@ int main(int argc, char **argv) {
 
     glClearColor(0.06f, 0.06f, 0.10f, 1.0f);
 
-    uint32_t last_mat_switch = timer_millis();
     bool mouse_dragging = false;
     int last_mx = 0, last_my = 0;
 
@@ -744,7 +819,11 @@ int main(int argc, char **argv) {
 
     /* Uncapped render loop */
     while (app_running && wm_session_active() && !system_is_interrupted() && wm_is_window_valid(win)) {
-        uint32_t frame_start = timer_millis();
+        wm_event_t ev;
+        while (wm_poll_event(win, &ev)) {
+            on_window_event(win, ev.type, ev.data);
+        }
+        if (!app_running || !wm_is_window_valid(win)) break;
 
         /* Dynamic Window Resize Handler */
         if (win->w != cur_w || win->h != cur_h) {
@@ -851,9 +930,11 @@ int main(int argc, char **argv) {
                    (int)(current_fps + 0.5f), t1-t0, t2-t1, t3-t2, t4-t3, t4-t0);
             fps_frame_count = 0;
             fps_timer = now;
-            char title_buf[64];
-            snprintf(title_buf, sizeof(title_buf), "Utah Teapot [%d FPS]", (int)(current_fps + 0.5f));
-            wm_set_title(win, title_buf);
+            char *title_buf = teapot_alloc_printf("Utah Teapot [%d FPS]", (int)(current_fps + 0.5f));
+            if (title_buf) {
+                wm_set_title(win, title_buf);
+                free(title_buf);
+            }
         }
 
         /* Overlay Status Bar / Controls Help on bottom of window */
@@ -861,18 +942,44 @@ int main(int argc, char **argv) {
             int bar_h = 12;
             int bar_y = cur_h - bar_h;
             wm_buf_fill_rect(win->framebuf, cur_w, cur_h, 0, bar_y, cur_w, bar_h, 16); /* Dark gray */
-            char status_buf[96];
-            snprintf(status_buf, sizeof(status_buf), "%d FPS|Shd:%s|Lgt:%s",
-                     (int)(current_fps + 0.5f),
-                     shadows_enabled ? "ON" : "OFF",
-                     light1_enabled ? "DUAL" : "SINGLE");
-            wm_buf_draw_string(win->framebuf, cur_w, cur_h, 4, bar_y + 2, status_buf, 15); /* White */
+            char *status_buf = teapot_alloc_printf("%d FPS|Shd:%s|Lgt:%s",
+                                                   (int)(current_fps + 0.5f),
+                                                   shadows_enabled ? "ON" : "OFF",
+                                                   light1_enabled ? "DUAL" : "SINGLE");
+            if (status_buf) {
+                wm_buf_draw_string(win->framebuf, cur_w, cur_h, 4, bar_y + 2, status_buf, 15); /* White */
+                free(status_buf);
+            }
         }
+
+        /* Draw custom cursor only when this window holds WM focus */
+        if (win->framebuf && wm_get_focused() == win) {
+            mouse_state_t cur_ms;
+            mouse_get_state(&cur_ms);
+            int local_x = (int)cur_ms.x - (int)win->x;
+            int local_y = (int)cur_ms.y - (int)win->y;
+            if (local_x >= 0 && local_x < cur_w &&
+                local_y >= 0 && local_y < cur_h) {
+                draw_teapot_cursor(win->framebuf, (uint16_t)cur_w, (uint16_t)cur_h,
+                                   local_x, local_y, mouse_dragging);
+            }
+        }
+
         wm_invalidate(win);
 
         /* 60+ FPS pacing: cooperative single yield per frame to keep OS and mouse responsive */
         ipo_syscall(IPO_SYSCALL_PROCESS_YIELD, 0, NULL);
     }
+
+    free(s_teapot_verts);
+    s_teapot_verts = NULL;
+    free(s_cached_shadow_verts);
+    s_cached_shadow_verts = NULL;
+    free(s_cached_verts);
+    s_cached_verts = NULL;
+    free(s_normal_colors);
+    s_normal_colors = NULL;
+    s_teapot_inited = false;
 
     gl_destroy_context(gl);
     if (wm_is_window_valid(win)) {

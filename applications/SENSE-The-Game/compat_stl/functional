@@ -1,0 +1,82 @@
+#pragma once
+#include <cstddef>
+#include <type_traits>
+#include <utility>
+
+namespace std {
+
+template <class Sig> class function;
+
+namespace detail {
+template <class R, class... Args>
+struct fn_base {
+    virtual R call(Args...) = 0;
+    virtual fn_base* clone() const = 0;
+    virtual ~fn_base() = default;
+};
+
+template <class F, class R, class... Args>
+struct fn_impl final : fn_base<R, Args...> {
+    F f;
+    explicit fn_impl(F&& fn) : f(move(fn)) {}
+    explicit fn_impl(const F& fn) : f(fn) {}
+    R call(Args... args) override {
+        if constexpr (is_same_v<R, void>) {
+            f(forward<Args>(args)...);
+        } else {
+            return f(forward<Args>(args)...);
+        }
+    }
+    fn_base<R, Args...>* clone() const override {
+        return new fn_impl<F, R, Args...>(f);
+    }
+};
+} // namespace detail
+
+template <class R, class... Args>
+class function<R(Args...)> {
+    detail::fn_base<R, Args...>* m_impl = nullptr;
+public:
+    function() noexcept = default;
+    function(nullptr_t) noexcept : m_impl(nullptr) {}
+
+    function(const function& o) : m_impl(o.m_impl ? o.m_impl->clone() : nullptr) {}
+    function(function&& o) noexcept : m_impl(o.m_impl) { o.m_impl = nullptr; }
+
+    template <class F, class = enable_if_t<!is_same_v<remove_cvref_t<F>, function>>>
+    function(F&& f) : m_impl(new detail::fn_impl<remove_cvref_t<F>, R, Args...>(forward<F>(f))) {}
+
+    ~function() { delete m_impl; }
+
+    function& operator=(nullptr_t) noexcept {
+        delete m_impl; m_impl = nullptr; return *this;
+    }
+    function& operator=(const function& o) {
+        if (this != &o) {
+            auto* next = o.m_impl ? o.m_impl->clone() : nullptr;
+            delete m_impl;
+            m_impl = next;
+        }
+        return *this;
+    }
+    function& operator=(function&& o) noexcept {
+        if (this != &o) {
+            delete m_impl;
+            m_impl = o.m_impl;
+            o.m_impl = nullptr;
+        }
+        return *this;
+    }
+
+    explicit operator bool() const noexcept { return m_impl != nullptr; }
+
+    R operator()(Args... args) const {
+        if constexpr (is_same_v<R, void>) {
+            if (m_impl) m_impl->call(forward<Args>(args)...);
+        } else {
+            return m_impl->call(forward<Args>(args)...);
+        }
+    }
+};
+
+} // namespace std

@@ -1,0 +1,184 @@
+#pragma once
+#include <cstddef>
+#include <initializer_list>
+#include <utility>
+
+namespace std {
+
+template <class Key, class Value>
+class map {
+public:
+    using key_type = Key;
+    using mapped_type = Value;
+    using value_type = pair<const Key, Value>;
+
+private:
+    struct Node {
+        value_type kv;
+        Node* left = nullptr;
+        Node* right = nullptr;
+        Node* parent = nullptr;
+
+        Node(const Key& k, const Value& v, Node* p)
+            : kv(k, v), parent(p) {}
+        Node(const Key& k, Node* p)
+            : kv(k, Value{}), parent(p) {}
+    };
+
+    Node* m_root = nullptr;
+    size_t m_size = 0;
+
+    static Node* min_node(Node* n) noexcept {
+        while (n && n->left) n = n->left;
+        return n;
+    }
+
+    static Node* next_node(Node* n) noexcept {
+        if (!n) return nullptr;
+        if (n->right) return min_node(n->right);
+        Node* p = n->parent;
+        while (p && n == p->right) {
+            n = p;
+            p = p->parent;
+        }
+        return p;
+    }
+
+    static void destroy_tree(Node* n) noexcept {
+        if (!n) return;
+        destroy_tree(n->left);
+        destroy_tree(n->right);
+        delete n;
+    }
+
+    Node* find_node(const Key& k) const {
+        Node* cur = m_root;
+        while (cur) {
+            if (k < cur->kv.first) cur = cur->left;
+            else if (cur->kv.first < k) cur = cur->right;
+            else return cur;
+        }
+        return nullptr;
+    }
+
+    Node* get_or_insert(const Key& k) {
+        if (!m_root) {
+            m_root = new Node(k, nullptr);
+            ++m_size;
+            return m_root;
+        }
+        Node* cur = m_root;
+        for (;;) {
+            if (k < cur->kv.first) {
+                if (!cur->left) {
+                    cur->left = new Node(k, cur);
+                    ++m_size;
+                    return cur->left;
+                }
+                cur = cur->left;
+            } else if (cur->kv.first < k) {
+                if (!cur->right) {
+                    cur->right = new Node(k, cur);
+                    ++m_size;
+                    return cur->right;
+                }
+                cur = cur->right;
+            } else {
+                return cur;
+            }
+        }
+    }
+
+public:
+    class iterator {
+        Node* m_node = nullptr;
+    public:
+        iterator() noexcept = default;
+        explicit iterator(Node* n) noexcept : m_node(n) {}
+        value_type& operator*() const noexcept { return m_node->kv; }
+        value_type* operator->() const noexcept { return &m_node->kv; }
+        iterator& operator++() noexcept { m_node = next_node(m_node); return *this; }
+        iterator operator++(int) noexcept { iterator t = *this; m_node = next_node(m_node); return t; }
+        bool operator==(const iterator& o) const noexcept { return m_node == o.m_node; }
+        bool operator!=(const iterator& o) const noexcept { return m_node != o.m_node; }
+    };
+
+    class const_iterator {
+        const Node* m_node = nullptr;
+    public:
+        const_iterator() noexcept = default;
+        explicit const_iterator(const Node* n) noexcept : m_node(n) {}
+        const value_type& operator*() const noexcept { return m_node->kv; }
+        const value_type* operator->() const noexcept { return &m_node->kv; }
+        const_iterator& operator++() noexcept {
+            m_node = next_node(const_cast<Node*>(m_node));
+            return *this;
+        }
+        const_iterator operator++(int) noexcept {
+            const_iterator t = *this;
+            m_node = next_node(const_cast<Node*>(m_node));
+            return t;
+        }
+        bool operator==(const const_iterator& o) const noexcept { return m_node == o.m_node; }
+        bool operator!=(const const_iterator& o) const noexcept { return m_node != o.m_node; }
+    };
+
+    map() noexcept = default;
+    map(initializer_list<value_type> il) {
+        for (const auto& p : il) (*this)[p.first] = p.second;
+    }
+    map(const map& o) {
+        for (const auto& p : o) (*this)[p.first] = p.second;
+    }
+    map(map&& o) noexcept : m_root(o.m_root), m_size(o.m_size) {
+        o.m_root = nullptr;
+        o.m_size = 0;
+    }
+    ~map() { clear(); }
+
+    map& operator=(const map& o) {
+        if (this != &o) {
+            clear();
+            for (const auto& p : o) (*this)[p.first] = p.second;
+        }
+        return *this;
+    }
+    map& operator=(map&& o) noexcept {
+        if (this != &o) {
+            clear();
+            m_root = o.m_root;
+            m_size = o.m_size;
+            o.m_root = nullptr;
+            o.m_size = 0;
+        }
+        return *this;
+    }
+
+    void clear() noexcept {
+        destroy_tree(m_root);
+        m_root = nullptr;
+        m_size = 0;
+    }
+
+    Value& operator[](const Key& k) {
+        return get_or_insert(k)->kv.second;
+    }
+
+    const Value& at(const Key& k) const {
+        Node* n = find_node(k);
+        return n->kv.second;
+    }
+
+    iterator find(const Key& k) noexcept { return iterator(find_node(k)); }
+    const_iterator find(const Key& k) const noexcept { return const_iterator(find_node(k)); }
+    size_t count(const Key& k) const noexcept { return find_node(k) ? 1 : 0; }
+    size_t size() const noexcept { return m_size; }
+    bool empty() const noexcept { return m_size == 0; }
+
+    iterator begin() noexcept { return iterator(min_node(m_root)); }
+    iterator end() noexcept { return iterator(nullptr); }
+    const_iterator begin() const noexcept { return const_iterator(min_node(m_root)); }
+    const_iterator end() const noexcept { return const_iterator(nullptr); }
+};
+
+} // namespace std

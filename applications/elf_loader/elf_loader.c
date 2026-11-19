@@ -12,6 +12,9 @@
 #define SYS_SBRK              0x1045u
 #define SYS_SET_RETURN_VALUE  0x1029u
 
+extern void call_struct_entry_stack(uint32_t entry_addr, void *ret_buf, int argc, char **argv, char **envp, void *new_stack_top);
+extern uint64_t call_app_entry_stack(uint32_t entry_addr, int argc, char **argv, char **envp, void *new_stack_top);
+
 static inline int raw_syscall(uint32_t num, uint32_t argc, uint32_t *argv) {
     int ret;
     __asm__ volatile(
@@ -370,6 +373,21 @@ uint64_t loader_main(int argc, char **argv, char **envp) {
     null_env[0] = NULL;
     char **pass_env = envp ? envp : null_env;
 
+    /*
+     * The process starts with a single 4 KiB stack page. The kernel grows the
+     * stack on page faults, but a fault taken when the stack is already
+     * exhausted cannot be serviced. Touch one address far below the current
+     * stack pointer while there is still headroom so the kernel maps the
+     * whole range at once, giving the application a large native stack.
+     */
+    #define TARGET_APP_STACK_SIZE (2u * 1024u * 1024u)
+    {
+        volatile uint8_t *cur_sp;
+        __asm__ volatile("movl %%esp, %0" : "=r"(cur_sp));
+        (void)cur_sp[-(int32_t)TARGET_APP_STACK_SIZE];
+    }
+    uint32_t *app_stack_top = NULL;
+
     uint32_t target_entry = ehdr.e_entry;
     uint32_t entry_offset = (target_entry >= min_vaddr && target_entry < max_vaddr) ? (target_entry - min_vaddr) : 0;
     bool is_struct = is_entry_struct_return(staging + entry_offset, (size_t)(total_span - entry_offset));
@@ -385,10 +403,11 @@ uint64_t loader_main(int argc, char **argv, char **envp) {
 
         uint32_t *sp = (uint32_t *)__builtin_frame_address(0);
         uint32_t kernel_ebp = sp[0];
+        uint32_t final_esp;
         sp[2] = (uint32_t)new_argc;
         sp[3] = (uint32_t)(uintptr_t)new_argv;
         sp[4] = (uint32_t)(uintptr_t)pass_env;
-        uint32_t final_esp = (uint32_t)(uintptr_t)(sp + 1);
+        final_esp = (uint32_t)(uintptr_t)(sp + 1);
 
         static const uint8_t tramp_perfect_bytes[30] = {
             0x55,                         /* push %ebp */
@@ -422,7 +441,11 @@ uint64_t loader_main(int argc, char **argv, char **envp) {
         }
         mem_set(struct_buf, 0xDD, 512);
 
-        call_struct_entry(entry_addr, struct_buf, new_argc, new_argv, pass_env);
+        if (app_stack_top) {
+            call_struct_entry_stack(entry_addr, struct_buf, new_argc, new_argv, pass_env, app_stack_top);
+        } else {
+            call_struct_entry(entry_addr, struct_buf, new_argc, new_argv, pass_env);
+        }
 
         uint32_t written_size = 0;
         for (int k = 511; k >= 0; k--) {
@@ -455,18 +478,6 @@ uint64_t loader_main(int argc, char **argv, char **envp) {
             fmt_args[1] = (uint32_t)(uintptr_t)detected_format;
             raw_syscall(SYS_SET_RETURN_VALUE, 2u, fmt_args);
         }
-        uint32_t ret_eax = 0;
-        uint32_t ret_edx = 0;
-        __asm__ volatile(
-            "pushl %3\n\t"
-            "pushl %4\n\t"
-            "pushl %5\n\t"
-            "call *%2\n\t"
-            "addl $12, %%esp\n\t"
-            : "=a"(ret_eax), "=d"(ret_edx)
-            : "r"(entry_addr), "r"(pass_env), "r"(new_argv), "r"(new_argc)
-            : "ecx", "memory", "cc"
-        );
-        return ((uint64_t)ret_edx << 32) | (uint64_t)ret_eax;
+        return call_app_entry_stack(entry_addr, new_argc, new_argv, pass_env, app_stack_top);
     }
 }

@@ -8,6 +8,8 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdarg.h>
+#include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 
@@ -15,6 +17,28 @@
 #include <syscall.h>
 #include <system/state.h>
 #include <system/timer.h>
+
+static void fps_draw_fmt(uint8_t *fb, uint16_t cur_w, uint16_t cur_h, int x, int y, uint8_t col,
+                         const char *fmt, ...) {
+    va_list ap, aq;
+    va_start(ap, fmt);
+    va_copy(aq, ap);
+    int len = vsnprintf(NULL, 0, fmt, aq);
+    va_end(aq);
+    if (len < 0) {
+        va_end(ap);
+        return;
+    }
+    char *buf = (char *)malloc((size_t)len + 1u);
+    if (!buf) {
+        va_end(ap);
+        return;
+    }
+    vsnprintf(buf, (size_t)len + 1u, fmt, ap);
+    va_end(ap);
+    wm_buf_draw_string(fb, cur_w, cur_h, x, y, buf, col);
+    free(buf);
+}
 
 #define WIN_W 220
 #define WIN_H 120
@@ -46,9 +70,7 @@ static void on_window_event(wm_window_t *w, uint32_t event, uint32_t data) {
         running = false;
     } else if (event == WM_EVENT_KEY_DOWN) {
         uint8_t sc = (uint8_t)(data & 0x7F);
-        if (sc == 1) { /* Esc */
-            running = false;
-        } else if (sc == 19) { /* 'R' key */
+        if (sc == 19) { /* 'R' key */
             reset_requested = true;
         }
     } else if (event == WM_EVENT_CLICK) {
@@ -63,18 +85,12 @@ int main(int argc, char **argv) {
 
     printf("[fps_meter] Launching System Performance Monitor...\n");
 
-    /* Ensure WM session is running */
-    if (!wm_session_active()) {
-        wm_session_start();
-    }
-
     wm_window_options_t opt = WM_WINDOW_OPTIONS_DEFAULT;
     opt.title = "Performance Monitor";
     opt.x = 90;
     opt.y = 35;
     opt.w = WIN_W;
     opt.h = WIN_H;
-    opt.event_cb = on_window_event;
 
     wm_window_t *win = wm_create_window(&opt);
     if (!win) {
@@ -82,11 +98,17 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    uint16_t history[HIST_LEN];
-    memset(history, 0, sizeof(history));
+    int hist_cap = HIST_LEN;
+    uint16_t *history = (uint16_t *)calloc((size_t)hist_cap, sizeof(uint16_t));
+    if (!history) {
+        wm_destroy_window(win);
+        return 1;
+    }
     int hist_head = 0;
 
     uint32_t frame_count = 0;
+    uint32_t window_frames = 0;
+    uint32_t window_start_time = timer_millis();
     uint32_t stats_start_time = timer_millis();
     uint32_t last_frame_time = timer_millis();
 
@@ -94,24 +116,37 @@ int main(int argc, char **argv) {
     float avg_fps = 0.0f;
     float min_fps = 999.0f;
     float max_fps = 0.0f;
-    uint32_t cur_dt = 33;
+    uint32_t cur_dt = 1;
 
     while (running && wm_session_active() && !system_is_interrupted() && wm_is_window_valid(win)) {
+        wm_event_t ev;
+        while (wm_poll_event(win, &ev)) {
+            on_window_event(win, ev.type, ev.data);
+        }
+        if (!running || !wm_is_window_valid(win)) break;
+
         uint32_t loop_start = timer_millis();
 
         /* Calculate delta time */
         cur_dt = loop_start - last_frame_time;
         last_frame_time = loop_start;
-        if (cur_dt == 0) cur_dt = 1;
 
         /* Add to history */
-        history[hist_head] = (uint16_t)cur_dt;
-        hist_head = (hist_head + 1) % HIST_LEN;
+        history[hist_head] = (uint16_t)(cur_dt > 0 ? cur_dt : 1);
+        hist_head = (hist_head + 1) % hist_cap;
 
         /* Calculate stats */
         frame_count++;
-        cur_fps = 1000.0f / (float)cur_dt;
-        if (cur_fps > 999.0f) cur_fps = 999.0f;
+        window_frames++;
+        uint32_t win_elapsed = loop_start - window_start_time;
+        if (win_elapsed >= 100) {
+            cur_fps = ((float)window_frames * 1000.0f) / (float)win_elapsed;
+            window_frames = 0;
+            window_start_time = loop_start;
+        } else if (cur_fps == 0.0f && cur_dt > 0) {
+            cur_fps = 1000.0f / (float)cur_dt;
+        }
+        if (cur_fps > 9999.0f) cur_fps = 9999.0f;
 
         uint32_t total_elapsed = loop_start - stats_start_time;
         if (total_elapsed >= 500) {
@@ -127,11 +162,13 @@ int main(int argc, char **argv) {
         if (reset_requested) {
             reset_requested = false;
             frame_count = 0;
+            window_frames = 0;
+            window_start_time = loop_start;
             stats_start_time = loop_start;
             min_fps = cur_fps;
             max_fps = cur_fps;
             avg_fps = cur_fps;
-            memset(history, 0, sizeof(history));
+            memset(history, 0, (size_t)hist_cap * sizeof(uint16_t));
         }
 
         /* Render UI */
@@ -144,28 +181,17 @@ int main(int argc, char **argv) {
             wm_buf_fill_rect(fb, cur_w, cur_h, 0, 0, cur_w, cur_h, CLR_BLACK);
 
             /* Top info bar */
-            char buf[64];
             uint8_t fps_col = (cur_fps >= 28.0f) ? CLR_LIGHT_GREEN : ((cur_fps >= 18.0f) ? CLR_YELLOW : CLR_LIGHT_RED);
 
-            snprintf(buf, sizeof(buf), "FPS: %d.%d", (int)cur_fps, (int)(cur_fps * 10.0f) % 10);
-            wm_buf_draw_string(fb, cur_w, cur_h, 8, 4, buf, fps_col);
-
-            snprintf(buf, sizeof(buf), "dt: %u ms", (unsigned int)cur_dt);
-            wm_buf_draw_string(fb, cur_w, cur_h, 95, 4, buf, CLR_LIGHT_CYAN);
-
-            snprintf(buf, sizeof(buf), "Avg: %d.%d", (int)avg_fps, (int)(avg_fps * 10.0f) % 10);
-            wm_buf_draw_string(fb, cur_w, cur_h, 155, 4, buf, CLR_WHITE);
+            fps_draw_fmt(fb, cur_w, cur_h, 8, 4, fps_col, "FPS: %d.%d", (int)cur_fps, (int)(cur_fps * 10.0f) % 10);
+            fps_draw_fmt(fb, cur_w, cur_h, 95, 4, CLR_LIGHT_CYAN, "dt: %u ms", (unsigned int)cur_dt);
+            fps_draw_fmt(fb, cur_w, cur_h, 155, 4, CLR_WHITE, "Avg: %d.%d", (int)avg_fps, (int)(avg_fps * 10.0f) % 10);
 
             /* Line 2: Min / Max / Windows count */
             int win_cnt = wm_get_window_count();
-            snprintf(buf, sizeof(buf), "Min: %d.%d", (int)min_fps, (int)(min_fps * 10.0f) % 10);
-            wm_buf_draw_string(fb, cur_w, cur_h, 8, 14, buf, CLR_LIGHT_GRAY);
-
-            snprintf(buf, sizeof(buf), "Max: %d.%d", (int)max_fps, (int)(max_fps * 10.0f) % 10);
-            wm_buf_draw_string(fb, cur_w, cur_h, 85, 14, buf, CLR_LIGHT_GRAY);
-
-            snprintf(buf, sizeof(buf), "Wins: %d", win_cnt);
-            wm_buf_draw_string(fb, cur_w, cur_h, 160, 14, buf, CLR_LIGHT_MAGENTA);
+            fps_draw_fmt(fb, cur_w, cur_h, 8, 14, CLR_LIGHT_GRAY, "Min: %d.%d", (int)min_fps, (int)(min_fps * 10.0f) % 10);
+            fps_draw_fmt(fb, cur_w, cur_h, 85, 14, CLR_LIGHT_GRAY, "Max: %d.%d", (int)max_fps, (int)(max_fps * 10.0f) % 10);
+            fps_draw_fmt(fb, cur_w, cur_h, 160, 14, CLR_LIGHT_MAGENTA, "Wins: %d", win_cnt);
 
             /* Divider line */
             wm_buf_draw_line(fb, cur_w, cur_h, 6, 24, cur_w - 7, 24, CLR_DARK_GRAY);
@@ -192,7 +218,7 @@ int main(int argc, char **argv) {
                 for (int lx = gx; lx < gx + gw; lx += 4) {
                     wm_buf_put_pixel(fb, cur_w, cur_h, lx, y_60fps, CLR_DARK_GRAY);
                 }
-                wm_buf_draw_string(fb, cur_w, cur_h, gx + 2, y_60fps - 7, "60fps", CLR_DARK_GRAY);
+                wm_buf_draw_string(fb, cur_w, cur_h, gx + 2, y_60fps - 7, "60fps", CLR_LIGHT_GRAY);
             }
 
             /* 30 FPS reference line (dotted) */
@@ -203,13 +229,29 @@ int main(int argc, char **argv) {
                 wm_buf_draw_string(fb, cur_w, cur_h, gx + 2, y_30fps - 7, "30fps", CLR_LIGHT_BLUE);
             }
 
-            /* Draw history bars */
+            /* Draw history bars, expanding ring capacity when resized wider */
             int bar_w = 2;
             int num_bars = gw / bar_w;
-            if (num_bars > HIST_LEN) num_bars = HIST_LEN;
+            if (num_bars > hist_cap) {
+                int new_cap = hist_cap;
+                while (new_cap < num_bars) new_cap *= 2;
+                uint16_t *nh = (uint16_t *)calloc((size_t)new_cap, sizeof(uint16_t));
+                if (nh) {
+                    int pad = new_cap - hist_cap;
+                    for (int k = 0; k < hist_cap; k++) {
+                        nh[pad + k] = history[(hist_head + k) % hist_cap];
+                    }
+                    free(history);
+                    history = nh;
+                    hist_cap = new_cap;
+                    hist_head = 0;
+                } else {
+                    num_bars = hist_cap;
+                }
+            }
 
             for (int i = 0; i < num_bars; i++) {
-                int idx = (hist_head - num_bars + i + HIST_LEN) % HIST_LEN;
+                int idx = (hist_head - num_bars + i + hist_cap) % hist_cap;
                 uint16_t dt_val = history[idx];
                 if (dt_val == 0) continue;
 
@@ -231,20 +273,18 @@ int main(int argc, char **argv) {
             if (bot_y > gy + gh) {
                 wm_buf_draw_line(fb, cur_w, cur_h, 6, bot_y, cur_w - 7, bot_y, CLR_DARK_GRAY);
                 uint32_t uptime = timer_seconds();
-                snprintf(buf, sizeof(buf), "Uptime: %02u:%02u", uptime / 60, uptime % 60);
-                wm_buf_draw_string(fb, cur_w, cur_h, 8, bot_y + 4, buf, CLR_LIGHT_GRAY);
-                wm_buf_draw_string(fb, cur_w, cur_h, cur_w > 200 ? cur_w - 110 : 85, bot_y + 4, "[R]eset [Esc]Exit", CLR_WHITE);
+                fps_draw_fmt(fb, cur_w, cur_h, 8, bot_y + 4, CLR_LIGHT_GRAY, "Uptime: %02u:%02u", uptime / 60, uptime % 60);
+                wm_buf_draw_string(fb, cur_w, cur_h, cur_w > 200 ? cur_w - 60 : 85, bot_y + 4, "[R]eset", CLR_WHITE);
             }
 
             wm_invalidate(win);
         }
 
-        /* Frame pacing: update at ~30 FPS, yield CPU */
-        do {
-            ipo_syscall(IPO_SYSCALL_PROCESS_YIELD, 0, NULL);
-        } while (timer_elapsed_ms(loop_start) < 33);
+        /* Uncapped frame processing: cooperative single yield per frame */
+        ipo_syscall(IPO_SYSCALL_PROCESS_YIELD, 0, NULL);
     }
 
+    free(history);
     wm_destroy_window(win);
     printf("[fps_meter] Performance Monitor closed.\n");
     return 0;

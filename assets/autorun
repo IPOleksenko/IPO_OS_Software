@@ -1,4 +1,7 @@
 # IPO_OS Autorun Script
-# Automatically registers executable formats on boot
+
+drivers load /drivers/rtl8139.kmd
+drivers load /drivers/touchpad.kmd
+drivers load /drivers/gamepad.kmd
 /applications/binfmt
 

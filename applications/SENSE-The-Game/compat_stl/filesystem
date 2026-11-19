@@ -1,0 +1,221 @@
+#pragma once
+#include <cstddef>
+#include <errno.h>
+#include <exception>
+#include <limits.h>
+#include <memory>
+#include <string>
+
+extern "C" {
+#include <dirent.h>
+#include <sys/stat.h>
+#include <unistd.h>
+}
+
+#ifndef S_ISDIR
+#define S_ISDIR(m) (((m) & S_IFMT) == S_IFDIR)
+#endif
+
+namespace std::filesystem {
+
+class path {
+    ::std::string m_path;
+
+public:
+    path() = default;
+    path(const char* s) : m_path(s ? s : "") {}
+    path(const ::std::string& s) : m_path(s) {}
+
+    const char* c_str() const noexcept { return m_path.c_str(); }
+    ::std::string string() const { return m_path; }
+    bool empty() const noexcept { return m_path.empty(); }
+
+    bool is_absolute() const noexcept {
+        return !m_path.empty() && m_path[0] == '/';
+    }
+
+    path operator/(const path& rhs) const {
+        if (rhs.empty()) return *this;
+        if (rhs.is_absolute() || m_path.empty()) return rhs;
+        ::std::string r = m_path;
+        if (r.back() != '/') r.push_back('/');
+        r += rhs.m_path;
+        return path(r);
+    }
+
+    path operator/(const char* rhs) const { return *this / path(rhs); }
+    path operator/(const ::std::string& rhs) const { return *this / path(rhs); }
+
+    path filename() const {
+        if (m_path.empty()) return path();
+        size_t pos = m_path.rfind('/');
+        if (pos == ::std::string::npos) return *this;
+        return path(m_path.substr(pos + 1));
+    }
+
+    path extension() const {
+        ::std::string fn = filename().string();
+        if (fn == "." || fn == ".." || fn.empty()) return path();
+        size_t dot = fn.rfind('.');
+        if (dot == ::std::string::npos || dot == 0) return path();
+        return path(fn.substr(dot));
+    }
+
+    path stem() const {
+        ::std::string fn = filename().string();
+        if (fn == "." || fn == ".." || fn.empty()) return path(fn);
+        size_t dot = fn.rfind('.');
+        if (dot == ::std::string::npos || dot == 0) return path(fn);
+        return path(fn.substr(0, dot));
+    }
+
+    bool operator==(const path& o) const noexcept { return m_path == o.m_path; }
+    bool operator!=(const path& o) const noexcept { return m_path != o.m_path; }
+    bool operator==(const char* o) const noexcept { return m_path == (o ? o : ""); }
+    bool operator!=(const char* o) const noexcept { return !(*this == o); }
+};
+
+inline bool operator==(const char* a, const path& b) noexcept { return b == a; }
+inline bool operator!=(const char* a, const path& b) noexcept { return b != a; }
+
+inline path current_path() {
+    struct stat st;
+    if (stat("/data", &st) != 0) {
+        mkdir("/data", 0755);
+    }
+    if (stat("/data/SENSE: The Game", &st) != 0) {
+        mkdir("/data/SENSE: The Game", 0755);
+    }
+    return path("/data/SENSE: The Game");
+}
+
+inline bool exists(const path& p) {
+    struct stat st;
+    return stat(p.c_str(), &st) == 0;
+}
+
+inline bool is_regular_file(const path& p) {
+    struct stat st;
+    if (stat(p.c_str(), &st) != 0) return false;
+    return S_ISREG(st.st_mode);
+}
+
+inline bool is_directory(const path& p) {
+    if (p == "/") return true;
+    struct stat st;
+    if (stat(p.c_str(), &st) != 0) return false;
+    return S_ISDIR(st.st_mode);
+}
+
+inline bool create_directories(const path& p) {
+    ::std::string s = p.string();
+    if (s.empty() || s == "/" || s == ".") return true;
+    if (is_directory(p)) return false;
+
+    ::std::string cur;
+    size_t i = 0;
+    if (s[0] == '/') {
+        cur = "/";
+        i = 1;
+    }
+    bool created_any = false;
+    while (i < s.size()) {
+        while (i < s.size() && s[i] == '/') ++i;
+        if (i >= s.size()) break;
+        size_t start = i;
+        while (i < s.size() && s[i] != '/') ++i;
+        if (!cur.empty() && cur.back() != '/') cur.push_back('/');
+        cur += s.substr(start, i - start);
+        if (!is_directory(cur)) {
+            if (mkdir(cur.c_str(), 0755) == 0) {
+                created_any = true;
+            } else if (!is_directory(cur)) {
+                return false;
+            }
+        }
+    }
+    return created_any;
+}
+
+class directory_entry {
+    class path m_path;
+public:
+    directory_entry() = default;
+    explicit directory_entry(const class path& p) : m_path(p) {}
+    const class path& path() const noexcept { return m_path; }
+    bool is_regular_file() const { return ::std::filesystem::is_regular_file(m_path); }
+    bool is_directory() const { return ::std::filesystem::is_directory(m_path); }
+    bool exists() const { return ::std::filesystem::exists(m_path); }
+};
+
+class directory_iterator {
+    struct State {
+        DIR* dir = nullptr;
+        path base;
+        directory_entry entry;
+        bool at_end = true;
+
+        ~State() {
+            if (dir) {
+                closedir(dir);
+                dir = nullptr;
+            }
+        }
+
+        void advance() {
+            if (!dir) {
+                at_end = true;
+                return;
+            }
+            struct dirent* ent;
+            while ((ent = readdir(dir)) != nullptr) {
+                if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) {
+                    continue;
+                }
+                entry = directory_entry(base / ent->d_name);
+                at_end = false;
+                return;
+            }
+            closedir(dir);
+            dir = nullptr;
+            at_end = true;
+        }
+    };
+
+    shared_ptr<State> m_state;
+
+public:
+    directory_iterator() noexcept = default;
+    explicit directory_iterator(const path& p) {
+        DIR* d = opendir(p.c_str());
+        if (!d) return;
+        m_state = make_shared<State>();
+        m_state->dir = d;
+        m_state->base = p;
+        m_state->advance();
+        if (m_state->at_end) m_state.reset();
+    }
+
+    const directory_entry& operator*() const noexcept { return m_state->entry; }
+    const directory_entry* operator->() const noexcept { return &m_state->entry; }
+
+    directory_iterator& operator++() {
+        if (m_state) {
+            m_state->advance();
+            if (m_state->at_end) m_state.reset();
+        }
+        return *this;
+    }
+
+    bool operator==(const directory_iterator& o) const noexcept {
+        return m_state.get() == o.m_state.get();
+    }
+    bool operator!=(const directory_iterator& o) const noexcept {
+        return !(*this == o);
+    }
+
+    directory_iterator begin() const noexcept { return *this; }
+    directory_iterator end() const noexcept { return directory_iterator(); }
+};
+
+} // namespace std::filesystem

@@ -188,7 +188,6 @@ boolean*	mousebuttons = &mousearray[1];		// allow [-1]
 
 // mouse values are used once 
 int             mousex;
-int		mousey;         
 
 int             dclicktime;
 int		dclickstate;
@@ -402,13 +401,9 @@ void G_BuildTiccmd (ticcmd_t* cmd)
 	} 
     } 
  
-    forward += mousey; 
-    if (strafe) 
-	side += mousex*2; 
-    else 
-	cmd->angleturn -= mousex*0x8; 
+    cmd->angleturn -= mousex*0x8;
 
-    mousex = mousey = 0; 
+    mousex = 0;
 	 
     if (forward > MAXPLMOVE) 
 	forward = MAXPLMOVE; 
@@ -490,7 +485,7 @@ void G_DoLoadLevel (void)
     // clear cmd building stuff
     memset (gamekeydown, 0, sizeof(gamekeydown)); 
     joyxmove = joyymove = 0; 
-    mousex = mousey = 0; 
+    mousex = 0;
     sendpause = sendsave = paused = false; 
     memset (mousebuttons, 0, sizeof(mousebuttons)); 
     memset (joybuttons, 0, sizeof(joybuttons)); 
@@ -574,10 +569,9 @@ boolean G_Responder (event_t* ev)
 		 
       case ev_mouse: 
 	mousebuttons[0] = ev->data1 & 1; 
-	mousebuttons[1] = ev->data1 & 2; 
-	mousebuttons[2] = ev->data1 & 4; 
+	mousebuttons[1] = false;
+	mousebuttons[2] = false;
 	mousex = ev->data2*(mouseSensitivity+5)/10; 
-	mousey = ev->data3*(mouseSensitivity+5)/10; 
 	return true;    // eat events 
  
       case ev_joystick: 
@@ -1269,7 +1263,7 @@ G_SaveGame
  
 void G_DoSaveGame (void) 
 { 
-    char	name[100]; 
+    char	name[256]; 
     char	name2[VERSIONSIZE]; 
     char*	description; 
     int		length; 
@@ -1278,7 +1272,11 @@ void G_DoSaveGame (void)
     if (M_CheckParm("-cdrom"))
 	sprintf(name,"c:\\doomdata\\"SAVEGAMENAME"%d.dsg",savegameslot);
     else
-	sprintf (name,SAVEGAMENAME"%d.dsg",savegameslot); 
+    {
+	const char* home = getenv("HOME");
+	if (!home || !home[0]) home = "/data/doom";
+	snprintf (name, sizeof(name), "%s/"SAVEGAMENAME"%d.dsg", home, savegameslot);
+    }
     description = savedescription; 
 	 
     save_p = savebuffer = screens[1]+0x4000; 

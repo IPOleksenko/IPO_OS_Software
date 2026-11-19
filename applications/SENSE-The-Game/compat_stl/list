@@ -1,0 +1,193 @@
+#pragma once
+#include <cstddef>
+#include <initializer_list>
+#include <new>
+#include <utility>
+
+namespace std {
+
+template <class T>
+class list {
+    struct Node {
+        Node* prev = nullptr;
+        Node* next = nullptr;
+        T value;
+        template <class... Args>
+        explicit Node(Args&&... args) : value(forward<Args>(args)...) {}
+    };
+
+    struct FreeSlot {
+        FreeSlot* next;
+    };
+
+    Node* m_head = nullptr;
+    Node* m_tail = nullptr;
+    FreeSlot* m_free = nullptr;
+    size_t m_size = 0;
+
+    template <class... Args>
+    Node* alloc_node(Args&&... args) {
+        void* mem = nullptr;
+        if (m_free) {
+            FreeSlot* slot = m_free;
+            m_free = slot->next;
+            mem = static_cast<void*>(slot);
+        } else {
+            mem = ::operator new(sizeof(Node));
+        }
+        return ::new (mem) Node(forward<Args>(args)...);
+    }
+
+    void release_node(Node* n) noexcept {
+        n->~Node();
+        auto* slot = reinterpret_cast<FreeSlot*>(n);
+        slot->next = m_free;
+        m_free = slot;
+    }
+
+    void free_pool() noexcept {
+        FreeSlot* cur = m_free;
+        while (cur) {
+            FreeSlot* nxt = cur->next;
+            ::operator delete(static_cast<void*>(cur));
+            cur = nxt;
+        }
+        m_free = nullptr;
+    }
+
+public:
+    class iterator {
+        Node* m_node = nullptr;
+        friend class list;
+    public:
+        iterator() noexcept = default;
+        explicit iterator(Node* n) noexcept : m_node(n) {}
+        T& operator*() const noexcept { return m_node->value; }
+        T* operator->() const noexcept { return &m_node->value; }
+        iterator& operator++() noexcept { m_node = m_node->next; return *this; }
+        iterator operator++(int) noexcept { iterator t = *this; m_node = m_node->next; return t; }
+        iterator& operator--() noexcept { m_node = m_node->prev; return *this; }
+        bool operator==(const iterator& o) const noexcept { return m_node == o.m_node; }
+        bool operator!=(const iterator& o) const noexcept { return m_node != o.m_node; }
+    };
+
+    class const_iterator {
+        const Node* m_node = nullptr;
+        friend class list;
+    public:
+        const_iterator() noexcept = default;
+        const_iterator(const iterator& it) noexcept : m_node(it.m_node) {}
+        explicit const_iterator(const Node* n) noexcept : m_node(n) {}
+        const T& operator*() const noexcept { return m_node->value; }
+        const T* operator->() const noexcept { return &m_node->value; }
+        const_iterator& operator++() noexcept { m_node = m_node->next; return *this; }
+        const_iterator operator++(int) noexcept { const_iterator t = *this; m_node = m_node->next; return t; }
+        bool operator==(const const_iterator& o) const noexcept { return m_node == o.m_node; }
+        bool operator!=(const const_iterator& o) const noexcept { return m_node != o.m_node; }
+    };
+
+    list() noexcept = default;
+    list(initializer_list<T> il) {
+        for (const auto& v : il) push_back(v);
+    }
+    list(const list& o) {
+        for (const auto& v : o) push_back(v);
+    }
+    list(list&& o) noexcept : m_head(o.m_head), m_tail(o.m_tail), m_free(o.m_free), m_size(o.m_size) {
+        o.m_head = o.m_tail = nullptr;
+        o.m_free = nullptr;
+        o.m_size = 0;
+    }
+    ~list() { clear(); free_pool(); }
+
+    list& operator=(const list& o) {
+        if (this != &o) {
+            clear();
+            for (const auto& v : o) push_back(v);
+        }
+        return *this;
+    }
+    list& operator=(list&& o) noexcept {
+        if (this != &o) {
+            clear();
+            free_pool();
+            m_head = o.m_head;
+            m_tail = o.m_tail;
+            m_free = o.m_free;
+            m_size = o.m_size;
+            o.m_head = o.m_tail = nullptr;
+            o.m_free = nullptr;
+            o.m_size = 0;
+        }
+        return *this;
+    }
+
+    void clear() noexcept {
+        Node* cur = m_head;
+        while (cur) {
+            Node* nxt = cur->next;
+            release_node(cur);
+            cur = nxt;
+        }
+        m_head = m_tail = nullptr;
+        m_size = 0;
+    }
+
+    template <class... Args>
+    T& emplace_back(Args&&... args) {
+        Node* n = alloc_node(forward<Args>(args)...);
+        n->prev = m_tail;
+        if (m_tail) m_tail->next = n;
+        else m_head = n;
+        m_tail = n;
+        ++m_size;
+        return n->value;
+    }
+
+    void push_back(const T& v) { emplace_back(v); }
+    void push_back(T&& v) { emplace_back(move(v)); }
+
+    void pop_front() noexcept {
+        if (!m_head) return;
+        Node* n = m_head;
+        m_head = n->next;
+        if (m_head) m_head->prev = nullptr;
+        else m_tail = nullptr;
+        release_node(n);
+        --m_size;
+    }
+
+    void pop_back() noexcept {
+        if (!m_tail) return;
+        Node* n = m_tail;
+        m_tail = n->prev;
+        if (m_tail) m_tail->next = nullptr;
+        else m_head = nullptr;
+        release_node(n);
+        --m_size;
+    }
+
+    iterator erase(iterator pos) {
+        Node* n = pos.m_node;
+        if (!n) return end();
+        Node* nxt = n->next;
+        if (n->prev) n->prev->next = n->next; else m_head = n->next;
+        if (n->next) n->next->prev = n->prev; else m_tail = n->prev;
+        release_node(n);
+        --m_size;
+        return iterator(nxt);
+    }
+
+    size_t size() const noexcept { return m_size; }
+    bool empty() const noexcept { return m_size == 0; }
+    T& front() noexcept { return m_head->value; }
+    const T& front() const noexcept { return m_head->value; }
+    T& back() noexcept { return m_tail->value; }
+    const T& back() const noexcept { return m_tail->value; }
+    iterator begin() noexcept { return iterator(m_head); }
+    iterator end() noexcept { return iterator(nullptr); }
+    const_iterator begin() const noexcept { return const_iterator(m_head); }
+    const_iterator end() const noexcept { return const_iterator(nullptr); }
+};
+
+} // namespace std

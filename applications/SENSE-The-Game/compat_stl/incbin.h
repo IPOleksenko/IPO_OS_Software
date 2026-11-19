@@ -1,0 +1,69 @@
+#ifndef SENSE_COMPAT_INCBIN_H
+#define SENSE_COMPAT_INCBIN_H
+
+/* Freestanding x86-32 ELF incbin.h compatible with SENSE-The-Game assets.cpp/hpp */
+
+#define INCBIN_STYLE_CAMEL 0
+#define INCBIN_STYLE_SNAKE 1
+
+#ifndef INCBIN_STYLE
+#define INCBIN_STYLE INCBIN_STYLE_CAMEL
+#endif
+
+#ifndef INCBIN_PREFIX
+#define INCBIN_PREFIX g
+#endif
+
+#define INCBIN_STR2(x) #x
+#define INCBIN_STR(x) INCBIN_STR2(x)
+
+#define INCBIN_CONCATENATE2(a, b) a##b
+#define INCBIN_CONCATENATE(a, b) INCBIN_CONCATENATE2(a, b)
+
+#if INCBIN_STYLE == INCBIN_STYLE_SNAKE
+#define INCBIN_STYLE_IDENT(TYPE) INCBIN_CONCATENATE(_INCBIN_SNAKE_, TYPE)
+#define _INCBIN_SNAKE_DATA _data
+#define _INCBIN_SNAKE_END  _end
+#define _INCBIN_SNAKE_SIZE _size
+#else
+#define INCBIN_STYLE_IDENT(TYPE) INCBIN_CONCATENATE(_INCBIN_CAMEL_, TYPE)
+#define _INCBIN_CAMEL_DATA Data
+#define _INCBIN_CAMEL_END  End
+#define _INCBIN_CAMEL_SIZE Size
+#endif
+
+#ifdef __cplusplus
+#define INCBIN_EXT extern "C"
+#else
+#define INCBIN_EXT extern
+#endif
+
+#define INCBIN_EXTERN(NAME) \
+    INCBIN_EXT const unsigned char INCBIN_CONCATENATE(INCBIN_CONCATENATE(INCBIN_PREFIX, NAME), INCBIN_STYLE_IDENT(DATA))[]; \
+    INCBIN_EXT const unsigned char *const INCBIN_CONCATENATE(INCBIN_CONCATENATE(INCBIN_PREFIX, NAME), INCBIN_STYLE_IDENT(END)); \
+    INCBIN_EXT const unsigned int INCBIN_CONCATENATE(INCBIN_CONCATENATE(INCBIN_PREFIX, NAME), INCBIN_STYLE_IDENT(SIZE))
+
+#define INCBIN_SYM_DATA(NAME) INCBIN_STR(INCBIN_CONCATENATE(INCBIN_CONCATENATE(INCBIN_PREFIX, NAME), INCBIN_STYLE_IDENT(DATA)))
+#define INCBIN_SYM_END(NAME)  INCBIN_STR(INCBIN_CONCATENATE(INCBIN_CONCATENATE(INCBIN_PREFIX, NAME), INCBIN_STYLE_IDENT(END)))
+#define INCBIN_SYM_SIZE(NAME) INCBIN_STR(INCBIN_CONCATENATE(INCBIN_CONCATENATE(INCBIN_PREFIX, NAME), INCBIN_STYLE_IDENT(SIZE)))
+
+#define INCBIN(NAME, FILENAME) \
+    __asm__( \
+        ".section .rodata\n" \
+        ".balign 16\n" \
+        ".global " INCBIN_SYM_DATA(NAME) "\n" \
+        ".type " INCBIN_SYM_DATA(NAME) ", @object\n" \
+        INCBIN_SYM_DATA(NAME) ":\n" \
+        ".incbin \"" FILENAME "\"\n" \
+        ".global " INCBIN_SYM_END(NAME) "\n" \
+        ".type " INCBIN_SYM_END(NAME) ", @object\n" \
+        INCBIN_SYM_END(NAME) ":\n" \
+        ".balign 4\n" \
+        ".global " INCBIN_SYM_SIZE(NAME) "\n" \
+        ".type " INCBIN_SYM_SIZE(NAME) ", @object\n" \
+        INCBIN_SYM_SIZE(NAME) ":\n" \
+        ".int " INCBIN_SYM_END(NAME) " - " INCBIN_SYM_DATA(NAME) "\n" \
+    ); \
+    INCBIN_EXTERN(NAME)
+
+#endif

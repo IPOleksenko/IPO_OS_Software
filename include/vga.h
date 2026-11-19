@@ -24,9 +24,14 @@ enum vga_color {
     VGA_COLOR_WHITE = 15,
 };
 
-#define VGA_WIDTH 80
-#define VGA_HEIGHT 25
-#define VGA_MEMORY ((volatile uint16_t*)0xB8000)
+uint16_t vga_get_width(void);
+uint16_t vga_get_height(void);
+volatile uint16_t *vga_get_memory(void);
+void vga_get_text_mode_info(uint16_t *out_w, uint16_t *out_h, uint32_t *out_vram_addr);
+
+#define VGA_WIDTH  (vga_get_width())
+#define VGA_HEIGHT (vga_get_height())
+#define VGA_MEMORY (vga_get_memory())
 
 #define VGA_START_CURSOR_POSITION (VGA_WIDTH * 2)
 
@@ -69,7 +74,8 @@ void vga_cursor_reset_blink(void);
 
 void vga_cursor_reset(void);
 
-extern const uint8_t vga_default_font_data[256][16];
+const uint8_t *vga_default_font_get_glyph(uint8_t char_code);
+void vga_default_font_copy_all(uint8_t *dst_4096);
 const uint8_t* vga_font_get_cached_glyph(uint8_t char_code);
 void vga_init_font_cache(void);
 

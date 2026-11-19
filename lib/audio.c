@@ -1,3 +1,7 @@
+/*
+ * Userspace wrappers for kernel audio stream management syscalls.
+ */
+
 #include <driver/audio_core.h>
 #include <driver/sound.h>
 #include <syscall.h>
@@ -98,12 +102,6 @@ void audio_tick(void) {
 
 void sb16_stop(void) {
     ipo_syscall(IPO_SYSCALL_AUDIO_STOP_ALL, 0u, NULL);
-}
-
-bool sb16_get_dsp_version(uint8_t *major, uint8_t *minor) {
-    if (major) *major = 4;
-    if (minor) *minor = 5;
-    return true;
 }
 
 void audio_stop_all(void) {

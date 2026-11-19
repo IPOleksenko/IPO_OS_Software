@@ -1,0 +1,63 @@
+#pragma once
+#include <cstdint>
+extern "C" {
+#include <system/timer.h>
+}
+
+namespace std::chrono {
+
+template <intmax_t Num, intmax_t Den = 1>
+struct ratio {
+    static constexpr intmax_t num = Num;
+    static constexpr intmax_t den = Den;
+};
+
+template <class Rep, class Period = ratio<1>>
+class duration {
+    Rep m_count = 0;
+public:
+    using rep = Rep;
+    using period = Period;
+    constexpr duration() noexcept = default;
+    constexpr explicit duration(Rep r) noexcept : m_count(r) {}
+    constexpr Rep count() const noexcept { return m_count; }
+};
+
+using nanoseconds  = duration<int64_t, ratio<1, 1000000000LL>>;
+using microseconds = duration<int64_t, ratio<1, 1000000LL>>;
+using milliseconds = duration<int64_t, ratio<1, 1000LL>>;
+using seconds      = duration<int64_t, ratio<1, 1LL>>;
+
+template <class ToDur, class Rep, class Period>
+constexpr ToDur duration_cast(const duration<Rep, Period>& d) noexcept {
+    int64_t num = Period::num * ToDur::period::den;
+    int64_t den = Period::den * ToDur::period::num;
+    return ToDur(static_cast<typename ToDur::rep>(
+        (static_cast<int64_t>(d.count()) * num) / den));
+}
+
+class steady_clock {
+public:
+    using rep = int64_t;
+    using period = ratio<1, 1000000000LL>;
+    using duration = ::std::chrono::nanoseconds;
+
+    struct time_point {
+        duration m_since_epoch;
+        constexpr time_point() noexcept = default;
+        constexpr explicit time_point(duration d) noexcept : m_since_epoch(d) {}
+        constexpr duration time_since_epoch() const noexcept { return m_since_epoch; }
+        duration operator-(const time_point& o) const noexcept {
+            return duration(m_since_epoch.count() - o.m_since_epoch.count());
+        }
+    };
+
+    static time_point now() noexcept {
+        int64_t ns = static_cast<int64_t>(timer_millis()) * 1000000LL;
+        return time_point(duration(ns));
+    }
+};
+
+using high_resolution_clock = steady_clock;
+
+} // namespace std::chrono

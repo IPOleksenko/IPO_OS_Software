@@ -1,0 +1,14 @@
+#pragma once
+
+namespace std {
+
+class exception {
+public:
+    exception() noexcept = default;
+    virtual ~exception() noexcept;
+    virtual const char* what() const noexcept;
+};
+
+void terminate() noexcept __attribute__((__noreturn__));
+
+} // namespace std

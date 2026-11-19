@@ -11,11 +11,14 @@
 #include "d_main.h"
 
 int main(int argc, char **argv) {
-    /* Set up environment for DOOM */
-    setenv("HOME", "/", 1);
+    /* Store DOOM config, saves, and screenshots inside /data/doom */
+    extern int mkdir(const char *pathname, uint32_t mode);
+    mkdir("/data", 0755);
+    mkdir("/data/doom", 0755);
+    setenv("HOME", "/data/doom", 1);
 
-    if (access("/applications/doom1.wad", 0) == 0) {
-        setenv("DOOMWADDIR", "/applications", 1);
+    if (access("/data/doom/doom1.wad", 0) == 0) {
+        setenv("DOOMWADDIR", "/data/doom", 1);
     } else if (access("/doom1.wad", 0) == 0) {
         setenv("DOOMWADDIR", "", 1);
     } else {
@@ -29,4 +32,3 @@ int main(int argc, char **argv) {
 
     return 0;
 }
-

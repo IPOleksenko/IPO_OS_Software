@@ -106,8 +106,13 @@ static uint8_t *parse_magic_string(const char *input, uint32_t *out_len) {
     while (*p != '\0') {
         uint8_t byte = 0;
         if (p[0] == '\\' && p[1] == 'x' && isxdigit((unsigned char)p[2]) && isxdigit((unsigned char)p[3])) {
-            char hex[3] = { p[2], p[3], '\0' };
-            byte = (uint8_t)strtoul(hex, NULL, 16);
+            unsigned char hi = (unsigned char)p[2];
+            unsigned char lo = (unsigned char)p[3];
+            uint8_t h = (hi >= '0' && hi <= '9') ? (uint8_t)(hi - '0') :
+                        (hi >= 'a' && hi <= 'f') ? (uint8_t)(hi - 'a' + 10) : (uint8_t)(hi - 'A' + 10);
+            uint8_t l = (lo >= '0' && lo <= '9') ? (uint8_t)(lo - '0') :
+                        (lo >= 'a' && lo <= 'f') ? (uint8_t)(lo - 'a' + 10) : (uint8_t)(lo - 'A' + 10);
+            byte = (uint8_t)((h << 4) | l);
             p += 4;
         } else if (p[0] == '\\' && p[1] == 'n') {
             byte = '\n';
@@ -192,7 +197,7 @@ static void populate_ecosystem_formats(binfmt_reg_table_t *table) {
                      "/applications/lua",
                      "Lua Script Header Tag (#lua)");
 
-    /* 5. TinyCC in-OS C script execution (//tcc, /*tcc, #!/applications/tcc) */
+    /* 5. TinyCC direct C script execution */
     binfmt_table_add(table, "TccHashbang", "#!/applications/tcc", 19, 0,
                      "/applications/tcc -run",
                      "TinyCC Direct C Script (#!/applications/tcc)");
@@ -254,8 +259,6 @@ static int cmd_init(bool verbose) {
     if (verbose) {
         printf("-----------------------------------------------------------------\n");
         printf("Result: %d format(s) registered successfully (%d errors).\n", registered, errors);
-        printf("Kernel default loader remains strictly bare-metal (0x800000).\n");
-        printf("Non-bare-metal files are matched dynamically by header bytes.\n");
         printf("=================================================================\n");
     }
 

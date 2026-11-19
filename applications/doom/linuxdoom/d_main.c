@@ -334,6 +334,8 @@ void D_Display (void)
 	{
 	    nowtime = I_GetTime ();
 	    tics = nowtime - wipestart;
+	    if (!tics)
+		I_WaitVBL (1);
 	} while (!tics);
 	wipestart = nowtime;
 	done = wipe_ScreenWipe(wipe_Melt
@@ -1153,7 +1155,11 @@ void D_DoomMain (void)
 	if (M_CheckParm("-cdrom"))
 	    sprintf(file, "c:\\doomdata\\"SAVEGAMENAME"%c.dsg",myargv[p+1][0]);
 	else
-	    sprintf(file, SAVEGAMENAME"%c.dsg",myargv[p+1][0]);
+	{
+	    const char* home = getenv("HOME");
+	    if (!home || !home[0]) home = "/data/doom";
+	    snprintf(file, sizeof(file), "%s/"SAVEGAMENAME"%c.dsg", home, myargv[p+1][0]);
+	}
 	G_LoadGame (file);
     }
 	

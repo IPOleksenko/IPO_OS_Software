@@ -1,0 +1,4 @@
+Links 2.22
+Source: https://github.com/nmbazima/LinksWWWbrowser
+Commit: cacf08075056d6ab27cd24bf3605606c14d0ef5f
+Imported files: the upstream links_SOURCES set from Makefile.am, plus COPYING.

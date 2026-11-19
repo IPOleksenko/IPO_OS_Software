@@ -666,15 +666,31 @@ void TryRunTics (void)
     availabletics = lowtic - gametic/ticdup;
     
     // decide how many tics to run
-    if (realtics < availabletics-1)
-	counts = realtics+1;
-    else if (realtics < availabletics)
-	counts = realtics;
-    else
+    if (doomcom->numnodes <= 1)
+    {
+	if (availabletics <= 0)
+	{
+	    // Pump input events and return immediately for uncapped frame presentation
+	    I_StartTic ();
+	    D_ProcessEvents ();
+	    return;
+	}
 	counts = availabletics;
-    
-    if (counts < 1)
-	counts = 1;
+	if (counts > 5)
+	    counts = 5;
+    }
+    else
+    {
+	if (realtics < availabletics-1)
+	    counts = realtics+1;
+	else if (realtics < availabletics)
+	    counts = realtics;
+	else
+	    counts = availabletics;
+
+	if (counts < 1)
+	    counts = 1;
+    }
 		
     frameon++;
 
@@ -729,7 +745,8 @@ void TryRunTics (void)
 	{
 	    M_Ticker ();
 	    return;
-	} 
+	}
+	I_WaitVBL (1);
     }
     
     // run the count * ticdup dics

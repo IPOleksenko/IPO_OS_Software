@@ -1,0 +1,4 @@
+[submodule "third_party/SENSE-The-Game"]
+	path = third_party/SENSE-The-Game
+	url = https://github.com/IPOleksenko/SENSE-The-Game
+

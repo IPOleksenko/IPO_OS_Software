@@ -18,7 +18,7 @@
 extern void I_ShutdownGraphics(void);
 
 /* Default environment array for libc getenv() */
-static char s_home_env[] = "HOME=/";
+static char s_home_env[] = "HOME=/data/doom";
 static char s_wad_env[] = "DOOMWADDIR=";
 static char *s_default_environ[] = {
     s_home_env,

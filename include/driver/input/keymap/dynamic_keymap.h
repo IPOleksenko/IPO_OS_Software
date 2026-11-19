@@ -69,8 +69,8 @@
  */
 typedef struct {
     uint8_t scancode;          /* Key scancode */
-    char normal[8];            /* Normal output string (supports UTF-8 / multi-byte) */
-    char shift[8];             /* Shift output string (supports UTF-8 / multi-byte) */
+    const char *normal;        /* Normal output string (supports arbitrary length) */
+    const char *shift;         /* Shift output string (supports arbitrary length) */
 } keymap_entry_t;
 
 #include <vga.h>

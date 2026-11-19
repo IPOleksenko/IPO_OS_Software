@@ -1,5 +1,6 @@
 #include <net/dyn_buf.h>
 #include <memory/kmalloc.h>
+#include <stdio.h>
 #include <string.h>
 
 #define DYN_BUF_DEFAULT_CAP 64
@@ -168,8 +169,87 @@ bool dyn_str_append(dyn_str_t *ds, const char *suffix) {
 }
 
 bool dyn_str_append_char(dyn_str_t *ds, char c) {
-    char s[2] = {c, '\0'};
-    return dyn_str_append(ds, s);
+    if (!ds) return false;
+    size_t needed = ds->len + 2;
+    if (needed > ds->capacity) {
+        size_t new_cap = ds->capacity ? ds->capacity * 2 : 32;
+        while (new_cap < needed) new_cap *= 2;
+        char *new_cstr = (char *)krealloc(ds->cstr, new_cap);
+        if (!new_cstr) return false;
+        ds->cstr = new_cstr;
+        ds->capacity = new_cap;
+    }
+    ds->cstr[ds->len++] = c;
+    ds->cstr[ds->len] = '\0';
+    return true;
+}
+
+static bool dyn_str_write_vprintf(dyn_str_t *ds, bool append_mode, const char *fmt, va_list ap) {
+    if (!ds || !fmt) return false;
+    va_list aq;
+    va_copy(aq, ap);
+    int n = vsnprintf(NULL, 0, fmt, aq);
+    va_end(aq);
+    if (n < 0) return false;
+
+    size_t base = append_mode ? ds->len : 0;
+    size_t needed = base + (size_t)n + 1;
+    if (needed > ds->capacity) {
+        size_t new_cap = ds->capacity ? ds->capacity * 2 : 32;
+        while (new_cap < needed) new_cap *= 2;
+        char *nb = (char *)krealloc(ds->cstr, new_cap);
+        if (!nb) return false;
+        ds->cstr = nb;
+        ds->capacity = new_cap;
+    }
+    vsnprintf(ds->cstr + base, (size_t)n + 1, fmt, ap);
+    ds->len = base + (size_t)n;
+    return true;
+}
+
+bool dyn_str_vprintf(dyn_str_t *ds, const char *fmt, va_list ap) {
+    return dyn_str_write_vprintf(ds, false, fmt, ap);
+}
+
+bool dyn_str_printf(dyn_str_t *ds, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    bool ok = dyn_str_vprintf(ds, fmt, ap);
+    va_end(ap);
+    return ok;
+}
+
+bool dyn_str_append_vprintf(dyn_str_t *ds, const char *fmt, va_list ap) {
+    return dyn_str_write_vprintf(ds, true, fmt, ap);
+}
+
+bool dyn_str_append_printf(dyn_str_t *ds, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    bool ok = dyn_str_append_vprintf(ds, fmt, ap);
+    va_end(ap);
+    return ok;
+}
+
+bool dyn_buf_append_printf(dyn_buf_t *buf, const char *fmt, ...) {
+    if (!buf || !fmt) return false;
+    va_list ap, aq;
+    va_start(ap, fmt);
+    va_copy(aq, ap);
+    int n = vsnprintf(NULL, 0, fmt, aq);
+    va_end(aq);
+    if (n < 0) {
+        va_end(ap);
+        return false;
+    }
+    if (!dyn_buf_reserve(buf, buf->size + (size_t)n + 1)) {
+        va_end(ap);
+        return false;
+    }
+    vsnprintf((char *)(buf->data + buf->size), (size_t)n + 1, fmt, ap);
+    va_end(ap);
+    buf->size += (size_t)n;
+    return true;
 }
 
 const char *dyn_str_c(const dyn_str_t *ds) {

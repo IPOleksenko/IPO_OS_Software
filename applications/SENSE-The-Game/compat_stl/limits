@@ -1,0 +1,45 @@
+#pragma once
+#include <limits.h>
+#include <cstdint>
+
+namespace std {
+
+template <class T> struct numeric_limits;
+
+template <> struct numeric_limits<int> {
+    static constexpr bool is_specialized = true;
+    static constexpr int min() noexcept { return INT_MIN; }
+    static constexpr int max() noexcept { return INT_MAX; }
+};
+
+template <> struct numeric_limits<unsigned int> {
+    static constexpr bool is_specialized = true;
+    static constexpr unsigned int min() noexcept { return 0; }
+    static constexpr unsigned int max() noexcept { return UINT_MAX; }
+};
+
+template <> struct numeric_limits<long> {
+    static constexpr bool is_specialized = true;
+    static constexpr long min() noexcept { return LONG_MIN; }
+    static constexpr long max() noexcept { return LONG_MAX; }
+};
+
+template <> struct numeric_limits<long long> {
+    static constexpr bool is_specialized = true;
+    static constexpr long long min() noexcept { return LLONG_MIN; }
+    static constexpr long long max() noexcept { return LLONG_MAX; }
+};
+
+template <> struct numeric_limits<double> {
+    static constexpr bool is_specialized = true;
+    static constexpr double min() noexcept { return 2.2250738585072014e-308; }
+    static constexpr double max() noexcept { return 1.7976931348623157e+308; }
+};
+
+template <> struct numeric_limits<float> {
+    static constexpr bool is_specialized = true;
+    static constexpr float min() noexcept { return 1.17549435e-38f; }
+    static constexpr float max() noexcept { return 3.40282347e+38f; }
+};
+
+} // namespace std

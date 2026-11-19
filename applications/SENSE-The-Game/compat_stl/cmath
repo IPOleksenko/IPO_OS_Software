@@ -1,0 +1,12 @@
+#pragma once
+#include <math.h>
+namespace std {
+    using ::sin;
+    using ::cos;
+    using ::sqrt;
+    using ::floor;
+    using ::ceil;
+    using ::fabs;
+    using ::pow;
+    using ::fmod;
+}

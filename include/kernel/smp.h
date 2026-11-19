@@ -5,7 +5,6 @@
 #include <stdbool.h>
 #include <stddef.h>
 
-/* Component status flags for honest architectural scaffolding evaluation */
 typedef enum {
     SMP_STATUS_INACTIVE = 0,
     SMP_STATUS_ACTIVE   = 1,
@@ -13,29 +12,31 @@ typedef enum {
 } smp_status_t;
 
 typedef struct {
-    smp_status_t cpu_capability_detection;    /* ACTIVE: CPUID leaf 1 & feature flags */
-    smp_status_t acpi_madt_enumeration;       /* ACTIVE: ACPI RSDP -> RSDT -> MADT APIC entries */
-    smp_status_t mp_table_fallback;           /* ACTIVE: MP floating pointer table scanning */
-    smp_status_t per_cpu_structures;          /* ACTIVE: Per-CPU stacks and cpu_info_t state */
-    smp_status_t atomic_spinlocks;            /* ACTIVE: Hardware bus-locked spinlocks */
-    smp_status_t ap_boot_sequence;            /* ACTIVE: INIT-SIPI-SIPI via LAPIC ICR */
-    smp_status_t driver_reentrancy;           /* BLOCKED: ATA/VGA/Net drivers lack fine-grained locks */
-    smp_status_t ipi_cross_core_reschedule;   /* BLOCKED: Requires APIC timer/IPI IDT vectors */
-    smp_status_t cross_core_scheduler;        /* BLOCKED: Requires multi-queue preemptive SMP scheduler */
+    smp_status_t cpu_capability_detection;
+    smp_status_t acpi_madt_enumeration;
+    smp_status_t mp_table_fallback;
+    smp_status_t per_cpu_structures;
+    smp_status_t atomic_spinlocks;
+    smp_status_t ap_boot_sequence;
+    smp_status_t driver_reentrancy;
+    smp_status_t ipi_cross_core_reschedule;
+    smp_status_t cross_core_scheduler;
 } smp_architecture_status_t;
 
-/* Per-CPU information structure */
 typedef struct {
-    uint32_t cpu_id;           /* Logical core ID (0 = BSP, 1..N = AP) */
-    uint32_t lapic_id;         /* Local APIC ID */
-    bool is_bsp;               /* Bootstrap processor */
-    volatile bool is_online;   /* Online / active */
-    uint32_t stack_base;       /* Allocated per-CPU stack base */
-    uint32_t stack_top;        /* Per-CPU stack top (ESP) */
-    volatile uint32_t ticks;   /* Per-CPU tick counter */
+    uint32_t cpu_id;
+    uint32_t lapic_id;
+    bool is_bsp;
+    volatile bool is_online;
+    uint32_t stack_base;
+    uint32_t stack_top;
+    volatile uint32_t ticks;
+    volatile uint32_t tasks_executed;
+    volatile uint32_t tasks_queued;
+    volatile uint32_t busy;
+    volatile uint32_t current_task_id;
 } cpu_info_t;
 
-/* Hardware bus-locked atomic spinlock */
 typedef struct {
     volatile uint32_t lock;
 } spinlock_t;
@@ -61,32 +62,55 @@ static inline bool spin_trylock(spinlock_t *sl) {
     return !__atomic_test_and_set(&sl->lock, __ATOMIC_ACQUIRE);
 }
 
-/* SMP Subsystem API */
+#define SMP_CPU_ANY              0xFFFFFFFFu
+
+#define SMP_ERR_OK               0
+#define SMP_ERR_INVALID_PARAM   -1
+#define SMP_ERR_INVALID_CPU     -2
+#define SMP_ERR_CPU_OFFLINE     -3
+#define SMP_ERR_QUEUE_FULL      -4
+#define SMP_ERR_NOT_FOUND       -5
+#define SMP_ERR_TIMEOUT         -6
+
+#define SMP_TASK_STATE_FREE      0u
+#define SMP_TASK_STATE_QUEUED    1u
+#define SMP_TASK_STATE_RUNNING   2u
+#define SMP_TASK_STATE_COMPLETED 3u
+#define SMP_TASK_STATE_FAILED    4u
+
+typedef uint32_t (*smp_work_fn_t)(uint32_t cpu_id, uintptr_t arg);
+
+typedef struct {
+    uint32_t task_id;
+    uint32_t requested_cpu;
+    uint32_t assigned_cpu;
+    uint32_t executed_cpu;
+    uint32_t executed_lapic_id;
+    uint32_t state;
+    uint32_t return_value;
+    uint32_t exec_ticks;
+} smp_task_result_t;
+
 void smp_init(void);
+void smp_sync_paging(uint32_t kernel_cr3);
 uint32_t smp_get_cpu_count(void);
 uint32_t smp_get_active_cpu_count(void);
 const cpu_info_t *smp_get_cpu_info(uint32_t cpu_id);
 uint32_t smp_get_current_cpu_id(void);
+uint32_t smp_get_hw_lapic_id(void);
 const smp_architecture_status_t *smp_get_architecture_status(void);
 uint32_t smp_get_lapic_base(void);
 void smp_print_summary(void);
 
-/* Cross-Core Communication & Diagnostic APIs */
-void ap_main(uint32_t cpu_id);
 void smp_send_ipi(uint32_t target_lapic_id, uint8_t vector);
 void smp_send_broadcast_ipi(uint8_t vector);
 uint32_t smp_get_ipi_count(uint32_t cpu_id);
 typedef void (*smp_task_fn_t)(uint32_t cpu_id, void *arg);
 void smp_broadcast_task(smp_task_fn_t fn, void *arg);
 
-
-
-/* Extended CPU capability queries */
-void smp_get_cpu_vendor(char *buf, size_t max_len);
-void smp_get_cpu_brand(char *buf, size_t max_len);
-void smp_get_cpu_features_str(char *buf, size_t max_len);
-void smp_get_cpu_model_info(uint32_t *family, uint32_t *model, uint32_t *stepping);
+int  smp_submit_task(uint32_t target_cpu, smp_work_fn_t fn, uintptr_t arg,
+                     uint32_t flags, uint32_t *out_task_id);
+int  smp_wait_task(uint32_t task_id, uint32_t timeout_ms, smp_task_result_t *out_res);
+void smp_poll_local_tasks(void);
 
 #endif /* KERNEL_SMP_H */
-
-

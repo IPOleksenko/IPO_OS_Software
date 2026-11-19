@@ -3,10 +3,11 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <stddef.h>
 
-#define VGA_GFX_WIDTH   320
-#define VGA_GFX_HEIGHT  200
-#define VGA_GFX_SIZE    (VGA_GFX_WIDTH * VGA_GFX_HEIGHT)
+#define VGA_GFX_WIDTH     320
+#define VGA_GFX_HEIGHT    200
+#define VGA_GFX_SIZE      ((size_t)VGA_GFX_WIDTH * (size_t)VGA_GFX_HEIGHT)
 #define VGA_GFX_VRAM_ADDR 0xA0000
 
 /* VGA Raw Graphics Overlay Flags */
@@ -46,11 +47,15 @@ void vga_gfx_buf_draw_circle(uint8_t *buf, int xc, int yc, int r, uint8_t color)
 void vga_gfx_buf_fill_circle(uint8_t *buf, int xc, int yc, int r, uint8_t color);
 void vga_gfx_buf_draw_line(uint8_t *buf, int x0, int y0, int x1, int y1, uint8_t color);
 void vga_gfx_flip(const uint8_t *buf);
+void vga_gfx_flip_scaled(const uint8_t *buf);
+void vga_gfx_flip_scaled_buffer(const uint8_t *buf, int width, int height);
 
 /* Active display bounds */
+void vga_gfx_probe_screen_size(void);
 void vga_gfx_get_screen_bounds(int *out_w, int *out_h);
 int  vga_gfx_get_width(void);
 int  vga_gfx_get_height(void);
+bool vga_gfx_set_resolution(int width, int height);
 
 /* Overlay controls */
 void vga_set_overlay_flags(uint32_t flags);

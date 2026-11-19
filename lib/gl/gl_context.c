@@ -215,6 +215,11 @@ bool gl_resize_context(GLContext *ctx, int new_w, int new_h) {
     ctx->color_buffer = new_color;
     ctx->z_buffer = new_z;
     ctx->stencil_buffer = new_stencil;
+    if (ctx->scissor_x == 0 && ctx->scissor_y == 0 &&
+        ctx->scissor_w == ctx->width && ctx->scissor_h == ctx->height) {
+        ctx->scissor_w = new_w;
+        ctx->scissor_h = new_h;
+    }
     ctx->width = new_w;
     ctx->height = new_h;
     ctx->vp_w = new_w;
@@ -257,14 +262,24 @@ void gl_swap_buffers(GLContext *ctx, void *win_ptr) {
         }
     } else {
         /*
-         * Standalone Mode 13h (like figure.c): route through kernel vga_gfx_flip
-         * so concurrent/background workspaces isolate VRAM properly.
+         * Standalone graphics: scale through kernel vga_gfx_flip_scaled_buffer
+         * so it uses the OS-configured resolution and isolates VRAM properly.
          */
-        static uint8_t s_mode13h_frame[320 * 200];
-        int w = ctx->width  < 320 ? ctx->width  : 320;
-        int h = ctx->height < 200 ? ctx->height : 200;
-        gl_quantize_argb_to_palette_strided(ctx->color_buffer, ctx->width, s_mode13h_frame, 320, w, h);
-        vga_gfx_flip(s_mode13h_frame);
+        static uint8_t *s_mode13h_frame = NULL;
+        static size_t s_mode13h_frame_cap = 0;
+        int w = ctx->width;
+        int h = ctx->height;
+        if (w > 0 && h > 0 && (size_t)w <= SIZE_MAX / (size_t)h) {
+            size_t need = (size_t)w * (size_t)h;
+            if (need > s_mode13h_frame_cap) {
+                uint8_t *nf = (uint8_t *)krealloc(s_mode13h_frame, need);
+                if (!nf) return;
+                s_mode13h_frame = nf;
+                s_mode13h_frame_cap = need;
+            }
+            gl_quantize_argb_to_palette_strided(ctx->color_buffer, ctx->width, s_mode13h_frame, w, w, h);
+            vga_gfx_flip_scaled_buffer(s_mode13h_frame, w, h);
+        }
     }
 }
 

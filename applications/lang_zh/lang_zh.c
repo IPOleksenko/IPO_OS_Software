@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <string.h>
 #include <syscall.h>
 #include <driver/input/keymap/dynamic_keymap.h>
 

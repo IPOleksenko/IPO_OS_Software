@@ -36,6 +36,7 @@ struct stat {
 #define S_IFSOCK 0140000
 
 #define S_ISCHR(m)  (((m) & S_IFMT) == S_IFCHR)
+#define S_ISREG(m)  (((m) & S_IFMT) == S_IFREG)
 #define S_ISBLK(m)  (((m) & S_IFMT) == S_IFBLK)
 #define S_ISFIFO(m) (((m) & S_IFMT) == S_IFIFO)
 #define S_ISLNK(m)  (((m) & S_IFMT) == S_IFLNK)

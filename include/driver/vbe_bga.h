@@ -39,7 +39,6 @@
 
 typedef struct {
     bool     available;
-    uint16_t version;
     uint32_t lfb_addr;
     int      width;
     int      height;

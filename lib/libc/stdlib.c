@@ -11,112 +11,273 @@
  * ------------------------------------------------------------- */
 
 #define BLOCK_MAGIC 0x4D414C43 /* "MALC" */
+#define NUM_BINS    32u
 
 typedef struct block_hdr {
-    size_t size;               /* Payload size in bytes */
+    size_t size;               /* Payload size in bytes (always ALIGN8) */
     uint32_t magic;
     int is_free;
-    struct block_hdr *next;
-    struct block_hdr *prev;
+    int bin_idx;
+    struct block_hdr *phys_prev;
+    struct block_hdr *phys_next;
+    struct block_hdr *free_prev;
+    struct block_hdr *free_next;
 } block_hdr_t;
 
 #define HDR_SIZE sizeof(block_hdr_t)
 #define ALIGN8(s) (((s) + 7u) & ~7u)
 
 static block_hdr_t *heap_head = NULL;
+static block_hdr_t *heap_tail = NULL;
+static block_hdr_t *free_bins[NUM_BINS];
+static uint32_t bin_bitmap = 0;
+static volatile uint8_t heap_lock = 0;
 
-void *malloc(size_t size) {
+static uint32_t size_to_bin(size_t size) {
+    if (size <= 128u) {
+        if (size < 8u) return 0u;
+        return (uint32_t)((size >> 3) - 1u);
+    }
+    if (size < 256u) return 16u;
+    uint32_t msb = 31u - (uint32_t)__builtin_clz((uint32_t)size);
+    uint32_t b = msb + 9u;
+    if (b >= NUM_BINS) b = NUM_BINS - 1u;
+    return b;
+}
+
+static void bin_insert(block_hdr_t *b) {
+    uint32_t idx = size_to_bin(b->size);
+    b->is_free = 1;
+    b->bin_idx = (int)idx;
+    b->free_prev = NULL;
+    b->free_next = free_bins[idx];
+    if (free_bins[idx]) {
+        free_bins[idx]->free_prev = b;
+    }
+    free_bins[idx] = b;
+    bin_bitmap |= (1u << idx);
+}
+
+static void bin_remove(block_hdr_t *b) {
+    if (!b->is_free) return;
+    uint32_t idx = (uint32_t)b->bin_idx;
+    if (b->free_prev) {
+        b->free_prev->free_next = b->free_next;
+    } else if (idx < NUM_BINS) {
+        free_bins[idx] = b->free_next;
+    }
+    if (b->free_next) {
+        b->free_next->free_prev = b->free_prev;
+    }
+    if (idx < NUM_BINS && free_bins[idx] == NULL) {
+        bin_bitmap &= ~(1u << idx);
+    }
+    b->free_prev = NULL;
+    b->free_next = NULL;
+    b->is_free = 0;
+}
+
+static void heap_lock_acquire(void) {
+    while (__sync_lock_test_and_set(&heap_lock, 1u)) {
+        __asm__ volatile("pause");
+    }
+}
+
+static void heap_lock_release(void) {
+    __sync_lock_release(&heap_lock);
+}
+
+static void *heap_sbrk_reserve(size_t size) {
+    if (size == 0u) return sbrk(0);
+
+    if (size <= 0x7FFFFFFFu) {
+        void *p = sbrk((intptr_t)size);
+        if (p == (void *)-1 || p == NULL) {
+            errno = ENOMEM;
+            return NULL;
+        }
+        return p;
+    }
+
+    /* size > 2 GiB: split into two sbrk calls; still single-chunk since the */
+    void *base = sbrk((intptr_t)0x7FFFFFFF);
+    if (base == (void *)-1 || base == NULL) { errno = ENOMEM; return NULL; }
+    size_t remaining = size - 0x7FFFFFFFu;
+    void *next = sbrk((intptr_t)(remaining <= 0x7FFFFFFFu ? remaining : 0x7FFFFFFFu));
+    if (next == (void *)-1 || next == NULL) {
+        sbrk(-(intptr_t)0x7FFFFFFF); /* try to rollback first chunk */
+        errno = ENOMEM;
+        return NULL;
+    }
+    return base;
+}
+
+static block_hdr_t *split_block_remainder(block_hdr_t *blk, size_t size) {
+    if (blk->size >= size + HDR_SIZE + 16u) {
+        size_t rem_size = blk->size - size - HDR_SIZE;
+        block_hdr_t *rem = (block_hdr_t *)((uint8_t *)blk + HDR_SIZE + size);
+        rem->magic = BLOCK_MAGIC;
+        rem->size = rem_size;
+        rem->is_free = 0;
+        rem->bin_idx = 0;
+        rem->free_prev = NULL;
+        rem->free_next = NULL;
+        rem->phys_next = blk->phys_next;
+        rem->phys_prev = blk;
+        if (blk->phys_next) blk->phys_next->phys_prev = rem;
+        else heap_tail = rem;
+        blk->phys_next = rem;
+        blk->size = size;
+        bin_insert(rem);
+    }
+    return blk;
+}
+
+static void *malloc_locked(size_t size) {
     if (size == 0) return NULL;
+    if (size > (size_t)-1 - HDR_SIZE - 7u) {
+        errno = ENOMEM;
+        return NULL;
+    }
     size = ALIGN8(size);
 
-    /* Search free list */
-    block_hdr_t *curr = heap_head;
-    while (curr) {
-        if (curr->magic == BLOCK_MAGIC && curr->is_free && curr->size >= size) {
-            curr->is_free = 0;
-            if (curr->size >= size + HDR_SIZE + 16) {
-                size_t rem_size = curr->size - size - HDR_SIZE;
-                block_hdr_t *rem = (block_hdr_t *)((uint8_t *)curr + HDR_SIZE + size);
-                rem->magic = BLOCK_MAGIC;
-                rem->size = rem_size;
-                rem->is_free = 1;
-                rem->next = curr->next;
-                rem->prev = curr;
-                if (curr->next) curr->next->prev = rem;
-                curr->next = rem;
-                curr->size = size;
+    /* O(1) segregated free-list lookup */
+    uint32_t b = size_to_bin(size);
+    block_hdr_t *fit = NULL;
+
+    if (bin_bitmap & (1u << b)) {
+        block_hdr_t *curr = free_bins[b];
+        if (b < 16u) {
+            /* Exact size bin: first block matches */
+            if (curr && curr->magic == BLOCK_MAGIC && curr->is_free && curr->size >= size) {
+                fit = curr;
             }
-            return (void *)((uint8_t *)curr + HDR_SIZE);
+        } else {
+            int max_probe = (b == NUM_BINS - 1u) ? 4096 : 64;
+            while (curr && max_probe-- > 0) {
+                if (curr->magic == BLOCK_MAGIC && curr->is_free && curr->size >= size) {
+                    fit = curr;
+                    break;
+                }
+                curr = curr->free_next;
+            }
         }
-        curr = curr->next;
+    }
+
+    if (!fit && b + 1u < NUM_BINS) {
+        uint32_t upper_mask = bin_bitmap & (~0u << (b + 1u));
+        if (upper_mask != 0u) {
+            uint32_t b2 = (uint32_t)__builtin_ctz(upper_mask);
+            block_hdr_t *curr = free_bins[b2];
+            if (b2 == NUM_BINS - 1u) {
+                while (curr) {
+                    if (curr->magic == BLOCK_MAGIC && curr->is_free && curr->size >= size) {
+                        fit = curr;
+                        break;
+                    }
+                    curr = curr->free_next;
+                }
+            } else if (curr && curr->magic == BLOCK_MAGIC && curr->is_free && curr->size >= size) {
+                fit = curr;
+            }
+        }
+    }
+
+    if (fit) {
+        bin_remove(fit);
+        split_block_remainder(fit, size);
+        return (void *)((uint8_t *)fit + HDR_SIZE);
     }
 
     /* Request memory from kernel */
     size_t alloc_size = ALIGN8(size + HDR_SIZE);
-    if (alloc_size < 65536) {
-        alloc_size = 65536; /* Allocate in 64KB chunks to reduce syscall overhead */
+    if (alloc_size < 65536u) {
+        alloc_size = 65536u; /* Allocate in 64KB chunks to reduce syscall overhead */
     }
 
-    void *p = sbrk((intptr_t)alloc_size);
-    if (p == (void *)-1 || p == NULL) {
+    void *p = heap_sbrk_reserve(alloc_size);
+    if (p == NULL) {
         errno = ENOMEM;
         return NULL;
     }
 
     block_hdr_t *new_block = (block_hdr_t *)p;
     new_block->magic = BLOCK_MAGIC;
-    new_block->size = size;
+    new_block->size = alloc_size - HDR_SIZE;
     new_block->is_free = 0;
-    new_block->next = NULL;
-    new_block->prev = NULL;
+    new_block->bin_idx = 0;
+    new_block->phys_next = NULL;
+    new_block->free_prev = NULL;
+    new_block->free_next = NULL;
 
-    /* If chunk is bigger than requested, create a free remainder block */
-    size_t leftover = alloc_size - (size + HDR_SIZE);
-    if (leftover >= HDR_SIZE + 16) {
-        block_hdr_t *rem = (block_hdr_t *)((uint8_t *)p + HDR_SIZE + size);
-        rem->magic = BLOCK_MAGIC;
-        rem->size = leftover - HDR_SIZE;
-        rem->is_free = 1;
-        rem->next = NULL;
-        rem->prev = new_block;
-        new_block->next = rem;
-    }
+    bool contiguous = heap_tail != NULL &&
+        (uint8_t *)heap_tail + HDR_SIZE + heap_tail->size == (uint8_t *)new_block;
 
-    /* Append to heap list */
+    new_block->phys_prev = contiguous ? heap_tail : NULL;
+
     if (!heap_head) {
         heap_head = new_block;
-    } else {
-        block_hdr_t *tail = heap_head;
-        while (tail->next) tail = tail->next;
-        tail->next = new_block;
-        new_block->prev = tail;
+    } else if (heap_tail && contiguous) {
+        heap_tail->phys_next = new_block;
+    }
+    heap_tail = new_block;
+
+    split_block_remainder(new_block, size);
+    return (void *)((uint8_t *)new_block + HDR_SIZE);
+}
+
+void *malloc(size_t size) {
+    heap_lock_acquire();
+    void *result = malloc_locked(size);
+    heap_lock_release();
+    return result;
+}
+
+static void free_locked(void *ptr) {
+    if (!ptr) return;
+    block_hdr_t *block = (block_hdr_t *)((uint8_t *)ptr - HDR_SIZE);
+    if (block->magic != BLOCK_MAGIC || block->is_free) return;
+
+    /* Coalesce with phys_next if free and physically contiguous */
+    block_hdr_t *nxt = block->phys_next;
+    if (nxt && nxt->magic == BLOCK_MAGIC && nxt->is_free &&
+        (uint8_t *)block + HDR_SIZE + block->size == (uint8_t *)nxt) {
+        bin_remove(nxt);
+        block->size += HDR_SIZE + nxt->size;
+        block->phys_next = nxt->phys_next;
+        if (nxt->phys_next) nxt->phys_next->phys_prev = block;
+        else heap_tail = block;
+        nxt->magic = 0;
     }
 
-    return (void *)((uint8_t *)new_block + HDR_SIZE);
+    /* Coalesce with phys_prev if free and physically contiguous */
+    block_hdr_t *prv = block->phys_prev;
+    if (prv && prv->magic == BLOCK_MAGIC && prv->is_free &&
+        (uint8_t *)prv + HDR_SIZE + prv->size == (uint8_t *)block) {
+        bin_remove(prv);
+        prv->size += HDR_SIZE + block->size;
+        prv->phys_next = block->phys_next;
+        if (block->phys_next) block->phys_next->phys_prev = prv;
+        else heap_tail = prv;
+        block->magic = 0;
+        block = prv;
+    }
+
+    bin_insert(block);
 }
 
 void free(void *ptr) {
     if (!ptr) return;
-    block_hdr_t *block = (block_hdr_t *)((uint8_t *)ptr - HDR_SIZE);
-    if (block->magic != BLOCK_MAGIC) return;
-    block->is_free = 1;
-
-    /* Coalesce with next if free */
-    if (block->next && block->next->magic == BLOCK_MAGIC && block->next->is_free) {
-        block->size += HDR_SIZE + block->next->size;
-        block->next = block->next->next;
-        if (block->next) block->next->prev = block;
-    }
-
-    /* Coalesce with prev if free */
-    if (block->prev && block->prev->magic == BLOCK_MAGIC && block->prev->is_free) {
-        block->prev->size += HDR_SIZE + block->size;
-        block->prev->next = block->next;
-        if (block->next) block->next->prev = block->prev;
-    }
+    heap_lock_acquire();
+    free_locked(ptr);
+    heap_lock_release();
 }
 
 void *calloc(size_t nmemb, size_t size) {
+    if (nmemb && size > (size_t)-1 / nmemb) {
+        errno = ENOMEM;
+        return NULL;
+    }
     size_t total = nmemb * size;
     void *p = malloc(total);
     if (p) memset(p, 0, total);
@@ -129,17 +290,48 @@ void *realloc(void *ptr, size_t new_size) {
         free(ptr);
         return NULL;
     }
-    block_hdr_t *block = (block_hdr_t *)((uint8_t *)ptr - HDR_SIZE);
-    if (block->magic != BLOCK_MAGIC) return NULL;
+    if (new_size > (size_t)-1 - HDR_SIZE - 7u) {
+        errno = ENOMEM;
+        return NULL;
+    }
+    size_t aligned_new = ALIGN8(new_size);
 
-    if (block->size >= new_size) {
+    heap_lock_acquire();
+    block_hdr_t *block = (block_hdr_t *)((uint8_t *)ptr - HDR_SIZE);
+    if (block->magic != BLOCK_MAGIC || block->is_free) {
+        heap_lock_release();
+        return NULL;
+    }
+
+    if (block->size >= aligned_new) {
+        heap_lock_release();
         return ptr;
     }
 
-    void *new_ptr = malloc(new_size);
-    if (!new_ptr) return NULL;
+    /* Try in-place expansion into contiguous free phys_next block */
+    block_hdr_t *nxt = block->phys_next;
+    if (nxt && nxt->magic == BLOCK_MAGIC && nxt->is_free &&
+        (uint8_t *)block + HDR_SIZE + block->size == (uint8_t *)nxt &&
+        block->size + HDR_SIZE + nxt->size >= aligned_new) {
+        bin_remove(nxt);
+        block->size += HDR_SIZE + nxt->size;
+        block->phys_next = nxt->phys_next;
+        if (nxt->phys_next) nxt->phys_next->phys_prev = block;
+        else heap_tail = block;
+        nxt->magic = 0;
+        split_block_remainder(block, aligned_new);
+        heap_lock_release();
+        return ptr;
+    }
+
+    void *new_ptr = malloc_locked(aligned_new);
+    if (!new_ptr) {
+        heap_lock_release();
+        return NULL;
+    }
     memcpy(new_ptr, ptr, block->size);
-    free(ptr);
+    free_locked(ptr);
+    heap_lock_release();
     return new_ptr;
 }
 
@@ -664,19 +856,51 @@ void srand(unsigned int seed) {
     rand_next = seed;
 }
 
-void qsort(void *base, size_t nmemb, size_t size, int (*compar)(const void *, const void *)) {
-    if (nmemb <= 1 || !base || size == 0) return;
-    char *arr = (char *)base;
-    for (size_t i = 0; i < nmemb - 1; i++) {
-        for (size_t j = i + 1; j < nmemb; j++) {
-            if (compar(arr + i * size, arr + j * size) > 0) {
-                for (size_t k = 0; k < size; k++) {
-                    char tmp = arr[i * size + k];
-                    arr[i * size + k] = arr[j * size + k];
-                    arr[j * size + k] = tmp;
-                }
-            }
+static void qsort_swap(char *a, char *b, size_t size) {
+    if (a == b || size == 0) return;
+    char *tmp = (char *)malloc(size);
+    if (tmp) {
+        memcpy(tmp, a, size);
+        memcpy(a, b, size);
+        memcpy(b, tmp, size);
+        free(tmp);
+        return;
+    }
+    while (size-- > 0) {
+        char t = *a;
+        *a++ = *b;
+        *b++ = t;
+    }
+}
+
+static void qsort_sift_down(char *arr, size_t start, size_t end, size_t size,
+                            int (*compar)(const void *, const void *)) {
+    size_t root = start;
+    while (root * 2 + 1 <= end) {
+        size_t child = root * 2 + 1;
+        if (child + 1 <= end &&
+            compar(arr + child * size, arr + (child + 1) * size) < 0) {
+            child++;
         }
+        if (compar(arr + root * size, arr + child * size) < 0) {
+            qsort_swap(arr + root * size, arr + child * size, size);
+            root = child;
+        } else {
+            return;
+        }
+    }
+}
+
+void qsort(void *base, size_t nmemb, size_t size, int (*compar)(const void *, const void *)) {
+    if (nmemb <= 1 || !base || size == 0 || !compar) return;
+    char *arr = (char *)base;
+    /* Iterative O(N log N) heapsort with O(1) stack avoids O(N^2) stalls on sorted inputs */
+    for (size_t i = nmemb / 2; i > 0; i--) {
+        qsort_sift_down(arr, i - 1, nmemb - 1, size, compar);
+    }
+    for (size_t end = nmemb - 1; end > 0; end--) {
+        qsort_swap(arr, arr + end * size, size);
+        qsort_sift_down(arr, 0, end - 1, size, compar);
     }
 }
 

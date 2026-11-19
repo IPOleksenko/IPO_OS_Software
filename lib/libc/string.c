@@ -385,13 +385,25 @@ size_t strnlen(const char *s, size_t maxlen) {
     return len;
 }
 
-static int32_t toupper_table[384];
-static int32_t tolower_table[384];
-static unsigned short ctype_b_table[384];
+static int32_t *toupper_table = NULL;
+static int32_t *tolower_table = NULL;
+static unsigned short *ctype_b_table = NULL;
 static int ctype_tables_initialized = 0;
 
 static void init_ctype_tables(void) {
     if (ctype_tables_initialized) return;
+    toupper_table = (int32_t *)malloc(384 * sizeof(int32_t));
+    tolower_table = (int32_t *)malloc(384 * sizeof(int32_t));
+    ctype_b_table = (unsigned short *)malloc(384 * sizeof(unsigned short));
+    if (!toupper_table || !tolower_table || !ctype_b_table) {
+        free(toupper_table);
+        free(tolower_table);
+        free(ctype_b_table);
+        toupper_table = NULL;
+        tolower_table = NULL;
+        ctype_b_table = NULL;
+        return;
+    }
     for (int i = 0; i < 384; i++) {
         int c = i - 128;
         toupper_table[i] = (c >= 'a' && c <= 'z') ? c - ('a' - 'A') : c;
@@ -416,18 +428,21 @@ static void init_ctype_tables(void) {
 
 const int32_t **__ctype_toupper_loc(void) {
     init_ctype_tables();
-    static const int32_t *p = &toupper_table[128];
+    static const int32_t *p = NULL;
+    if (toupper_table) p = &toupper_table[128];
     return &p;
 }
 
 const int32_t **__ctype_tolower_loc(void) {
     init_ctype_tables();
-    static const int32_t *p = &tolower_table[128];
+    static const int32_t *p = NULL;
+    if (tolower_table) p = &tolower_table[128];
     return &p;
 }
 
 const unsigned short **__ctype_b_loc(void) {
     init_ctype_tables();
-    static const unsigned short *p = &ctype_b_table[128];
+    static const unsigned short *p = NULL;
+    if (ctype_b_table) p = &ctype_b_table[128];
     return &p;
 }

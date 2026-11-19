@@ -69,6 +69,7 @@ int ferror(FILE *stream);
 void clearerr(FILE *stream);
 int fflush(FILE *stream);
 int setvbuf(FILE *stream, char *buf, int mode, size_t size);
+void setbuf(FILE *stream, char *buf);
 FILE *tmpfile(void);
 char *tmpnam(char *s);
 int remove(const char *pathname);

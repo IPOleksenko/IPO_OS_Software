@@ -1,5 +1,5 @@
 # ==============================================================================
-# IPO_Applications - Build Configuration & Tool Definitions
+# IPO_OS_Software - Build Configuration & Tool Definitions
 # ==============================================================================
 
 # Tools
@@ -12,16 +12,17 @@ OBJCOPY := objcopy
 PYTHON  := python3
 
 # Directories
-PROJECT_ROOT  := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))/..)
-APPS_DIR      := $(PROJECT_ROOT)/applications
-LIB_DIR       := $(PROJECT_ROOT)/lib
-INCLUDE_DIR   := $(PROJECT_ROOT)/include
-TOOLS_DIR     := $(PROJECT_ROOT)/tools
-ASSETS_DIR    := $(PROJECT_ROOT)/assets
-BUILD         := $(PROJECT_ROOT)/build
-LIB_BUILD_DIR := $(BUILD)/lib
-APPS_BUILD    := $(BUILD)/applications
-TOOLCHAIN_DIR := $(BUILD)/toolchain
+PROJECT_ROOT    := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))/..)
+APPS_DIR        := $(PROJECT_ROOT)/applications
+LIB_DIR         := $(PROJECT_ROOT)/lib
+INCLUDE_DIR     := $(PROJECT_ROOT)/include
+THIRD_PARTY_DIR := $(PROJECT_ROOT)/third_party
+TOOLS_DIR       := $(PROJECT_ROOT)/tools
+ASSETS_DIR      := $(PROJECT_ROOT)/assets
+BUILD           := $(PROJECT_ROOT)/build
+LIB_BUILD_DIR   := $(BUILD)/lib
+APPS_BUILD      := $(BUILD)/applications
+TOOLCHAIN_DIR   := $(BUILD)/toolchain
 
 # Output Libraries
 USER_LIBC_A   := $(LIB_BUILD_DIR)/libc.a
@@ -29,6 +30,7 @@ USER_LIBM_A   := $(LIB_BUILD_DIR)/libm.a
 USER_LIBCXX_A := $(LIB_BUILD_DIR)/libstdc++.a
 APP_LIB_A     := $(LIB_BUILD_DIR)/libapp.a
 APP_API_LIB_A := $(LIB_BUILD_DIR)/libapp_api.a
+BEARSSL_LIB_A := $(LIB_BUILD_DIR)/libbearssl.a
 
 USER_CRT0     := $(LIB_BUILD_DIR)/crt0.o
 USER_CRTI     := $(LIB_BUILD_DIR)/crti.o
@@ -64,3 +66,4 @@ TCC_CFLAGS := -m32 \
 # No preset disk paths: user must explicitly specify DISK=/path/to/disk.img
 DISK ?= $(or $(IPO_DISK),$(shell printenv DISK 2>/dev/null))
 START_LBA ?= 2048
+

@@ -520,7 +520,11 @@ void M_ReadSaveStrings(void)
 	if (M_CheckParm("-cdrom"))
 	    sprintf(name,"c:\\doomdata\\"SAVEGAMENAME"%d.dsg",i);
 	else
-	    sprintf(name,SAVEGAMENAME"%d.dsg",i);
+	{
+	    const char* home = getenv("HOME");
+	    if (!home || !home[0]) home = "/data/doom";
+	    snprintf(name,sizeof(name),"%s/"SAVEGAMENAME"%d.dsg",home,i);
+	}
 
 	handle = open (name, O_RDONLY | 0, 0666);
 	if (handle == -1)
@@ -583,7 +587,11 @@ void M_LoadSelect(int choice)
     if (M_CheckParm("-cdrom"))
 	sprintf(name,"c:\\doomdata\\"SAVEGAMENAME"%d.dsg",choice);
     else
-	sprintf(name,SAVEGAMENAME"%d.dsg",choice);
+    {
+	const char* home = getenv("HOME");
+	if (!home || !home[0]) home = "/data/doom";
+	snprintf(name,sizeof(name),"%s/"SAVEGAMENAME"%d.dsg",home,choice);
+    }
     G_LoadGame (name);
     M_ClearMenus ();
 }
@@ -1351,11 +1359,6 @@ boolean M_Responder (event_t* ev)
     int             ch;
     int             i;
     static  int     joywait = 0;
-    static  int     mousewait = 0;
-    static  int     mousey = 0;
-    static  int     lasty = 0;
-    static  int     mousex = 0;
-    static  int     lastx = 0;
 	
     ch = -1;
 	
@@ -1394,55 +1397,9 @@ boolean M_Responder (event_t* ev)
 	    joywait = I_GetTime() + 5;
 	}
     }
-    else
+    else if (ev->type == ev_keydown)
     {
-	if (ev->type == ev_mouse && mousewait < I_GetTime())
-	{
-	    mousey += ev->data3;
-	    if (mousey < lasty-30)
-	    {
-		ch = KEY_DOWNARROW;
-		mousewait = I_GetTime() + 5;
-		mousey = lasty -= 30;
-	    }
-	    else if (mousey > lasty+30)
-	    {
-		ch = KEY_UPARROW;
-		mousewait = I_GetTime() + 5;
-		mousey = lasty += 30;
-	    }
-		
-	    mousex += ev->data2;
-	    if (mousex < lastx-30)
-	    {
-		ch = KEY_LEFTARROW;
-		mousewait = I_GetTime() + 5;
-		mousex = lastx -= 30;
-	    }
-	    else if (mousex > lastx+30)
-	    {
-		ch = KEY_RIGHTARROW;
-		mousewait = I_GetTime() + 5;
-		mousex = lastx += 30;
-	    }
-		
-	    if (ev->data1&1)
-	    {
-		ch = KEY_ENTER;
-		mousewait = I_GetTime() + 15;
-	    }
-			
-	    if (ev->data1&2)
-	    {
-		ch = KEY_BACKSPACE;
-		mousewait = I_GetTime() + 15;
-	    }
-	}
-	else
-	    if (ev->type == ev_keydown)
-	    {
-		ch = ev->data1;
-	    }
+	ch = ev->data1;
     }
     
     if (ch == -1)
@@ -1890,4 +1847,3 @@ void M_Init (void)
     }
     
 }
-

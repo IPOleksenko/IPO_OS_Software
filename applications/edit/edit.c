@@ -16,7 +16,9 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <syscall.h>
 #include <vga.h>
@@ -30,9 +32,9 @@
 #include <system/state.h>
 #include <kernel/process.h>
 
-#define VIEW_ROWS 24
+#define VIEW_ROWS ((int)VGA_HEIGHT - 1)
 #define GUTTER_WIDTH 5
-#define TEXT_COLS (VGA_WIDTH - GUTTER_WIDTH)
+#define TEXT_COLS ((int)VGA_WIDTH - GUTTER_WIDTH)
 
 /* Editor modes */
 typedef enum {
@@ -61,7 +63,8 @@ static char **lines = NULL;
 static size_t *line_caps = NULL;
 static int line_count = 0;
 static int line_capacity = 0;
-static char current_file[128];
+static char *current_file = NULL;
+static size_t current_file_cap = 0;
 static bool is_modified = false;
 static bool show_line_numbers = true;
 static bool show_help_screen = false;
@@ -73,11 +76,82 @@ static int cur_col = 0;    /* 0 .. strlen(lines[cur_line]) */
 static int row_offset = 0; /* line at top of viewport */
 static int col_offset = 0; /* column at left of text area */
 
-/* Command mode buffer */
-static char cmd_buf[64];
+/* Command mode and status buffers (dynamically sized, no fixed length limit) */
+static char *cmd_buf = NULL;
+static size_t cmd_cap = 0;
 static int cmd_len = 0;
-static char status_msg[128];
+static char *status_msg = NULL;
+static size_t status_msg_cap = 0;
 static uint32_t status_timer = 0;
+
+static bool strbuf_ensure(char **buf, size_t *cap, size_t needed) {
+    if (*buf && *cap >= needed) return true;
+    size_t new_cap = (*cap == 0) ? 128 : *cap;
+    while (new_cap < needed) {
+        if (new_cap > ((size_t)-1) / 2) {
+            new_cap = needed;
+            break;
+        }
+        new_cap *= 2;
+    }
+    char *nb = (char *)krealloc(*buf, new_cap);
+    if (!nb) return false;
+    if (*buf == NULL && new_cap > 0) nb[0] = '\0';
+    *buf = nb;
+    *cap = new_cap;
+    return true;
+}
+
+static const char *get_current_file(void) {
+    return current_file ? current_file : "";
+}
+
+static bool has_current_file(void) {
+    return current_file != NULL && current_file[0] != '\0';
+}
+
+static bool set_current_file(const char *s, size_t len) {
+    if (!strbuf_ensure(&current_file, &current_file_cap, len + 1)) return false;
+    if (s && len > 0) memcpy(current_file, s, len);
+    current_file[len] = '\0';
+    return true;
+}
+
+static void set_status_msg(const char *fmt, ...) {
+    if (!strbuf_ensure(&status_msg, &status_msg_cap, 128)) return;
+    va_list ap;
+    va_start(ap, fmt);
+    int need = vsnprintf(status_msg, status_msg_cap, fmt, ap);
+    va_end(ap);
+    if (need >= 0 && (size_t)need >= status_msg_cap) {
+        if (strbuf_ensure(&status_msg, &status_msg_cap, (size_t)need + 1)) {
+            va_start(ap, fmt);
+            vsnprintf(status_msg, status_msg_cap, fmt, ap);
+            va_end(ap);
+        }
+    }
+}
+
+static void clear_status_msg(void) {
+    if (status_msg) status_msg[0] = '\0';
+}
+
+static bool has_status_msg(void) {
+    return status_msg != NULL && status_msg[0] != '\0';
+}
+
+static void reset_cmd_buf(void) {
+    cmd_len = 0;
+    if (strbuf_ensure(&cmd_buf, &cmd_cap, 1)) cmd_buf[0] = '\0';
+}
+
+static void append_cmd_str(const char *s) {
+    if (!s || !*s) return;
+    size_t slen = strlen(s);
+    if (!strbuf_ensure(&cmd_buf, &cmd_cap, (size_t)cmd_len + slen + 1)) return;
+    memcpy(cmd_buf + cmd_len, s, slen + 1);
+    cmd_len += (int)slen;
+}
 
 /* Undo single step - Dynamic Self-Expanding Buffer */
 static char **undo_lines = NULL;
@@ -89,9 +163,11 @@ static int undo_cur_col = 0;
 static bool can_undo = false;
 
 /* Screen preservation & double-buffering */
-static uint16_t saved_screen[VGA_WIDTH * VGA_HEIGHT];
+static uint16_t *saved_screen = NULL;
 static uint16_t saved_cursor = 0;
-static uint16_t back_buffer[VGA_WIDTH * VGA_HEIGHT];
+static uint16_t *back_buffer = NULL;
+static size_t vga_screen_cells = 0;
+static size_t vga_screen_bytes = 0;
 
 /* Pending normal command state (e.g. 'd' for 'dd', 'g' for 'gg') */
 static char pending_op = '\0';
@@ -202,7 +278,7 @@ static void save_undo_state(void) {
 
 static void restore_undo_state(void) {
     if (!can_undo) {
-        snprintf(status_msg, sizeof(status_msg), "Already at oldest change");
+        set_status_msg("Already at oldest change");
         return;
     }
 
@@ -236,7 +312,7 @@ static void restore_undo_state(void) {
     }
 
     is_modified = true;
-    snprintf(status_msg, sizeof(status_msg), "1 change undone");
+    set_status_msg("1 change undone");
 }
 
 /* File operations */
@@ -250,25 +326,25 @@ static bool load_file(const char *path) {
     if (ipo_stat(path, &st) != 0) {
         /* New file */
         buffer_init();
-        snprintf(status_msg, sizeof(status_msg), "\"%s\" [New File]", path);
+        set_status_msg("\"%s\" [New File]", path);
         return true;
     }
 
     if ((st.mode & IPO_INODE_TYPE_DIR) != 0) {
-        snprintf(status_msg, sizeof(status_msg), "Error: \"%s\" is a directory", path);
+        set_status_msg("Error: \"%s\" is a directory", path);
         buffer_init();
         return false;
     }
 
     if (st.size == 0) {
         buffer_init();
-        snprintf(status_msg, sizeof(status_msg), "\"%s\" [Empty File]", path);
+        set_status_msg("\"%s\" [Empty File]", path);
         return true;
     }
 
     int fd = ipo_open(path);
     if (fd < 0) {
-        snprintf(status_msg, sizeof(status_msg), "Error: Cannot open \"%s\"", path);
+        set_status_msg("Error: Cannot open \"%s\"", path);
         buffer_init();
         return false;
     }
@@ -276,7 +352,7 @@ static bool load_file(const char *path) {
     char *buf = kmalloc((size_t)st.size + 2);
     if (!buf) {
         ipo_close(fd);
-        snprintf(status_msg, sizeof(status_msg), "Error: Out of memory");
+        set_status_msg("Error: Out of memory");
         buffer_init();
         return false;
     }
@@ -286,7 +362,7 @@ static bool load_file(const char *path) {
 
     if (rd < 0) {
         kfree(buf);
-        snprintf(status_msg, sizeof(status_msg), "Error reading \"%s\"", path);
+        set_status_msg("Error reading \"%s\"", path);
         buffer_init();
         return false;
     }
@@ -326,7 +402,7 @@ static bool load_file(const char *path) {
     row_offset = 0;
     col_offset = 0;
 
-    snprintf(status_msg, sizeof(status_msg), "\"%s\" %d lines, %d bytes", path, line_count, rd);
+    set_status_msg("\"%s\" %d lines, %d bytes", path, line_count, rd);
     return true;
 }
 
@@ -343,7 +419,7 @@ static bool save_file(const char *path) {
 
     char *buf = kmalloc(total + 1);
     if (!buf) {
-        snprintf(status_msg, sizeof(status_msg), "Error: Out of memory saving file");
+        set_status_msg("Error: Out of memory saving file");
         return false;
     }
 
@@ -362,7 +438,7 @@ static bool save_file(const char *path) {
     int fd = ipo_open(path);
     if (fd < 0) {
         kfree(buf);
-        snprintf(status_msg, sizeof(status_msg), "Error: Cannot write to \"%s\"", path);
+        set_status_msg("Error: Cannot write to \"%s\"", path);
         return false;
     }
 
@@ -371,12 +447,12 @@ static bool save_file(const char *path) {
     kfree(buf);
 
     if (wr < 0) {
-        snprintf(status_msg, sizeof(status_msg), "Error: Write failed for \"%s\"", path);
+        set_status_msg("Error: Write failed for \"%s\"", path);
         return false;
     }
 
     is_modified = false;
-    snprintf(status_msg, sizeof(status_msg), "\"%s\" %d lines, %d bytes written", path, line_count, wr);
+    set_status_msg("\"%s\" %d lines, %d bytes written", path, line_count, wr);
     return true;
 }
 
@@ -487,14 +563,10 @@ static bool switch_to_dynamic_layout(const char *target) {
     if (!target || target[0] == '\0') return false;
 
     const char *start_name = dynamic_keymap_get_name();
-    char origin[64];
-    origin[0] = '\0';
-    if (start_name) {
-        strncpy(origin, start_name, sizeof(origin) - 1);
-        origin[sizeof(origin) - 1] = '\0';
-    }
+    char *origin = start_name ? strdup(start_name) : NULL;
 
-    if (keymap_name_matches(origin, target)) {
+    if (origin && keymap_name_matches(origin, target)) {
+        free(origin);
         return true; /* Already active */
     }
 
@@ -503,24 +575,22 @@ static bool switch_to_dynamic_layout(const char *target) {
         const char *cur = dynamic_keymap_get_name();
         if (!cur) break;
         if (keymap_name_matches(cur, target)) {
+            free(origin);
             return true;
         }
-        if (origin[0] != '\0' && strcmp(cur, origin) == 0) {
+        if (origin && origin[0] != '\0' && strcmp(cur, origin) == 0) {
             /* Cycled through all registered OS layouts and returned to start */
             break;
         }
     }
+    free(origin);
     return false;
 }
 
-static void get_dynamic_lang_tag(char *tag, size_t max_len) {
-    if (!tag || max_len == 0) return;
-    tag[0] = '\0';
+static char *alloc_dynamic_lang_tag(void) {
     const char *name = dynamic_keymap_get_name();
     if (!name || name[0] == '\0') {
-        strncpy(tag, "KEY", max_len - 1);
-        tag[max_len - 1] = '\0';
-        return;
+        return strdup("KEY");
     }
 
     /* Check if name contains tag in parentheses e.g. "English (US)" -> "US" */
@@ -531,20 +601,23 @@ static void get_dynamic_lang_tag(char *tag, size_t max_len) {
         const char *close_paren = strchr(p, ')');
         if (close_paren != NULL && close_paren > p && (size_t)(close_paren - p) <= 4) {
             size_t len = (size_t)(close_paren - p);
-            if (len >= max_len) len = max_len - 1;
+            char *tag = (char *)malloc(len + 1u);
+            if (!tag) return NULL;
             for (size_t i = 0; i < len; i++) {
                 char c = p[i];
                 if (c >= 'a' && c <= 'z') c = (char)(c - ('a' - 'A'));
                 tag[i] = c;
             }
             tag[len] = '\0';
-            return;
+            return tag;
         }
     }
 
     /* Otherwise, take first 2-3 characters and uppercase them */
+    char *tag = (char *)malloc(4u);
+    if (!tag) return NULL;
     size_t ti = 0;
-    for (size_t i = 0; name[i] != '\0' && ti < 3 && ti < max_len - 1; i++) {
+    for (size_t i = 0; name[i] != '\0' && ti < 3; i++) {
         char c = name[i];
         if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) {
             if (c >= 'a' && c <= 'z') c = (char)(c - ('a' - 'A'));
@@ -553,9 +626,9 @@ static void get_dynamic_lang_tag(char *tag, size_t max_len) {
     }
     tag[ti] = '\0';
     if (ti == 0) {
-        strncpy(tag, "KEY", max_len - 1);
-        tag[max_len - 1] = '\0';
+        strcpy(tag, "KEY");
     }
+    return tag;
 }
 
 /* Full-screen Vim Help Reference Overlay */
@@ -587,15 +660,25 @@ static void render_help_screen(void) {
         "==================== Press <ESC>, <F1>, or <Enter> to close ===================="
     };
 
-    for (int r = 0; r < 25; r++) {
-        const char *line = help_lines[r];
+    int vw = (int)VGA_WIDTH;
+    int vh = (int)VGA_HEIGHT;
+    if (!back_buffer || vw <= 0 || vh <= 0) return;
+
+    for (size_t i = 0; i < (size_t)(vw * vh); i++) {
+        back_buffer[i] = vga_entry(' ', VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+    }
+
+    for (int i = 0; i < 25; i++) {
+        int r = (i == 24) ? (vh - 1) : i;
+        if (i < 24 && r >= vh - 1) continue;
+        const char *line = help_lines[i];
         int len = (int)strlen(line);
-        uint16_t *dst_row = &back_buffer[r * VGA_WIDTH];
+        uint16_t *dst_row = &back_buffer[r * vw];
 
         enum vga_color fg = VGA_COLOR_LIGHT_GREY;
         enum vga_color bg = VGA_COLOR_BLACK;
 
-        if (r == 0 || r == 24) {
+        if (i == 0 || i == 24) {
             fg = VGA_COLOR_BLACK;
             bg = VGA_COLOR_LIGHT_CYAN;
         } else if (strncmp(line, " MODES:", 7) == 0 ||
@@ -608,13 +691,13 @@ static void render_help_screen(void) {
             fg = VGA_COLOR_WHITE;
         }
 
-        for (int c = 0; c < VGA_WIDTH; c++) {
+        for (int c = 0; c < vw; c++) {
             char ch = (c < len) ? line[c] : ' ';
             dst_row[c] = vga_entry((unsigned char)ch, fg, bg);
         }
     }
 
-    memcpy((void *)VGA_MEMORY, back_buffer, sizeof(back_buffer));
+    memcpy((void *)VGA_MEMORY, back_buffer, vga_screen_bytes);
     vga_hide_cursor();
 }
 
@@ -631,7 +714,7 @@ static void render(void) {
     int text_w = VGA_WIDTH - text_x;
 
     bool is_splash = (line_count <= 1 && lines[0][0] == '\0' && !is_modified &&
-                      current_file[0] == '\0' && mode == MODE_NORMAL);
+                      !has_current_file() && mode == MODE_NORMAL);
 
     static const char *splash_lines[] = {
         "VIM for IPO_OS",
@@ -656,16 +739,14 @@ static void render(void) {
         if (file_line < line_count) {
             /* Line number gutter */
             if (show_line_numbers) {
-                char num_str[8];
                 int n = file_line + 1;
-                num_str[0] = (n >= 1000) ? (0 + (n / 1000) % 10) : ' ';
-                num_str[1] = (n >= 100)  ? (0 + (n / 100) % 10)  : ' ';
-                num_str[2] = (n >= 10)   ? (0 + (n / 10) % 10)   : ' ';
-                num_str[3] = '0' + (n % 10);
-                num_str[4] = ' ';
-                num_str[5] = '\0';
                 for (int c = 0; c < GUTTER_WIDTH; c++) {
-                    dst_row[c] = vga_entry((unsigned char)num_str[c], VGA_COLOR_CYAN, VGA_COLOR_BLACK);
+                    unsigned char ch = ' ';
+                    if (c == 0) ch = (unsigned char)((n >= 1000) ? (0 + (n / 1000) % 10) : ' ');
+                    else if (c == 1) ch = (unsigned char)((n >= 100) ? (0 + (n / 100) % 10) : ' ');
+                    else if (c == 2) ch = (unsigned char)((n >= 10) ? (0 + (n / 10) % 10) : ' ');
+                    else if (c == 3) ch = (unsigned char)('0' + (n % 10));
+                    dst_row[c] = vga_entry(ch, VGA_COLOR_CYAN, VGA_COLOR_BLACK);
                 }
             }
 
@@ -732,70 +813,86 @@ static void render(void) {
 
     /* Status row (Row 24) */
     uint16_t *status_row = &back_buffer[VIEW_ROWS * VGA_WIDTH];
+    int cmd_view_cols = 0;
 
     if (mode == MODE_COMMAND) {
-        char left_cmd[128];
-        snprintf(left_cmd, sizeof(left_cmd), ":%s", cmd_buf);
-
+        const char *cmd_str = cmd_buf ? cmd_buf : "";
         const char *cmd_hint = "[Enter: Run | ESC: Cancel]";
         int hlen = (int)strlen(cmd_hint);
+        int max_cmd_area = VGA_WIDTH - hlen - 1;
+        if (max_cmd_area < 2) max_cmd_area = 2;
+        int max_body_cols = max_cmd_area - 1;
 
         for (int c = 0; c < VGA_WIDTH; c++) {
             status_row[c] = vga_entry(' ', VGA_COLOR_WHITE, VGA_COLOR_BLACK);
         }
 
-        render_utf8_to_status(status_row, 0, VGA_WIDTH - hlen - 1, left_cmd, VGA_COLOR_WHITE, VGA_COLOR_BLACK);
+        int view_off = 0;
+        int total_cols = get_screen_col(cmd_str, cmd_len);
+        while (view_off < cmd_len && total_cols > max_body_cols) {
+            view_off = utf8_next_char_offset(cmd_str, view_off);
+            total_cols--;
+        }
+
+        status_row[0] = vga_entry(':', VGA_COLOR_WHITE, VGA_COLOR_BLACK);
+        cmd_view_cols = render_utf8_to_status(status_row, 1, max_cmd_area,
+                                              cmd_str + view_off,
+                                              VGA_COLOR_WHITE, VGA_COLOR_BLACK) - 1;
 
         for (int i = 0; i < hlen; i++) {
-            status_row[VGA_WIDTH - hlen + i] = vga_entry((unsigned char)cmd_hint[i], VGA_COLOR_DARK_GREY, VGA_COLOR_BLACK);
+            int col = VGA_WIDTH - hlen + i;
+            if (col >= 0) {
+                status_row[col] = vga_entry((unsigned char)cmd_hint[i], VGA_COLOR_DARK_GREY, VGA_COLOR_BLACK);
+            }
         }
     } else {
         const char *mode_str = (mode == MODE_INSERT) ? "-- INSERT --" : "-- NORMAL --";
         enum vga_color mode_fg = (mode == MODE_INSERT) ? VGA_COLOR_LIGHT_GREEN : VGA_COLOR_BLACK;
         enum vga_color mode_bg = (mode == MODE_INSERT) ? VGA_COLOR_BLACK : VGA_COLOR_LIGHT_GREY;
+        const char *fname = has_current_file() ? get_current_file() : "[No Name]";
 
-        char left_part[64];
-        snprintf(left_part, sizeof(left_part), "%s %s%s",
-                 mode_str,
-                 current_file[0] ? current_file : "[No Name]",
-                 is_modified ? " [+]" : "");
-
-        char lang_tag[16];
-        get_dynamic_lang_tag(lang_tag, sizeof(lang_tag));
+        char *lang_tag = alloc_dynamic_lang_tag();
+        const char *tag_str = lang_tag ? lang_tag : "KEY";
 
         int cur_screen_col = get_screen_col(lines[cur_line], cur_col);
-        char right_part[48];
-        snprintf(right_part, sizeof(right_part), "[%s|F2] ln %d/%d col %d",
-                 lang_tag, cur_line + 1, line_count, cur_screen_col + 1);
-
-        char center_hint[128];
-        if (status_msg[0] != '\0') {
-            snprintf(center_hint, sizeof(center_hint), "%s", status_msg);
-        } else if (mode == MODE_NORMAL) {
-            snprintf(center_hint, sizeof(center_hint), "[F1:Help | F2:Lang | i:Insert | :w:Save]");
-        } else {
-            snprintf(center_hint, sizeof(center_hint), "[F2:Lang | ESC:Normal | Arrows:Move]");
+        int rp_len = snprintf(NULL, 0, "[%s|F2] ln %d/%d col %d",
+                              tag_str, cur_line + 1, line_count, cur_screen_col + 1);
+        char *right_part = (rp_len >= 0) ? (char *)malloc((size_t)rp_len + 1u) : NULL;
+        if (right_part) {
+            snprintf(right_part, (size_t)rp_len + 1u, "[%s|F2] ln %d/%d col %d",
+                     tag_str, cur_line + 1, line_count, cur_screen_col + 1);
         }
+        const char *right_str = right_part ? right_part : "";
+
+        const char *center_hint = has_status_msg() ? status_msg :
+                                  (mode == MODE_NORMAL ? "[F1:Help | F2:Lang | i:Insert | :w:Save]" :
+                                                         "[F2:Lang | ESC:Normal | Arrows:Move]");
 
         /* Clear entire status bar with background color */
         for (int c = 0; c < VGA_WIDTH; c++) {
             status_row[c] = vga_entry(' ', mode_fg, mode_bg);
         }
 
-        int left_cols = get_screen_col(left_part, (int)strlen(left_part));
-        int right_cols = get_screen_col(right_part, (int)strlen(right_part));
+        int right_cols = get_screen_col(right_str, (int)strlen(right_str));
         int hint_cols = get_screen_col(center_hint, (int)strlen(center_hint));
 
         int right_start = VGA_WIDTH - right_cols;
         if (right_start < 0) right_start = 0;
 
-        /* Render left part */
-        render_utf8_to_status(status_row, 0, right_start > 0 ? right_start - 1 : 0,
-                              left_part, mode_fg, mode_bg);
+        /* Render left part directly without intermediate path truncation */
+        int left_limit = right_start > 0 ? right_start - 1 : 0;
+        int left_cols = render_utf8_to_status(status_row, 0, left_limit, mode_str, mode_fg, mode_bg);
+        left_cols = render_utf8_to_status(status_row, left_cols, left_limit, " ", mode_fg, mode_bg);
+        left_cols = render_utf8_to_status(status_row, left_cols, left_limit, fname, mode_fg, mode_bg);
+        if (is_modified) {
+            left_cols = render_utf8_to_status(status_row, left_cols, left_limit, " [+]", mode_fg, mode_bg);
+        }
 
         /* Render right part */
         render_utf8_to_status(status_row, right_start, VGA_WIDTH,
-                              right_part, mode_fg, mode_bg);
+                              right_str, mode_fg, mode_bg);
+        free(right_part);
+        free(lang_tag);
 
         /* Render centered hint/status */
         int hint_start = (VGA_WIDTH - hint_cols) / 2;
@@ -804,20 +901,19 @@ static void render(void) {
         }
         int max_hint_end = right_start - 1;
         if (hint_start < max_hint_end) {
-            enum vga_color hint_fg = (status_msg[0] != '\0') ? VGA_COLOR_LIGHT_BROWN :
+            enum vga_color hint_fg = has_status_msg() ? VGA_COLOR_LIGHT_BROWN :
                                      (mode == MODE_INSERT ? VGA_COLOR_LIGHT_CYAN : VGA_COLOR_BLUE);
             render_utf8_to_status(status_row, hint_start, max_hint_end,
                                   center_hint, hint_fg, mode_bg);
         }
     }
 
-    /* Fast blit to VGA text buffer (80 * 25 words = 4000 bytes) */
-    memcpy((void *)VGA_MEMORY, back_buffer, sizeof(back_buffer));
+    /* Fast blit to VGA text buffer */
+    memcpy((void *)VGA_MEMORY, back_buffer, vga_screen_bytes);
 
     /* Position hardware cursor */
     if (mode == MODE_COMMAND) {
-        int cmd_cols = get_screen_col(cmd_buf, cmd_len);
-        int hw_cursor = VIEW_ROWS * VGA_WIDTH + 1 + cmd_cols;
+        int hw_cursor = VIEW_ROWS * VGA_WIDTH + 1 + cmd_view_cols;
         if (hw_cursor >= VGA_WIDTH * VGA_HEIGHT) hw_cursor = VGA_WIDTH * VGA_HEIGHT - 1;
         vga_set_cursor((uint16_t)hw_cursor);
     } else {
@@ -1040,22 +1136,22 @@ static void move_word_backward(void) {
 
 /* Execute command mode input (:w, :q, :wq, :q!) */
 static bool execute_command(void) {
-    char *cmd = cmd_buf;
+    const char *cmd = cmd_buf ? cmd_buf : "";
     while (*cmd == ' ') cmd++;
 
     if (strcmp(cmd, "q") == 0 || strcmp(cmd, "Q") == 0) {
         if (is_modified) {
-            snprintf(status_msg, sizeof(status_msg), "No write since last change (add ! to override)");
+            set_status_msg("No write since last change (add ! to override)");
             return false;
         }
         return true; /* Exit editor */
     } else if (strcmp(cmd, "q!") == 0 || strcmp(cmd, "Q!") == 0) {
         return true; /* Force exit */
     } else if (strcmp(cmd, "w") == 0 || strcmp(cmd, "W") == 0) {
-        if (current_file[0] == '\0') {
-            snprintf(status_msg, sizeof(status_msg), "Error: No file name");
+        if (!has_current_file()) {
+            set_status_msg("Error: No file name");
         } else {
-            save_file(current_file);
+            save_file(get_current_file());
         }
     } else if (strncmp(cmd, "w ", 2) == 0 || strncmp(cmd, "W ", 2) == 0 ||
                strncmp(cmd, "wq ", 3) == 0 || strncmp(cmd, "WQ ", 3) == 0) {
@@ -1064,49 +1160,46 @@ static bool execute_command(void) {
         while (*new_path == ' ') new_path++;
         if (*new_path) {
             size_t nplen = strlen(new_path);
+            bool saved_path_ok;
             if ((*new_path == '"' || *new_path == '\'') && nplen >= 2 && new_path[nplen - 1] == *new_path) {
-                size_t unquoted_len = nplen - 2;
-                if (unquoted_len < sizeof(current_file)) {
-                    memcpy(current_file, new_path + 1, unquoted_len);
-                    current_file[unquoted_len] = '\0';
-                }
+                saved_path_ok = set_current_file(new_path + 1, nplen - 2);
             } else {
-                strncpy(current_file, new_path, sizeof(current_file) - 1);
-                current_file[sizeof(current_file) - 1] = '\0';
+                saved_path_ok = set_current_file(new_path, nplen);
             }
-            if (save_file(current_file)) {
+            if (!saved_path_ok) {
+                set_status_msg("Error: Out of memory");
+            } else if (save_file(get_current_file())) {
                 if (and_quit) return true;
             }
         }
     } else if (strcmp(cmd, "wq") == 0 || strcmp(cmd, "WQ") == 0 ||
                strcmp(cmd, "wq!") == 0 || strcmp(cmd, "WQ!") == 0 ||
                strcmp(cmd, "x") == 0 || strcmp(cmd, "X") == 0) {
-        if (current_file[0] == '\0') {
-            snprintf(status_msg, sizeof(status_msg), "Error: No file name");
+        if (!has_current_file()) {
+            set_status_msg("Error: No file name");
         } else {
-            if (save_file(current_file)) {
+            if (save_file(get_current_file())) {
                 return true; /* Exit editor */
             }
         }
-    }
- else if (strcmp(cmd, "set nu") == 0) {
+    } else if (strcmp(cmd, "set nu") == 0) {
         show_line_numbers = true;
-        snprintf(status_msg, sizeof(status_msg), "Line numbers enabled");
+        set_status_msg("Line numbers enabled");
     } else if (strcmp(cmd, "set nonu") == 0) {
         show_line_numbers = false;
-        snprintf(status_msg, sizeof(status_msg), "Line numbers disabled");
+        set_status_msg("Line numbers disabled");
     } else if (strncmp(cmd, "lang", 4) == 0 || strncmp(cmd, "keymap", 6) == 0 || strncmp(cmd, "layout", 6) == 0) {
         const char *arg = (strncmp(cmd, "keymap", 6) == 0 || strncmp(cmd, "layout", 6) == 0) ? cmd + 6 : cmd + 4;
         while (*arg == ' ') arg++;
 
         if (*arg == '\0') {
             dynamic_keymap_cycle_next();
-            snprintf(status_msg, sizeof(status_msg), "Layout: %s", dynamic_keymap_get_name());
+            set_status_msg("Layout: %s", dynamic_keymap_get_name());
         } else {
             if (switch_to_dynamic_layout(arg)) {
-                snprintf(status_msg, sizeof(status_msg), "Layout: %s", dynamic_keymap_get_name());
+                set_status_msg("Layout: %s", dynamic_keymap_get_name());
             } else {
-                snprintf(status_msg, sizeof(status_msg), "Layout '%s' not found in OS keymap", arg);
+                set_status_msg("Layout '%s' not found in OS keymap", arg);
             }
         }
     } else if (strncmp(cmd, "font", 4) == 0) {
@@ -1119,14 +1212,14 @@ static bool execute_command(void) {
                 fname = "System VGA Hardware Font";
                 if (count == 0) count = 256;
             }
-            snprintf(status_msg, sizeof(status_msg), "Font: %s (%u glyphs)", fname, count);
+            set_status_msg("Font: %s (%u glyphs)", fname, count);
         } else {
             int res = vga_font_load_database(arg);
             if (res == 0) {
-                snprintf(status_msg, sizeof(status_msg), "Font: %s (%u glyphs)",
-                         vga_font_get_current_name(), vga_font_get_glyph_count());
+                set_status_msg("Font: %s (%u glyphs)",
+                               vga_font_get_current_name(), vga_font_get_glyph_count());
             } else {
-                snprintf(status_msg, sizeof(status_msg), "Cannot load font from '%s'", arg);
+                set_status_msg("Cannot load font from '%s'", arg);
             }
         }
     } else if (strcmp(cmd, "help") == 0 || strcmp(cmd, "h") == 0) {
@@ -1135,9 +1228,9 @@ static bool execute_command(void) {
     } else {
         /* Check if entered command directly matches an active OS keymap */
         if (cmd[0] != '\0' && switch_to_dynamic_layout(cmd)) {
-            snprintf(status_msg, sizeof(status_msg), "Layout: %s", dynamic_keymap_get_name());
+            set_status_msg("Layout: %s", dynamic_keymap_get_name());
         } else {
-            snprintf(status_msg, sizeof(status_msg), "Unknown command: :%s (type :help or press F1)", cmd);
+            set_status_msg("Unknown command: :%s (type :help or press F1)", cmd);
         }
     }
     return false;
@@ -1163,17 +1256,18 @@ int main(int argc, char **argv) {
         return 0;
     }
 
-    current_file[0] = '\0';
+    set_current_file("", 0);
     if (argc > 1) {
+        size_t total_len = 0;
         for (int i = 1; i < argc; i++) {
-            if (i > 1) {
-                size_t clen = strlen(current_file);
-                if (clen + 1 < sizeof(current_file)) {
-                    current_file[clen] = ' ';
-                    current_file[clen + 1] = '\0';
-                }
+            total_len += strlen(argv[i]) + (i > 1 ? 1u : 0u);
+        }
+        if (strbuf_ensure(&current_file, &current_file_cap, total_len + 1)) {
+            current_file[0] = '\0';
+            for (int i = 1; i < argc; i++) {
+                if (i > 1) strcat(current_file, " ");
+                strcat(current_file, argv[i]);
             }
-            strncat(current_file, argv[i], sizeof(current_file) - strlen(current_file) - 1);
         }
     }
 
@@ -1185,16 +1279,32 @@ int main(int argc, char **argv) {
         }
     }
 
+    uint16_t hw_w = VGA_WIDTH;
+    uint16_t hw_h = VGA_HEIGHT;
+    if (hw_w == 0 || hw_h == 0) {
+        printf("edit: invalid VGA hardware dimensions\n");
+        return 1;
+    }
+    vga_screen_cells = (size_t)hw_w * (size_t)hw_h;
+    vga_screen_bytes = vga_screen_cells * sizeof(uint16_t);
+    saved_screen = (uint16_t *)kmalloc(vga_screen_bytes);
+    back_buffer = (uint16_t *)kmalloc(vga_screen_bytes);
+    if (!saved_screen || !back_buffer) {
+        if (saved_screen) { kfree(saved_screen); saved_screen = NULL; }
+        if (back_buffer) { kfree(back_buffer); back_buffer = NULL; }
+        return 1;
+    }
+
     /* Save previous screen & cursor position to restore cleanly upon exit */
     saved_cursor = vga_get_cursor_position();
     if (vga_is_graphics_mode()) {
-        for (int i = 0; i < VGA_WIDTH * VGA_HEIGHT; i++) {
+        for (size_t i = 0; i < vga_screen_cells; i++) {
             saved_screen[i] = 0x0720;
         }
         saved_cursor = VGA_START_CURSOR_POSITION;
     } else {
-        memcpy(saved_screen, (const void *)VGA_MEMORY, sizeof(saved_screen));
-        for (int i = 0; i < VGA_WIDTH * VGA_HEIGHT; i++) {
+        memcpy(saved_screen, (const void *)VGA_MEMORY, vga_screen_bytes);
+        for (size_t i = 0; i < vga_screen_cells; i++) {
             uint16_t ent = saved_screen[i];
             uint8_t ch = (uint8_t)(ent & 0xFF);
             uint8_t attr = (uint8_t)(ent >> 8);
@@ -1211,11 +1321,11 @@ int main(int argc, char **argv) {
     vga_hide_cursor();
 
     /* Load target file */
-    if (current_file[0] != '\0') {
-        load_file(current_file);
+    if (has_current_file()) {
+        load_file(get_current_file());
     } else {
         buffer_init();
-        status_msg[0] = '\0';
+        clear_status_msg();
     }
 
     /* Ensure font and keymap subsystems are in app mode */
@@ -1248,7 +1358,7 @@ int main(int argc, char **argv) {
         /* F2 key or Ctrl+Space: dedicated language switch */
         if (sc == 0x3C || (sc == 0x39 && keyboard_is_ctrl_pressed())) {
             dynamic_keymap_cycle_next();
-            snprintf(status_msg, sizeof(status_msg), "Layout: %s", dynamic_keymap_get_name());
+            set_status_msg("Layout: %s", dynamic_keymap_get_name());
             status_timer = 0;
             continue;
         }
@@ -1290,10 +1400,10 @@ int main(int argc, char **argv) {
 
         /* Ctrl+S: Quick save file */
         if (keyboard_is_ctrl_pressed() && (sc == 0x1F || sc == 0x9F)) {
-            if (current_file[0] == '\0') {
-                snprintf(status_msg, sizeof(status_msg), "Error: No file name (use :w <filename>)");
+            if (!has_current_file()) {
+                set_status_msg("Error: No file name (use :w <filename>)");
             } else {
-                save_file(current_file);
+                save_file(get_current_file());
             }
             continue;
         }
@@ -1309,8 +1419,8 @@ int main(int argc, char **argv) {
 
         /* Clear status message upon any interaction */
         status_timer++;
-        if (status_timer > 3 && status_msg[0] != '\0') {
-            status_msg[0] = '\0';
+        if (status_timer > 3 && has_status_msg()) {
+            clear_status_msg();
             status_timer = 0;
         }
 
@@ -1376,7 +1486,7 @@ int main(int argc, char **argv) {
             /* Normal Mode */
             if (sc == SC_ESC) {
                 pending_op = '\0';
-                status_msg[0] = '\0';
+                clear_status_msg();
             } else if (sc == 0x52) { /* 'Insert' key -> Insert mode */
                 mode = MODE_INSERT;
                 pending_op = '\0';
@@ -1488,18 +1598,16 @@ int main(int argc, char **argv) {
             } else if ((sc == 0x27 && keyboard_is_shift_pressed()) ||
                        (sc == 0x07 && keyboard_is_shift_pressed())) { /* ':' -> Command mode */
                 mode = MODE_COMMAND;
-                cmd_len = 0;
-                cmd_buf[0] = '\0';
+                reset_cmd_buf();
                 pending_op = '\0';
             } else {
                 const char *ks = keyboard_get_key_string(sc);
                 if (ks && strcmp(ks, ":") == 0) {
                     mode = MODE_COMMAND;
-                    cmd_len = 0;
-                    cmd_buf[0] = '\0';
+                    reset_cmd_buf();
                     pending_op = '\0';
                 } else if (ks && (unsigned char)ks[0] >= 32) {
-                    snprintf(status_msg, sizeof(status_msg), "Press 'i' to enter Insert mode");
+                    set_status_msg("Press 'i' to enter Insert mode");
                 }
             }
         } else if (mode == MODE_INSERT) {
@@ -1526,15 +1634,14 @@ int main(int argc, char **argv) {
             if (sc == SC_ESC) {
                 mode = MODE_NORMAL;
             } else if (sc == SC_BACKSPACE) {
-                if (cmd_len > 0) {
+                if (cmd_len > 0 && cmd_buf) {
                     int prev = utf8_prev_char_offset(cmd_buf, cmd_len);
                     cmd_len = prev;
                     cmd_buf[cmd_len] = '\0';
                 } else {
                     mode = MODE_NORMAL;
                 }
-            }
- else if (sc == SC_ENTER) {
+            } else if (sc == SC_ENTER) {
                 mode = MODE_NORMAL;
                 if (execute_command()) {
                     running = false;
@@ -1542,10 +1649,7 @@ int main(int argc, char **argv) {
             } else {
                 const char *s = keyboard_get_key_string(sc);
                 if (s && s[0] != '\0' && s[0] != '\n' && s[0] != '\r' && s[0] != '\b' && s[0] != 127) {
-                    while (*s && cmd_len < (int)sizeof(cmd_buf) - 1) {
-                        cmd_buf[cmd_len++] = *s++;
-                    }
-                    cmd_buf[cmd_len] = '\0';
+                    append_cmd_str(s);
                 }
             }
         }
@@ -1553,14 +1657,16 @@ int main(int argc, char **argv) {
 
     /* Restore screen & cursor on exit */
     vga_hide_cursor();
-    for (int i = 0; i < VGA_WIDTH * VGA_HEIGHT; i++) {
+    for (size_t i = 0; i < vga_screen_cells; i++) {
         uint16_t ent = saved_screen[i];
         uint8_t attr = (uint8_t)(ent >> 8);
         if (ent == 0xFFFF || attr == 0xFF) {
             saved_screen[i] = 0x0720;
         }
     }
-    memcpy((void *)VGA_MEMORY, saved_screen, sizeof(saved_screen));
+    memcpy((void *)VGA_MEMORY, saved_screen, vga_screen_bytes);
+    if (saved_screen) { kfree(saved_screen); saved_screen = NULL; }
+    if (back_buffer) { kfree(back_buffer); back_buffer = NULL; }
     vga_set_cursor(saved_cursor);
     vga_font_set_app_mode(false);
     dynamic_keymap_set_app_mode(false);
@@ -1576,6 +1682,9 @@ int main(int argc, char **argv) {
     if (line_caps) { kfree(line_caps); line_caps = NULL; }
     if (undo_lines) { kfree(undo_lines); undo_lines = NULL; }
     if (undo_line_caps) { kfree(undo_line_caps); undo_line_caps = NULL; }
+    if (current_file) { kfree(current_file); current_file = NULL; current_file_cap = 0; }
+    if (cmd_buf) { kfree(cmd_buf); cmd_buf = NULL; cmd_cap = 0; }
+    if (status_msg) { kfree(status_msg); status_msg = NULL; status_msg_cap = 0; }
 
     return 0;
 }

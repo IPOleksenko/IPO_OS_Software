@@ -13,7 +13,7 @@ typedef uint32_t gid_t;
 typedef uint32_t dev_t;
 typedef uint32_t ino_t;
 typedef uint32_t nlink_t;
-typedef long time_t;
+typedef int64_t time_t;
 typedef uint32_t clock_t;
 typedef uint32_t useconds_t;
 

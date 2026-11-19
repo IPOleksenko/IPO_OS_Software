@@ -2,11 +2,11 @@
 set -e
 
 # ==============================================================================
-# IPO_Applications - Dependency Installation Script
+# IPO_OS_Software - Dependency Installation Script
 # ==============================================================================
 
 echo "=========================================="
-echo "Installing dependencies for IPO_Applications"
+echo "Installing dependencies for IPO_OS_Software"
 echo "=========================================="
 
 REQUIRED_PACKAGES=(

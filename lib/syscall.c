@@ -8,7 +8,7 @@ int ipo_syscall(uint32_t num, uint32_t argc, uint32_t *argv) {
         : "a"(num),
           "b"(argc),
           "c"(argv)
-        : "memory"
+        : "edx", "memory", "cc"
     );
     return ret;
 }

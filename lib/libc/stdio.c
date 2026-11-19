@@ -336,19 +336,47 @@ int setvbuf(FILE *stream, char *buf, int mode, size_t size) {
     return 0;
 }
 
+void setbuf(FILE *stream, char *buf) {
+    (void)setvbuf(stream, buf, buf ? _IOFBF : _IONBF, buf ? BUFSIZ : 0u);
+}
+
 static int tmp_counter = 0;
-static char tmpnam_buf[L_tmpnam];
+static char *tmpnam_buf = NULL;
+static size_t tmpnam_cap = 0;
+
+static char *alloc_tmpnam_path(int id) {
+    int needed = snprintf(NULL, 0, "/tmp/tmp_%d.tmp", id);
+    if (needed < 0) return NULL;
+    char *path = (char *)malloc((size_t)needed + 1);
+    if (!path) return NULL;
+    snprintf(path, (size_t)needed + 1, "/tmp/tmp_%d.tmp", id);
+    return path;
+}
 
 char *tmpnam(char *s) {
-    char *out = s ? s : tmpnam_buf;
-    snprintf(out, L_tmpnam, "/tmp/tmp_%d.tmp", ++tmp_counter);
-    return out;
+    int id = ++tmp_counter;
+    if (s) {
+        snprintf(s, L_tmpnam, "/tmp/tmp_%d.tmp", id);
+        return s;
+    }
+    int needed = snprintf(NULL, 0, "/tmp/tmp_%d.tmp", id);
+    if (needed < 0) return NULL;
+    if ((size_t)needed + 1 > tmpnam_cap) {
+        char *nb = (char *)realloc(tmpnam_buf, (size_t)needed + 1);
+        if (!nb) return NULL;
+        tmpnam_buf = nb;
+        tmpnam_cap = (size_t)needed + 1;
+    }
+    snprintf(tmpnam_buf, tmpnam_cap, "/tmp/tmp_%d.tmp", id);
+    return tmpnam_buf;
 }
 
 FILE *tmpfile(void) {
-    char name[L_tmpnam];
-    tmpnam(name);
-    return fopen(name, "w+");
+    char *name = alloc_tmpnam_path(++tmp_counter);
+    if (!name) return NULL;
+    FILE *fp = fopen(name, "w+");
+    free(name);
+    return fp;
 }
 
 int remove(const char *pathname) {
@@ -383,102 +411,116 @@ void perror(const char *s) {
 /* Printf implementations */
 
 static void uint_to_str(unsigned long long uval, int base, int uppercase, char *buf, int *len) {
-    char digits[] = "0123456789abcdef0123456789ABCDEF";
-    char *d = uppercase ? &digits[16] : &digits[0];
-    char temp[64];
+    static const char *lower_digits = "0123456789abcdef";
+    static const char *upper_digits = "0123456789ABCDEF";
+    const char *d = uppercase ? upper_digits : lower_digits;
     int tlen = 0;
 
     if (uval == 0) {
-        temp[tlen++] = '0';
+        buf[tlen++] = '0';
     } else {
         while (uval > 0) {
-            temp[tlen++] = d[uval % (unsigned int)base];
+            buf[tlen++] = d[uval % (unsigned int)base];
             uval /= (unsigned int)base;
+        }
+        for (int l = 0, r = tlen - 1; l < r; l++, r--) {
+            char tmp = buf[l];
+            buf[l] = buf[r];
+            buf[r] = tmp;
         }
     }
 
     *len = tlen;
-    for (int i = 0; i < tlen; i++) {
-        buf[i] = temp[tlen - 1 - i];
-    }
     buf[tlen] = '\0';
 }
 
-static void int_to_str(long long val, int base, int uppercase, char *buf, int *len) {
-    unsigned long long uval;
-    if (val < 0 && base == 10) {
-        uval = 0ULL - (unsigned long long)val;
-    } else {
-        uval = (unsigned long long)val;
-    }
-    uint_to_str(uval, base, uppercase, buf, len);
+static void format_uint_str(unsigned long long uval, int base, int uppercase, const char *prefix, char *buf, int *out_len) {
+    int plen = prefix ? (int)strlen(prefix) : 0;
+    if (plen > 0) memcpy(buf, prefix, (size_t)plen);
+    int num_len = 0;
+    uint_to_str(uval, base, uppercase, buf + plen, &num_len);
+    if (out_len) *out_len = plen + num_len;
 }
 
-static void float_to_str(double val, int prec, char *buf) {
+static void format_float_str(double val, int prec, char *buf, size_t buf_size) {
     if (isnan(val)) {
-        strcpy(buf, "nan");
+        if (buf_size > 3) strcpy(buf, "nan");
         return;
     }
     if (isinf(val)) {
-        if (val < 0) strcpy(buf, "-inf");
-        else strcpy(buf, "inf");
+        if (val < 0 && buf_size > 4) strcpy(buf, "-inf");
+        else if (buf_size > 3) strcpy(buf, "inf");
         return;
     }
 
     if (prec < 0) prec = 6;
-    if (val < 0) {
-        *buf++ = '-';
-        val = -val;
-    }
+    if (prec > 16) prec = 16;
+    int neg = (val < 0);
+    if (neg) val = -val;
 
     double int_part;
     double frac_part = modf(val, &int_part);
-
     long long ip = (long long)int_part;
-    int len = 0;
-    int_to_str(ip, 10, 0, buf, &len);
-    buf += len;
+    unsigned long long uip = (ip < 0) ? (0ULL - (unsigned long long)ip) : (unsigned long long)ip;
 
-    if (prec > 0) {
-        *buf++ = '.';
-        for (int i = 0; i < prec; i++) {
+    char *out = buf;
+    char *end = buf + buf_size - 1;
+    if (neg && out < end) *out++ = '-';
+    int len = 0;
+    char int_buf[32];
+    uint_to_str(uip, 10, 0, int_buf, &len);
+    for (int i = 0; i < len && out < end; i++) *out++ = int_buf[i];
+
+    if (prec > 0 && out < end) {
+        *out++ = '.';
+        for (int i = 0; i < prec && out < end; i++) {
             frac_part *= 10.0;
             int digit = (int)frac_part;
-            *buf++ = '0' + (digit % 10);
+            *out++ = '0' + (digit % 10);
             frac_part -= digit;
         }
     }
-    *buf = '\0';
+    *out = '\0';
+}
+
+typedef struct {
+    char *str;
+    size_t size;
+    size_t written;
+} vsn_stream_t;
+
+static inline void vsn_putc(vsn_stream_t *s, char c) {
+    if (s->str && s->written + 1 < s->size) {
+        s->str[s->written] = c;
+    }
+    s->written++;
+}
+
+static inline void vsn_puts(vsn_stream_t *s, const char *str, int width, int prec, int left_align, char pad) {
+    int len = (int)strlen(str);
+    if (prec >= 0 && len > prec) len = prec;
+    int pad_len = width > len ? width - len : 0;
+
+    if (!left_align) {
+        for (int i = 0; i < pad_len; i++) vsn_putc(s, pad);
+    }
+    for (int i = 0; i < len; i++) vsn_putc(s, str[i]);
+    if (left_align) {
+        for (int i = 0; i < pad_len; i++) vsn_putc(s, ' ');
+    }
 }
 
 int vsnprintf(char *str, size_t size, const char *format, va_list ap) {
-    size_t written = 0;
-
-    void append_char(char c) {
-        if (str && written + 1 < size) {
-            str[written] = c;
-        }
-        written++;
-    }
-
-    void append_str(const char *s, int width, int prec, int left_align, char pad) {
-        int len = (int)strlen(s);
-        if (prec >= 0 && len > prec) len = prec;
-        int pad_len = width > len ? width - len : 0;
-
-        if (!left_align) {
-            for (int i = 0; i < pad_len; i++) append_char(pad);
-        }
-        for (int i = 0; i < len; i++) append_char(s[i]);
-        if (left_align) {
-            for (int i = 0; i < pad_len; i++) append_char(' ');
-        }
-    }
+    vsn_stream_t stream;
+    stream.str = str;
+    stream.size = size;
+    stream.written = 0;
 
     const char *p = format;
     while (*p) {
         if (*p != '%') {
-            append_char(*p++);
+            char ch = *p++;
+            vsn_putc(&stream, ch);
             continue;
         }
         p++; // skip '%'
@@ -539,7 +581,6 @@ int vsnprintf(char *str, size_t size, const char *format, va_list ap) {
         }
 
         char spec = *p++;
-        char buf[128];
         int num_len = 0;
 
         switch (spec) {
@@ -548,100 +589,111 @@ int vsnprintf(char *str, size_t size, const char *format, va_list ap) {
                 long long val = is_long_long ? va_arg(ap, long long) :
                                 (is_long ? va_arg(ap, long) : va_arg(ap, int));
                 int neg = (val < 0);
-                int_to_str(val, 10, 0, buf, &num_len);
-                char sign_buf[2] = {0};
-                if (neg) sign_buf[0] = '-';
-                else if (plus_sign) sign_buf[0] = '+';
-                else if (space_sign) sign_buf[0] = ' ';
+                unsigned long long uval = neg ? (0ULL - (unsigned long long)val) : (unsigned long long)val;
+                char buf[64];
+                format_uint_str(uval, 10, 0, NULL, buf, &num_len);
+                char sign_ch = 0;
+                if (neg) sign_ch = '-';
+                else if (plus_sign) sign_ch = '+';
+                else if (space_sign) sign_ch = ' ';
 
-                if (sign_buf[0]) {
+                if (sign_ch) {
                     if (width > 0) width--;
                     if (pad_char == '0') {
-                        append_char(sign_buf[0]);
-                        append_str(buf, width, prec, left_align, '0');
+                        vsn_putc(&stream, sign_ch);
+                        vsn_puts(&stream, buf, width, prec, left_align, '0');
                     } else {
                         if (!left_align && width > num_len) {
-                            for (int i = 0; i < width - num_len; i++) append_char(' ');
-                            append_char(sign_buf[0]);
-                            for (int i = 0; i < num_len; i++) append_char(buf[i]);
+                            for (int i = 0; i < width - num_len; i++) vsn_putc(&stream, ' ');
+                            vsn_putc(&stream, sign_ch);
+                            for (int i = 0; i < num_len; i++) vsn_putc(&stream, buf[i]);
                         } else {
-                            append_char(sign_buf[0]);
-                            append_str(buf, width, prec, left_align, ' ');
+                            vsn_putc(&stream, sign_ch);
+                            vsn_puts(&stream, buf, width, prec, left_align, ' ');
                         }
                     }
                 } else {
-                    append_str(buf, width, prec, left_align, pad_char);
+                    vsn_puts(&stream, buf, width, prec, left_align, pad_char);
                 }
                 break;
             }
             case 'u': {
                 unsigned long long val = is_long_long ? va_arg(ap, unsigned long long) :
                                          (is_long ? va_arg(ap, unsigned long) : va_arg(ap, unsigned int));
-                uint_to_str(val, 10, 0, buf, &num_len);
-                append_str(buf, width, prec, left_align, pad_char);
+                char buf[64];
+                format_uint_str(val, 10, 0, NULL, buf, &num_len);
+                vsn_puts(&stream, buf, width, prec, left_align, pad_char);
                 break;
             }
             case 'x':
             case 'X': {
                 unsigned long long val = is_long_long ? va_arg(ap, unsigned long long) :
                                          (is_long ? va_arg(ap, unsigned long) : va_arg(ap, unsigned int));
-                uint_to_str(val, 16, (spec == 'X'), buf, &num_len);
-                append_str(buf, width, prec, left_align, pad_char);
+                char buf[64];
+                format_uint_str(val, 16, (spec == 'X'), NULL, buf, &num_len);
+                vsn_puts(&stream, buf, width, prec, left_align, pad_char);
                 break;
             }
             case 'o': {
                 unsigned long long val = is_long_long ? va_arg(ap, unsigned long long) :
                                          (is_long ? va_arg(ap, unsigned long) : va_arg(ap, unsigned int));
-                uint_to_str(val, 8, 0, buf, &num_len);
-                append_str(buf, width, prec, left_align, pad_char);
+                char buf[64];
+                format_uint_str(val, 8, 0, NULL, buf, &num_len);
+                vsn_puts(&stream, buf, width, prec, left_align, pad_char);
                 break;
             }
             case 'p': {
                 void *ptr = va_arg(ap, void *);
-                uint_to_str((uintptr_t)ptr, 16, 0, buf, &num_len);
-                char pbuf[64] = "0x";
-                strcat(pbuf, buf);
-                append_str(pbuf, width, prec, left_align, ' ');
+                char buf[64];
+                format_uint_str((uintptr_t)ptr, 16, 0, "0x", buf, &num_len);
+                vsn_puts(&stream, buf, width, prec, left_align, ' ');
                 break;
             }
             case 's': {
                 const char *s = va_arg(ap, const char *);
                 if (!s) s = "(null)";
-                append_str(s, width, prec, left_align, ' ');
+                vsn_puts(&stream, s, width, prec, left_align, ' ');
                 break;
             }
             case 'c': {
                 char c = (char)va_arg(ap, int);
-                char s[2] = { c, '\0' };
-                append_str(s, width, -1, left_align, ' ');
+                int pad_len = width > 1 ? width - 1 : 0;
+                if (!left_align) {
+                    for (int i = 0; i < pad_len; i++) vsn_putc(&stream, ' ');
+                }
+                vsn_putc(&stream, c);
+                if (left_align) {
+                    for (int i = 0; i < pad_len; i++) vsn_putc(&stream, ' ');
+                }
                 break;
             }
             case 'f':
             case 'g':
             case 'e': {
                 double val = va_arg(ap, double);
-                float_to_str(val, prec, buf);
-                append_str(buf, width, -1, left_align, ' ');
+                char buf[64];
+                format_float_str(val, prec, buf, sizeof(buf));
+                vsn_puts(&stream, buf, width, -1, left_align, ' ');
                 break;
             }
             case '%': {
-                append_char('%');
+                vsn_putc(&stream, '%');
                 break;
             }
             default:
-                append_char(spec);
+                vsn_putc(&stream, spec);
                 break;
         }
     }
 
     if (str && size > 0) {
-        if (written < size) {
-            str[written] = '\0';
+        if (stream.written < size) {
+            str[stream.written] = '\0';
         } else {
             str[size - 1] = '\0';
         }
     }
-    return (int)written;
+    return (int)stream.written;
 }
 
 int snprintf(char *str, size_t size, const char *format, ...) {
@@ -666,24 +718,21 @@ int vsprintf(char *str, const char *format, va_list ap) {
 
 int vfprintf(FILE *stream, const char *format, va_list ap) {
     if (!stream) return -1;
-    char buf[1024];
+    char stack_buf[1024];
     va_list aq;
     va_copy(aq, ap);
-    int len = vsnprintf(buf, sizeof(buf), format, aq);
+    int len = vsnprintf(stack_buf, sizeof(stack_buf), format, aq);
     va_end(aq);
-
     if (len < 0) return -1;
-
-    if (len < (int)sizeof(buf)) {
-        return (int)fwrite(buf, 1, len, stream);
-    } else {
-        char *dyn = (char *)malloc(len + 1);
-        if (!dyn) return -1;
-        vsnprintf(dyn, len + 1, format, ap);
-        int written = (int)fwrite(dyn, 1, len, stream);
-        free(dyn);
-        return written;
+    if ((size_t)len < sizeof(stack_buf)) {
+        return (int)fwrite(stack_buf, 1, (size_t)len, stream);
     }
+    char *dyn = (char *)malloc((size_t)len + 1);
+    if (!dyn) return -1;
+    vsnprintf(dyn, (size_t)len + 1, format, ap);
+    int written = (int)fwrite(dyn, 1, (size_t)len, stream);
+    free(dyn);
+    return written;
 }
 
 int fprintf(FILE *stream, const char *format, ...) {
@@ -735,6 +784,12 @@ int vsscanf(const char *str, const char *format, va_list ap) {
             continue;
         }
 
+        int suppress = 0;
+        if (*f == '*') {
+            suppress = 1;
+            f++;
+        }
+
         int is_long = 0;
         if (*f == 'l') {
             is_long = 1;
@@ -750,20 +805,24 @@ int vsscanf(const char *str, const char *format, va_list ap) {
                 char *end;
                 long val = strtol(s, &end, (spec == 'i' ? 0 : 10));
                 if (end == s) return matched;
-                if (is_long) *va_arg(ap, long *) = val;
-                else *va_arg(ap, int *) = (int)val;
+                if (!suppress) {
+                    if (is_long) *va_arg(ap, long *) = val;
+                    else *va_arg(ap, int *) = (int)val;
+                    matched++;
+                }
                 s = end;
-                matched++;
                 break;
             }
             case 'u': {
                 char *end;
                 unsigned long val = strtoul(s, &end, 10);
                 if (end == s) return matched;
-                if (is_long) *va_arg(ap, unsigned long *) = val;
-                else *va_arg(ap, unsigned int *) = (unsigned int)val;
+                if (!suppress) {
+                    if (is_long) *va_arg(ap, unsigned long *) = val;
+                    else *va_arg(ap, unsigned int *) = (unsigned int)val;
+                    matched++;
+                }
                 s = end;
-                matched++;
                 break;
             }
             case 'x':
@@ -771,36 +830,47 @@ int vsscanf(const char *str, const char *format, va_list ap) {
                 char *end;
                 unsigned long val = strtoul(s, &end, 16);
                 if (end == s) return matched;
-                if (is_long) *va_arg(ap, unsigned long *) = val;
-                else *va_arg(ap, unsigned int *) = (unsigned int)val;
+                if (!suppress) {
+                    if (is_long) *va_arg(ap, unsigned long *) = val;
+                    else *va_arg(ap, unsigned int *) = (unsigned int)val;
+                    matched++;
+                }
                 s = end;
-                matched++;
                 break;
             }
             case 's': {
-                char *out = va_arg(ap, char *);
+                char *out = suppress ? NULL : va_arg(ap, char *);
                 int idx = 0;
                 while (*s && !isspace(*s)) {
-                    out[idx++] = *s++;
+                    if (out) out[idx++] = *s++;
+                    else s++;
                 }
-                out[idx] = '\0';
-                if (idx > 0) matched++;
+                if (out) {
+                    out[idx] = '\0';
+                    if (idx > 0) matched++;
+                }
                 break;
             }
             case 'c': {
-                char *out = va_arg(ap, char *);
-                *out = *s++;
-                matched++;
+                if (suppress) {
+                    s++;
+                } else {
+                    char *out = va_arg(ap, char *);
+                    *out = *s++;
+                    matched++;
+                }
                 break;
             }
             case 'f': {
                 char *end;
                 double val = strtod(s, &end);
                 if (end == s) return matched;
-                if (is_long) *va_arg(ap, double *) = val;
-                else *va_arg(ap, float *) = (float)val;
+                if (!suppress) {
+                    if (is_long) *va_arg(ap, double *) = val;
+                    else *va_arg(ap, float *) = (float)val;
+                    matched++;
+                }
                 s = end;
-                matched++;
                 break;
             }
             default:
@@ -818,13 +888,45 @@ int sscanf(const char *str, const char *format, ...) {
     return res;
 }
 
+static char *read_dynamic_line(FILE *stream) {
+    if (!stream) return NULL;
+    size_t cap = 128;
+    size_t len = 0;
+    char *line = (char *)malloc(cap);
+    if (!line) return NULL;
+
+    int ch;
+    while ((ch = fgetc(stream)) != EOF) {
+        if (len + 2 > cap) {
+            size_t new_cap = cap * 2;
+            char *nb = (char *)realloc(line, new_cap);
+            if (!nb) {
+                free(line);
+                return NULL;
+            }
+            line = nb;
+            cap = new_cap;
+        }
+        line[len++] = (char)ch;
+        if (ch == '\n') break;
+    }
+
+    if (len == 0) {
+        free(line);
+        return NULL;
+    }
+    line[len] = '\0';
+    return line;
+}
+
 int fscanf(FILE *stream, const char *format, ...) {
-    char line[1024];
-    if (!fgets(line, sizeof(line), stream)) return EOF;
+    char *line = read_dynamic_line(stream);
+    if (!line) return EOF;
     va_list ap;
     va_start(ap, format);
     int res = vsscanf(line, format, ap);
     va_end(ap);
+    free(line);
     return res;
 }
 
@@ -842,11 +944,12 @@ int serial_printf(const char *fmt, ...) {
     va_start(ap, fmt);
     int ret = vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
-    for (int i = 0; i < ret && buf[i]; i++) {
+    if (ret < 0) return -1;
+    int limit = (ret < (int)sizeof(buf)) ? ret : (int)sizeof(buf) - 1;
+    for (int i = 0; i < limit && buf[i]; i++) {
 #ifdef __i386__
         __asm__ volatile("outb %0, %1" : : "a"((uint8_t)buf[i]), "Nd"((uint16_t)0x3F8));
 #endif
     }
     return ret;
 }
-

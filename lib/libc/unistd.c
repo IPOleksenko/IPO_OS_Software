@@ -12,6 +12,16 @@
 
 int errno = 0;
 
+extern int ipo_libc_socket_is_fd(int fd) __attribute__((weak));
+extern ssize_t ipo_libc_socket_read(int fd, void *buf, size_t count) __attribute__((weak));
+extern ssize_t ipo_libc_socket_write(int fd, const void *buf, size_t count) __attribute__((weak));
+extern int ipo_libc_socket_close(int fd) __attribute__((weak));
+extern ssize_t ipo_libc_stdin_read(void *buf, size_t count) __attribute__((weak));
+
+static int is_socket_fd(int fd) {
+    return ipo_libc_socket_is_fd && ipo_libc_socket_is_fd(fd);
+}
+
 int open(const char *pathname, int flags, ...) {
     if (!pathname) {
         errno = EINVAL;
@@ -65,6 +75,9 @@ int close(int fd) {
         errno = EBADF;
         return -1;
     }
+    if (is_socket_fd(fd)) {
+        return ipo_libc_socket_close ? ipo_libc_socket_close(fd) : -1;
+    }
     if (fd < 3) {
         return 0;
     }
@@ -87,8 +100,14 @@ ssize_t read(int fd, void *buf, size_t count) {
         return -1;
     }
     if (count == 0) return 0;
+    if (is_socket_fd(fd)) {
+        return ipo_libc_socket_read ? ipo_libc_socket_read(fd, buf, count) : -1;
+    }
 
     if (fd == STDIN_FILENO) {
+        if (ipo_libc_stdin_read) {
+            return ipo_libc_stdin_read(buf, count);
+        }
         if (stdin_line_pos >= stdin_line_len) {
             stdin_line_pos = 0;
             stdin_line_len = 0;
@@ -152,6 +171,9 @@ ssize_t write(int fd, const void *buf, size_t count) {
         return -1;
     }
     if (count == 0) return 0;
+    if (is_socket_fd(fd)) {
+        return ipo_libc_socket_write ? ipo_libc_socket_write(fd, buf, count) : -1;
+    }
 
     if (fd == STDOUT_FILENO || fd == STDERR_FILENO) {
         uint32_t args[2];

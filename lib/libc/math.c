@@ -42,6 +42,13 @@ float cosf(float x) {
     return (float)cos((double)x);
 }
 
+void sincosf(float x, float *sin_out, float *cos_out) {
+    float sin_value = sinf(x);
+    float cos_value = cosf(x);
+    if (sin_out) *sin_out = sin_value;
+    if (cos_out) *cos_out = cos_value;
+}
+
 double tan(double x) {
     double sin_val, cos_val;
     sin_val = sin(x);
@@ -62,6 +69,19 @@ double atan(double x) {
         : "=t" (res) : "0" (x) : "st(1)"
     );
     return res;
+}
+
+float atanf(float x) {
+    return (float)atan((double)x);
+}
+
+float hypotf(float x, float y) {
+    if (isinf(x) || isinf(y)) return HUGE_VALF;
+    if (isnan(x) || isnan(y)) return NAN;
+
+    double dx = (double)x;
+    double dy = (double)y;
+    return (float)sqrt(dx * dx + dy * dy);
 }
 
 double atan2(double y, double x) {

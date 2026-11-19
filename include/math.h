@@ -68,9 +68,12 @@ double lgamma(double x);
 
 float sinf(float x);
 float cosf(float x);
+void sincosf(float x, float *sin_out, float *cos_out);
 float tanf(float x);
 float sqrtf(float x);
 float fabsf(float x);
+float atanf(float x);
+float hypotf(float x, float y);
 float floorf(float x);
 float ceilf(float x);
 float expf(float x);

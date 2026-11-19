@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
-load_applications.py - Utility to populate an IPO_OS filesystem disk image
-with all compiled applications, userland libraries, compiler toolchains,
-headers, runtime scripts, and fonts.
+Populate an IPO_OS filesystem image with applications, toolchains, libraries,
+headers, fonts, the root autorun script, and all files under data/.
 """
 
 import argparse
@@ -51,7 +50,7 @@ def load_applications_to_disk(
     Populates the specified disk image with applications, libraries, headers, and assets.
 
     :param image_path: Path to the target disk image (e.g. disk.img).
-    :param project_root: Root directory of IPO_Applications (defaults to auto-detected root).
+    :param project_root: Root directory of IPO_OS_Software (defaults to auto-detected root).
     :param apps_dir: Directory containing compiled application .bin binaries.
     :param toolchain_dir: Directory containing compiled in-OS toolchain .elf binaries.
     :param fonts_dir: Directory containing .fnt font files.
@@ -125,14 +124,15 @@ def load_applications_to_disk(
 
     # Mandatory OS system directories
     safe_mkdir(disk, "/applications")
+    safe_mkdir(disk, "/drivers")
+    safe_mkdir(disk, "/data")
+    safe_mkdir(disk, "/etc")
     safe_mkdir(disk, "/lib")
     safe_mkdir(disk, "/fonts")
     safe_mkdir(disk, "/include")
 
     # Autorun file
     autorun_file = project_root / "assets" / "autorun"
-    if not autorun_file.exists():
-        autorun_file = project_root / "autorun"
     if autorun_file.exists():
         safe_put(disk, autorun_file, "/autorun")
     else:
@@ -151,14 +151,30 @@ def load_applications_to_disk(
         for app in app_files:
             app_name = app.name[:-4] if app.name.endswith(".bin") else app.name
             safe_put_executable(disk, app, f"/applications/{app_name}")
-            if app_name == "ifconfig":
-                safe_put_executable(disk, app, "/applications/ipconfig")
 
-    # Doom WAD asset
-    doom_wad = project_root / "applications" / "doom" / "doom1.wad"
-    if doom_wad.exists():
-        print("Uploading DOOM game data (doom1.wad)...")
-        safe_put(disk, doom_wad, "/applications/doom1.wad")
+    # 1b. Upload loadable kernel drivers (.kmd)
+    drivers_dir = project_root / "build" / "drivers"
+    if drivers_dir.is_dir():
+        kmd_files = sorted(drivers_dir.glob("*.kmd"))
+        if kmd_files:
+            print(f"Uploading {len(kmd_files)} kernel driver(s) to /drivers...")
+            for kmd in kmd_files:
+                safe_put(disk, kmd, f"/drivers/{kmd.name}")
+
+    # Upload all data files while preserving their directory structure.
+    data_dir = project_root / "data"
+    if data_dir.is_dir():
+        data_entries = sorted(data_dir.rglob("*"))
+        data_dirs = [entry for entry in data_entries if entry.is_dir()]
+        for directory in sorted(data_dirs, key=lambda entry: (len(entry.relative_to(data_dir).parts), entry)):
+            relative = directory.relative_to(data_dir).as_posix()
+            safe_mkdir(disk, f"/data/{relative}")
+
+        data_files = [entry for entry in data_entries if entry.is_file()]
+        print(f"Uploading {len(data_files)} data file(s) to /data...")
+        for data_file in data_files:
+            relative = data_file.relative_to(data_dir).as_posix()
+            safe_put(disk, data_file, f"/data/{relative}")
 
     # 2. Upload toolchain binaries
     tool_map = {
@@ -175,7 +191,6 @@ def load_applications_to_disk(
         "strip": toolchain_dir / "strip.elf",
         "nasm": toolchain_dir / "nasm.elf",
         "micropython": toolchain_dir / "python.elf",
-        "python": toolchain_dir / "python.elf",
         "lua": toolchain_dir / "lua" / "lua.elf",
         "luac": toolchain_dir / "lua" / "luac.elf",
     }
@@ -285,7 +300,7 @@ def main():
         "--project-root",
         type=Path,
         default=repo_root,
-        help="Root directory of the IPO_Applications repository.",
+        help="Root directory of the IPO_OS_Software repository.",
     )
     parser.add_argument(
         "--start-lba",
@@ -324,12 +339,10 @@ def main():
     )
     args = parser.parse_args()
 
-    # Determine disk image path priority:
+    # Determine target disk image path:
     # 1. --disk / -d / --image flag
     # 2. Positional disk argument
     # 3. Environment variable IPO_DISK or DISK
-    # 4. ../build/disk.img (sibling IPO_OS build)
-    # 5. build/disk.img
     target_disk = None
     if args.disk_flag:
         target_disk = args.disk_flag
@@ -350,6 +363,15 @@ def main():
             file=sys.stderr,
         )
         return 1
+
+    if target_disk and target_disk.name in ("IPO_OS.bin", "IPO_OS.img", "IPO_OS.iso"):
+        print(
+            f"Error: Target '{target_disk}' is the OS kernel/boot binary, not a filesystem disk!\n"
+            f"Please specify the disk image path explicitly (e.g. DISK=path/to/disk/disk.img).",
+            file=sys.stderr,
+        )
+        return 1
+
 
     try:
         return load_applications_to_disk(

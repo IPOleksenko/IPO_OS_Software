@@ -51,6 +51,11 @@ void mouse_poll(void);
 void mouse_get_state(mouse_state_t *out_state);
 
 /**
+ * Get cumulative relative mouse motion since initialization.
+ */
+void mouse_get_cumulative_motion(int64_t *out_x, int64_t *out_y);
+
+/**
  * Set custom screen boundaries.
  * If max_x <= 0 or max_y <= 0, boundaries are dynamically detected from active display.
  */
@@ -91,5 +96,12 @@ bool mouse_is_clicked_in_region(int32_t x, int32_t y, int32_t w, int32_t h, int 
  * Convenience function: checks if left mouse button is pressed inside rectangular region.
  */
 bool mouse_check_click(int32_t x, int32_t y, int32_t w, int32_t h);
+
+/**
+ * Inject a synthetic pointer event (relative delta or absolute coordinates)
+ * into the core OS cursor state from a low-level or user-space HID driver.
+ */
+void mouse_inject_event(int32_t dx_or_x, int32_t dy_or_y, int32_t dz,
+                        uint32_t buttons_mask, bool is_absolute);
 
 #endif /* _MOUSE_H */

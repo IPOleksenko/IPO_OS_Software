@@ -15,8 +15,10 @@ typedef uint32_t ip4_addr_t;
 #define IP4_ADDR_BROADCAST  IP4_ADDR(255, 255, 255, 255)
 
 typedef struct {
-    uint8_t mac[6];
-} __attribute__((packed)) mac_addr_t;
+    uint8_t *bytes;
+    size_t   len;
+    size_t   capacity;
+} mac_addr_t;
 
 typedef struct {
     mac_addr_t mac;

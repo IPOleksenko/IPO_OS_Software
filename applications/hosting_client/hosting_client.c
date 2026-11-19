@@ -152,7 +152,6 @@ int main(int argc, char **argv) {
     dyn_buf_t resp_buf;
     dyn_buf_init(&resp_buf, 1024);
 
-    char chunk[512];
     ssize_t bytes_recv;
     uint32_t start_time = timer_millis();
     bool aborted = false;
@@ -165,7 +164,12 @@ int main(int argc, char **argv) {
         }
 
         net_poll();
-        bytes_recv = recv(sock, chunk, sizeof(chunk), 0);
+        const size_t read_chunk = 512u;
+        if (!dyn_buf_reserve(&resp_buf, resp_buf.size + read_chunk)) {
+            printf("\n[error] Out of memory growing response buffer.\n");
+            break;
+        }
+        bytes_recv = recv(sock, resp_buf.data + resp_buf.size, read_chunk, 0);
 
         if (check_user_interrupted()) {
             aborted = true;
@@ -174,8 +178,7 @@ int main(int argc, char **argv) {
         }
 
         if (bytes_recv > 0) {
-            /* Append chunk to self-expanding dynamic buffer */
-            dyn_buf_append(&resp_buf, chunk, (size_t)bytes_recv);
+            resp_buf.size += (size_t)bytes_recv;
         } else if (bytes_recv == 0) {
             /* Server closed connection (EOF) */
             printf("[client] Server closed connection (EOF reached)\n");

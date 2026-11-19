@@ -3,6 +3,7 @@
 #include <driver/input/keymap/keymap.h>
 #include <driver/input/keymap/dynamic_keymap.h>
 #include <syscall.h>
+#include <stdlib.h>
 #include <string.h>
 
 void keyboard_poll(void) {
@@ -62,26 +63,57 @@ void update_hot_key_state(uint8_t scancode) {
     (void)scancode;
 }
 
+typedef int (*input_cstr_fetch_fn)(char *buf, uint32_t cap, uintptr_t ctx);
+
+static const char *query_dynamic_cstr(char **buf, size_t *cap,
+                                      input_cstr_fetch_fn fetch_fn, uintptr_t ctx,
+                                      const char *fallback) {
+    size_t try_cap = (*cap >= 64u) ? *cap : 64u;
+    while (try_cap <= 65536u) {
+        if (!*buf || try_cap > *cap) {
+            char *nb = (char *)realloc(*buf, try_cap);
+            if (!nb) return fallback;
+            *buf = nb;
+            *cap = try_cap;
+        }
+        (*buf)[0] = '\0';
+        int rc = fetch_fn(*buf, (uint32_t)*cap, ctx);
+        if (rc < 0) return fallback;
+        if ((*buf)[0] == '\0' && rc != 0 && rc != 1 && rc != (int)IPO_SYSCALL_ENOSYS) {
+            return (const char *)(uintptr_t)rc;
+        }
+        size_t len = strlen(*buf);
+        if (len + 1u < *cap) {
+            return (*buf)[0] ? *buf : fallback;
+        }
+        try_cap *= 2u;
+    }
+    return (*buf && (*buf)[0]) ? *buf : fallback;
+}
+
+static int fetch_key_string_cb(char *buf, uint32_t cap, uintptr_t ctx) {
+    uint32_t args[3] = { (uint32_t)ctx, (uint32_t)(uintptr_t)buf, cap };
+    uint32_t res = ipo_syscall(IPO_SYSCALL_KBD_GET_KEY_STRING, 3u, args);
+    if (res == 0u || res == IPO_SYSCALL_ENOSYS) return -1;
+    return (int)res;
+}
+
 char* get_keymap(void) {
-    static char dynamic_table[256];
+    static char *dynamic_table = NULL;
+    if (!dynamic_table) {
+        dynamic_table = (char *)malloc(256u);
+        if (!dynamic_table) return NULL;
+    }
     bool shift = keyboard_is_shift_pressed();
-    uint32_t args[4] = { 1u, (uint32_t)(uintptr_t)dynamic_table, (uint32_t)sizeof(dynamic_table), (uint32_t)shift };
+    uint32_t args[4] = { 1u, (uint32_t)(uintptr_t)dynamic_table, 256u, (uint32_t)shift };
     ipo_syscall(IPO_SYSCALL_KEYMAP_GET, 4u, args);
     return dynamic_table;
 }
 
 const char* keyboard_get_key_string(uint8_t scancode) {
-    static char buf[32];
-    buf[0] = '\0';
-    uint32_t args[3] = { (uint32_t)scancode, (uint32_t)(uintptr_t)buf, (uint32_t)sizeof(buf) };
-    uint32_t res = ipo_syscall(IPO_SYSCALL_KBD_GET_KEY_STRING, 3u, args);
-    if (res != 0 && buf[0] != '\0') {
-        return buf;
-    }
-    if (res != 0 && res != 1 && res != IPO_SYSCALL_ENOSYS) {
-        return (const char *)(uintptr_t)res;
-    }
-    return NULL;
+    static char *buf = NULL;
+    static size_t cap = 0u;
+    return query_dynamic_cstr(&buf, &cap, fetch_key_string_cb, (uintptr_t)scancode, NULL);
 }
 
 char get_char(uint8_t scancode) {
@@ -97,6 +129,15 @@ void mouse_get_state(mouse_state_t *out_state) {
     if (!out_state) return;
     uint32_t arg = (uint32_t)(uintptr_t)out_state;
     ipo_syscall(IPO_SYSCALL_MOUSE_GET_STATE, 1u, &arg);
+}
+
+void mouse_get_cumulative_motion(int64_t *out_x, int64_t *out_y) {
+    if (!out_x || !out_y) return;
+    uint32_t args[2] = {
+        (uint32_t)(uintptr_t)out_x,
+        (uint32_t)(uintptr_t)out_y
+    };
+    ipo_syscall(IPO_SYSCALL_MOUSE_GET_MOTION, 2u, args);
 }
 
 void mouse_get_position(int32_t *out_x, int32_t *out_y) {
@@ -142,13 +183,16 @@ void dynamic_keymap_cycle_prev(void) {
     ipo_syscall(IPO_SYSCALL_KEYMAP_CYCLE_PREV, 0u, NULL);
 }
 
+static int fetch_keymap_name_cb(char *buf, uint32_t cap, uintptr_t ctx) {
+    (void)ctx;
+    uint32_t args[2] = { (uint32_t)(uintptr_t)buf, cap };
+    return (int)ipo_syscall(IPO_SYSCALL_KEYMAP_GET_NAME, 2u, args);
+}
+
 const char* dynamic_keymap_get_name(void) {
-    static char name_buf[64];
-    uint32_t args[2] = { (uint32_t)(uintptr_t)name_buf, (uint32_t)sizeof(name_buf) };
-    if (ipo_syscall(IPO_SYSCALL_KEYMAP_GET_NAME, 2u, args) == 0) {
-        return name_buf;
-    }
-    return "English";
+    static char *name_buf = NULL;
+    static size_t name_cap = 0u;
+    return query_dynamic_cstr(&name_buf, &name_cap, fetch_keymap_name_cb, 0u, "English");
 }
 
 int dynamic_keymap_set(const char *name, const keymap_entry_t *entries, uint32_t count) {
@@ -191,12 +235,15 @@ bool dynamic_keymap_is_slot_enabled(uint32_t index) {
     return ipo_syscall(IPO_SYSCALL_KEYMAP_GET, 2u, args) != 0;
 }
 
+static int fetch_slot_name_cb(char *buf, uint32_t cap, uintptr_t ctx) {
+    uint32_t args[4] = { 5u, (uint32_t)ctx, (uint32_t)(uintptr_t)buf, cap };
+    return (int)ipo_syscall(IPO_SYSCALL_KEYMAP_GET, 4u, args);
+}
+
 const char* dynamic_keymap_get_slot_name(uint32_t index) {
-    static char slot_name_buf[64];
-    slot_name_buf[0] = '\0';
-    uint32_t args[4] = { 5u, index, (uint32_t)(uintptr_t)slot_name_buf, (uint32_t)sizeof(slot_name_buf) };
-    ipo_syscall(IPO_SYSCALL_KEYMAP_GET, 4u, args);
-    return slot_name_buf;
+    static char *slot_name_buf = NULL;
+    static size_t slot_name_cap = 0u;
+    return query_dynamic_cstr(&slot_name_buf, &slot_name_cap, fetch_slot_name_cb, (uintptr_t)index, "Unknown");
 }
 
 void dynamic_keymap_reset(void) {
@@ -214,4 +261,3 @@ uint32_t dynamic_keymap_copy_entries(uint32_t slot_idx, keymap_entry_t *out_entr
     uint32_t args[4] = { 2u, slot_idx, (uint32_t)(uintptr_t)out_entries, max_count };
     return ipo_syscall(IPO_SYSCALL_KEYMAP_GET, 4u, args);
 }
-

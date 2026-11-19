@@ -33,13 +33,16 @@ typedef struct driver {
     struct driver *next;
 } driver_t;
 
-#define DRIVER_FLAG_KERNEL   (1 << 0)  /* Built-in kernel hardware driver */
-#define DRIVER_FLAG_USER     (1 << 1)  /* Dynamically loaded user-space driver */
-#define DRIVER_FLAG_ACTIVE   (1 << 2)  /* Driver is initialized and active */
+#define DRIVER_FLAG_KERNEL          (1 << 0)  /* Built-in kernel hardware driver */
+#define DRIVER_FLAG_USER            (1 << 1)  /* Dynamically loaded user-space driver */
+#define DRIVER_FLAG_ACTIVE          (1 << 2)  /* Driver is initialized and active */
+#define DRIVER_FLAG_CONTINUOUS_TICK (1 << 3)  /* Call on_tick even when no keys are held */
 
 /* Driver registration functions */
 int driver_register(driver_t *drv);
 int driver_unregister(const char *name);
+int driver_unregister_force(const char *name);
+void driver_unregister_by_owner(void *owner_proc);
 driver_t* driver_find(const char *name);
 driver_t* driver_get_list(void);
 uint32_t driver_count(void);

@@ -1,0 +1,53 @@
+#pragma once
+#include <utility>
+
+namespace std {
+
+template <class T>
+constexpr const T& min(const T& a, const T& b) {
+    return (b < a) ? b : a;
+}
+
+template <class T>
+constexpr const T& max(const T& a, const T& b) {
+    return (a < b) ? b : a;
+}
+
+template <class InputIt, class UnaryPredicate>
+bool all_of(InputIt first, InputIt last, UnaryPredicate p) {
+    for (; first != last; ++first) {
+        if (!p(*first)) return false;
+    }
+    return true;
+}
+
+template <class InputIt, class UnaryPredicate>
+bool any_of(InputIt first, InputIt last, UnaryPredicate p) {
+    for (; first != last; ++first) {
+        if (p(*first)) return true;
+    }
+    return false;
+}
+
+template <class InputIt, class T>
+InputIt find(InputIt first, InputIt last, const T& value) {
+    for (; first != last; ++first) {
+        if (*first == value) return first;
+    }
+    return last;
+}
+
+template <class InputIt, class UnaryPredicate>
+InputIt find_if(InputIt first, InputIt last, UnaryPredicate p) {
+    for (; first != last; ++first) {
+        if (p(*first)) return first;
+    }
+    return last;
+}
+
+template <class T>
+constexpr const T& clamp(const T& v, const T& lo, const T& hi) {
+    return (v < lo) ? lo : (hi < v) ? hi : v;
+}
+
+} // namespace std

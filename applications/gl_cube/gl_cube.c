@@ -7,13 +7,14 @@
 #include <system/state.h>
 #include <driver/input/keyboard.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 #define WIN_W 140
 #define WIN_H 100
 
-static uint32_t tex_data[16 * 16];
-
-static void generate_checker_texture(void) {
+static uint32_t *generate_checker_texture(void) {
+    uint32_t *tex_data = (uint32_t *)malloc(16u * 16u * sizeof(uint32_t));
+    if (!tex_data) return NULL;
     for (int y = 0; y < 16; y++) {
         for (int x = 0; x < 16; x++) {
             bool check = ((x ^ y) & 2) != 0;
@@ -24,6 +25,7 @@ static void generate_checker_texture(void) {
             }
         }
     }
+    return tex_data;
 }
 
 static void draw_cube(void) {
@@ -99,7 +101,6 @@ int main(int argc, char **argv) {
     opt.w = WIN_W;
     opt.h = WIN_H;
     opt.decor_style = WM_DECOR_DEFAULT;
-    opt.event_cb = on_window_event;
 
     wm_window_t *win = wm_create_window(&opt);
     if (!win) return 1;
@@ -111,7 +112,12 @@ int main(int argc, char **argv) {
     }
     gl_make_current(gl);
 
-    generate_checker_texture();
+    uint32_t *tex_data = generate_checker_texture();
+    if (!tex_data) {
+        gl_destroy_context(gl);
+        wm_destroy_window(win);
+        return 1;
+    }
 
     GLuint tex_id = 1;
     glBindTexture(GL_TEXTURE_2D, tex_id);
@@ -120,6 +126,7 @@ int main(int argc, char **argv) {
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 16, 16, 0, GL_RGBA, GL_UNSIGNED_BYTE, tex_data);
+    free(tex_data);
 
     glEnable(GL_DEPTH_TEST);
     glEnable(GL_TEXTURE_2D);
@@ -138,13 +145,22 @@ int main(int argc, char **argv) {
 
     /* Render loop */
     while (app_running && wm_session_active() && !system_is_interrupted() && wm_is_window_valid(win)) {
-        uint32_t frame_start = timer_millis();
+        wm_event_t ev;
+        while (wm_poll_event(win, &ev)) {
+            on_window_event(win, ev.type, ev.data);
+        }
+        if (!app_running || !wm_is_window_valid(win)) break;
 
-        gl_make_current(gl);
-        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        uint32_t frame_start = timer_millis();
 
         int cur_w = (win && win->w > 0) ? (int)win->w : WIN_W;
         int cur_h = (win && win->h > 0) ? (int)win->h : WIN_H;
+        if (cur_w != gl->width || cur_h != gl->height) {
+            gl_resize_context(gl, cur_w, cur_h);
+        }
+
+        gl_make_current(gl);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
         glViewport(0, 0, cur_w, cur_h);
 
         glMatrixMode(GL_PROJECTION);
@@ -164,10 +180,9 @@ int main(int argc, char **argv) {
         angle_x += 2.0f;
         angle_y += 3.5f;
 
-        /* Limit to 30 FPS to prevent CPU overload */
-        do {
-            ipo_syscall(IPO_SYSCALL_PROCESS_YIELD, 0, NULL);
-        } while (timer_elapsed_ms(frame_start) < 33);
+        /* Uncapped frame processing: cooperative single yield per frame */
+        (void)frame_start;
+        ipo_syscall(IPO_SYSCALL_PROCESS_YIELD, 0, NULL);
     }
 
     gl_destroy_context(gl);

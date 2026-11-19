@@ -1,7 +1,11 @@
 #ifndef _SIGNAL_H
 #define _SIGNAL_H
 
-#include <sys/types.h>
+#include <stddef.h>
+#ifndef _PID_T_DECLARED
+typedef int pid_t;
+#define _PID_T_DECLARED
+#endif
 
 #define SIGHUP    1
 #define SIGINT    2
@@ -27,7 +31,13 @@ typedef struct {
     int si_signo;
     int si_errno;
     int si_code;
-    void *si_addr;
+    union {
+        void *si_addr;
+        struct {
+            pid_t si_pid;
+            unsigned int si_uid;
+        } sender;
+    };
 } siginfo_t;
 
 typedef struct {
@@ -65,6 +75,19 @@ struct sigaction {
 #define SIGIO     29
 #define SIGPOLL   SIGIO
 
+#define SI_USER   0
+#define SI_KERNEL 128
+
+#define SA_SIGINFO   0x00000004
+#define SA_ONSTACK   0x08000000
+#define SA_NODEFER   0x40000000
+#define SA_RESETHAND 0x80000000u
+
+#define SS_ONSTACK 1
+#define SS_DISABLE 2
+#define MINSIGSTKSZ 2048u
+#define SIGSTKSZ    8192u
+
 #define SIG_BLOCK   0
 #define SIG_UNBLOCK 1
 #define SIG_SETMASK 2
@@ -89,5 +112,6 @@ int sigdelset(sigset_t *set, int signum);
 int sigismember(const sigset_t *set, int signum);
 int sigprocmask(int how, const sigset_t *set, sigset_t *oldset);
 int sigaction(int signum, const struct sigaction *act, struct sigaction *oldact);
+int sigaltstack(const stack_t *ss, stack_t *old_ss);
 
 #endif

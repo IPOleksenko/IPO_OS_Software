@@ -19,6 +19,7 @@
  *  - Clean exit on ESC, 'q', or Ctrl+C.
  */
 
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -90,41 +91,62 @@ static const uint8_t *mem_find(const uint8_t *haystack, size_t haystack_len,
     return NULL;
 }
 
+/* Send formatted text response/header over socket with dynamic allocation */
+static void send_http_fmt(int client_fd, const char *fmt, ...) {
+    dyn_str_t s;
+    dyn_str_init(&s, NULL);
+    va_list ap;
+    va_start(ap, fmt);
+    bool ok = dyn_str_vprintf(&s, fmt, ap);
+    va_end(ap);
+    if (ok && s.len > 0) {
+        send(client_fd, dyn_str_c(&s), s.len, 0);
+    }
+    dyn_str_free(&s);
+}
+
+static void dyn_ip_to_str(ip4_addr_t ip, dyn_str_t *out) {
+    const size_t cap = 32u;
+    char *tmp = (char *)malloc(cap);
+    if (!tmp) {
+        dyn_str_set(out, "0.0.0.0");
+        return;
+    }
+    ip_to_str(ip, tmp, cap);
+    dyn_str_set(out, tmp);
+    free(tmp);
+}
+
 /* Parse HTTP request method, URI path, and query string */
-static void parse_http_request(const char *req, char *method, size_t method_sz,
-                               char *path, size_t path_sz, char *query, size_t query_sz) {
-    method[0] = '\0';
-    path[0] = '\0';
-    if (query && query_sz > 0) query[0] = '\0';
+static void parse_http_request(const char *req, dyn_str_t *method,
+                               dyn_str_t *path, dyn_str_t *query) {
+    dyn_str_set(method, "");
+    dyn_str_set(path, "");
+    if (query) dyn_str_set(query, "");
     if (!req) return;
 
     while (*req == ' ' || *req == '\r' || *req == '\n') req++;
 
-    size_t m = 0;
-    while (*req && *req != ' ' && m + 1 < method_sz) {
-        method[m++] = *req++;
+    while (*req && *req != ' ' && *req != '\r' && *req != '\n') {
+        dyn_str_append_char(method, *req++);
     }
-    method[m] = '\0';
 
     while (*req == ' ') req++;
 
-    size_t p = 0;
-    while (*req && *req != ' ' && *req != '\r' && *req != '\n' && *req != '?' && p + 1 < path_sz) {
-        path[p++] = *req++;
+    while (*req && *req != ' ' && *req != '\r' && *req != '\n' && *req != '?') {
+        dyn_str_append_char(path, *req++);
     }
-    path[p] = '\0';
 
     if (*req == '?') {
         req++;
-        size_t q = 0;
-        while (*req && *req != ' ' && *req != '\r' && *req != '\n' && query && q + 1 < query_sz) {
-            query[q++] = *req++;
+        while (*req && *req != ' ' && *req != '\r' && *req != '\n') {
+            if (query) dyn_str_append_char(query, *req);
+            req++;
         }
-        if (query && q < query_sz) query[q] = '\0';
     }
 
-    if (p == 0) {
-        strncpy(path, "/", path_sz);
+    if (path->len == 0) {
+        dyn_str_set(path, "/");
     }
 }
 
@@ -143,75 +165,77 @@ static long parse_content_length(const char *headers, size_t hdr_len) {
 }
 
 /* Parse Content-Type header */
-static void parse_content_type(const char *headers, size_t hdr_len, char *ctype, size_t ctype_sz) {
-    ctype[0] = '\0';
+static void parse_content_type(const char *headers, size_t hdr_len, dyn_str_t *ctype) {
+    dyn_str_set(ctype, "");
     const char *p = my_strcasestr(headers, "Content-Type:");
     if (!p || (size_t)(p - headers) >= hdr_len) return;
     p += 13;
     while (*p == ' ' || *p == '\t') p++;
-    size_t i = 0;
-    while (*p && *p != '\r' && *p != '\n' && i + 1 < ctype_sz) {
-        ctype[i++] = *p++;
+    while (*p && *p != '\r' && *p != '\n' && (size_t)(p - headers) < hdr_len) {
+        dyn_str_append_char(ctype, *p++);
     }
-    ctype[i] = '\0';
 }
 
 /* Sanitize filename: strip paths, slashes, forbidden dots */
-static void sanitize_filename(char *filename, size_t sz) {
-    if (!filename || sz == 0) return;
-    char *last_slash = strrchr(filename, '/');
-    char *last_bslash = strrchr(filename, '\\');
-    char *base = filename;
+static void sanitize_filename(dyn_str_t *filename) {
+    if (!filename || !filename->cstr) return;
+    char *s = filename->cstr;
+    char *last_slash = strrchr(s, '/');
+    char *last_bslash = strrchr(s, '\\');
+    char *base = s;
     if (last_slash && last_slash + 1 > base) base = last_slash + 1;
     if (last_bslash && last_bslash + 1 > base) base = last_bslash + 1;
-    if (base != filename) {
-        memmove(filename, base, strlen(base) + 1);
+    if (base != s) {
+        size_t blen = strlen(base);
+        memmove(s, base, blen + 1);
+        filename->len = blen;
     }
     /* Trim quotes or spaces */
-    size_t len = strlen(filename);
-    while (len > 0 && (filename[len - 1] == ' ' || filename[len - 1] == '\"' || filename[len - 1] == '\'')) {
-        filename[--len] = '\0';
+    while (filename->len > 0 &&
+           (s[filename->len - 1] == ' ' || s[filename->len - 1] == '\"' || s[filename->len - 1] == '\'')) {
+        s[--filename->len] = '\0';
     }
-    if (filename[0] == '\"' || filename[0] == '\'') {
-        memmove(filename, filename + 1, len);
+    if (filename->len > 0 && (s[0] == '\"' || s[0] == '\'')) {
+        memmove(s, s + 1, filename->len);
+        filename->len--;
     }
-    if (filename[0] == '\0' || strcmp(filename, ".") == 0 || strcmp(filename, "..") == 0) {
-        strncpy(filename, "upload.bin", sz);
+    if (filename->len == 0 || strcmp(s, ".") == 0 || strcmp(s, "..") == 0) {
+        dyn_str_set(filename, "upload.bin");
     }
 }
 
 /* Normalize requested URL path directly to real IPO_FS filesystem path */
-static void map_url_to_fspath(const char *url_path, char *fs_path, size_t fs_path_sz) {
+static void map_url_to_fspath(const char *url_path, dyn_str_t *fs_path) {
     if (!url_path || url_path[0] == '\0' || strcmp(url_path, "/") == 0) {
-        strncpy(fs_path, "/", fs_path_sz);
+        dyn_str_set(fs_path, "/");
         return;
     }
 
     if (url_path[0] != '/') {
-        snprintf(fs_path, fs_path_sz, "/%s", url_path);
+        dyn_str_printf(fs_path, "/%s", url_path);
     } else {
-        strncpy(fs_path, url_path, fs_path_sz);
+        dyn_str_set(fs_path, url_path);
     }
 
     /* Remove trailing slash if not root */
-    size_t len = strlen(fs_path);
-    if (len > 1 && fs_path[len - 1] == '/') {
-        fs_path[len - 1] = '\0';
+    if (fs_path->cstr && fs_path->len > 1 && fs_path->cstr[fs_path->len - 1] == '/') {
+        fs_path->cstr[--fs_path->len] = '\0';
     }
 }
 
 /* Get parent URL path for directory navigation */
-static void get_parent_url(const char *url, char *parent, size_t parent_sz) {
-    strncpy(parent, url, parent_sz);
-    size_t len = strlen(parent);
-    if (len > 1 && parent[len - 1] == '/') {
-        parent[len - 1] = '\0';
+static void get_parent_url(const char *url, dyn_str_t *parent) {
+    dyn_str_set(parent, url ? url : "/");
+    if (!parent->cstr) return;
+    if (parent->len > 1 && parent->cstr[parent->len - 1] == '/') {
+        parent->cstr[--parent->len] = '\0';
     }
-    char *last = strrchr(parent, '/');
-    if (!last || last == parent) {
-        strncpy(parent, "/", parent_sz);
+    char *last = strrchr(parent->cstr, '/');
+    if (!last || last == parent->cstr) {
+        dyn_str_set(parent, "/");
     } else {
         *last = '\0';
+        parent->len = (size_t)(last - parent->cstr);
     }
 }
 
@@ -241,39 +265,33 @@ static void send_404(int client_fd, const char *path) {
     dyn_buf_append_str(&b, "<!DOCTYPE html><html><head><meta charset='utf-8'><title>404 Not Found</title></head>");
     dyn_buf_append_str(&b, "<body style='font-family:monospace;background:#181818;color:#eee;padding:24px;'>");
     dyn_buf_append_str(&b, "<h1 style='color:#f85149;'>404 Not Found</h1>");
-    dyn_buf_append_str(&b, "<p>Path <code>");
-    dyn_buf_append_str(&b, path ? path : "");
-    dyn_buf_append_str(&b, "</code> was not found on this IPO_OS host.</p>");
+    dyn_buf_append_printf(&b, "<p>Path <code>%s</code> was not found on this IPO_OS host.</p>", path ? path : "");
     dyn_buf_append_str(&b, "<hr style='border:none;border-top:1px solid #333;margin:20px 0;'>");
     dyn_buf_append_str(&b, "<p><a style='color:#58a6ff;' href='/'>⬅ Back to Root (/)</a></p>");
     dyn_buf_append_str(&b, "</body></html>\n");
 
-    char hdr[256];
-    snprintf(hdr, sizeof(hdr),
-             "HTTP/1.1 404 Not Found\r\n"
-             "Content-Type: text/html; charset=UTF-8\r\n"
-             "Content-Length: %u\r\n"
-             "Server: IPO_OS/1.0\r\n"
-             "Connection: close\r\n\r\n",
-             (unsigned int)b.size);
-    send(client_fd, hdr, strlen(hdr), 0);
+    send_http_fmt(client_fd,
+                  "HTTP/1.1 404 Not Found\r\n"
+                  "Content-Type: text/html; charset=UTF-8\r\n"
+                  "Content-Length: %u\r\n"
+                  "Server: IPO_OS/1.0\r\n"
+                  "Connection: close\r\n\r\n",
+                  (unsigned int)b.size);
     send(client_fd, b.data, b.size, 0);
     dyn_buf_free(&b);
 }
 
 /* 405 Method Not Allowed response */
 static void send_method_not_allowed(int client_fd, const char *method) {
-    const char body[] = "405 Method Not Allowed\nAllowed methods: GET, HEAD, POST, PUT, DELETE, OPTIONS, PATCH, TRACE\n";
-    char hdr[512];
-    snprintf(hdr, sizeof(hdr),
-             "HTTP/1.1 405 Method Not Allowed\r\n"
-             "Allow: GET, HEAD, POST, PUT, DELETE, OPTIONS, PATCH, TRACE\r\n"
-             "Content-Type: text/plain; charset=UTF-8\r\n"
-             "Content-Length: %u\r\n"
-             "Server: IPO_OS/1.0\r\n"
-             "Connection: close\r\n\r\n",
-             (unsigned int)strlen(body));
-    send(client_fd, hdr, strlen(hdr), 0);
+    const char *body = "405 Method Not Allowed\nAllowed methods: GET, HEAD, POST, PUT, DELETE, OPTIONS, PATCH, TRACE\n";
+    send_http_fmt(client_fd,
+                  "HTTP/1.1 405 Method Not Allowed\r\n"
+                  "Allow: GET, HEAD, POST, PUT, DELETE, OPTIONS, PATCH, TRACE\r\n"
+                  "Content-Type: text/plain; charset=UTF-8\r\n"
+                  "Content-Length: %u\r\n"
+                  "Server: IPO_OS/1.0\r\n"
+                  "Connection: close\r\n\r\n",
+                  (unsigned int)strlen(body));
     send(client_fd, body, strlen(body), 0);
     printf("[http] 405 Method Not Allowed for '%s'\n", method ? method : "UNKNOWN");
 }
@@ -290,25 +308,24 @@ static void send_file(int client_fd, const char *fs_path, const struct ipo_inode
     const char *fname = get_filename(fs_path);
     uint32_t file_size = (uint32_t)st->size;
 
-    char hdr[512];
-    snprintf(hdr, sizeof(hdr),
-             "HTTP/1.1 200 OK\r\n"
-             "Content-Type: %s\r\n"
-             "Content-Length: %u\r\n"
-             "Content-Disposition: inline; filename=\"%s\"\r\n"
-             "Server: IPO_OS/1.0\r\n"
-             "Connection: close\r\n\r\n",
-             mime, file_size, fname);
-    send(client_fd, hdr, strlen(hdr), 0);
+    send_http_fmt(client_fd,
+                  "HTTP/1.1 200 OK\r\n"
+                  "Content-Type: %s\r\n"
+                  "Content-Length: %u\r\n"
+                  "Content-Disposition: inline; filename=\"%s\"\r\n"
+                  "Server: IPO_OS/1.0\r\n"
+                  "Connection: close\r\n\r\n",
+                  mime, file_size, fname);
 
+    const size_t chunk_cap = 2048u;
+    char *chunk = (char *)malloc(chunk_cap);
     uint32_t offset = 0;
-    char chunk[2048];
-    while (offset < file_size) {
+    while (chunk && offset < file_size) {
         if (check_user_interrupted()) {
             break;
         }
         uint32_t to_read = file_size - offset;
-        if (to_read > sizeof(chunk)) to_read = sizeof(chunk);
+        if (to_read > chunk_cap) to_read = (uint32_t)chunk_cap;
 
         int r = ipo_read(fd, chunk, to_read, offset);
         if (r <= 0) break;
@@ -329,6 +346,7 @@ static void send_file(int client_fd, const char *fs_path, const struct ipo_inode
         offset += (uint32_t)r;
         net_poll();
     }
+    free(chunk);
     ipo_close(fd);
     printf("[file] Successfully streamed %u bytes of %s\n", offset, fs_path);
 }
@@ -344,34 +362,28 @@ static void send_head(int client_fd, const char *url_path, const char *fs_path) 
         const char *fname = get_filename(fs_path);
         uint32_t file_size = (uint32_t)st.size;
 
-        char hdr[512];
-        snprintf(hdr, sizeof(hdr),
-                 "HTTP/1.1 200 OK\r\n"
-                 "Content-Type: %s\r\n"
-                 "Content-Length: %u\r\n"
-                 "Content-Disposition: inline; filename=\"%s\"\r\n"
-                 "Server: IPO_OS/1.0\r\n"
-                 "Connection: close\r\n\r\n",
-                 mime, file_size, fname);
-        send(client_fd, hdr, strlen(hdr), 0);
+        send_http_fmt(client_fd,
+                      "HTTP/1.1 200 OK\r\n"
+                      "Content-Type: %s\r\n"
+                      "Content-Length: %u\r\n"
+                      "Content-Disposition: inline; filename=\"%s\"\r\n"
+                      "Server: IPO_OS/1.0\r\n"
+                      "Connection: close\r\n\r\n",
+                      mime, file_size, fname);
         printf("[head] File %s (%u bytes)\n", fs_path, file_size);
     } else if (strcmp(fs_path, "/") == 0 || (stat_res == 0 && (st.mode & IPO_INODE_TYPE_DIR))) {
-        char hdr[512];
-        snprintf(hdr, sizeof(hdr),
-                 "HTTP/1.1 200 OK\r\n"
-                 "Content-Type: text/html; charset=UTF-8\r\n"
-                 "Server: IPO_OS/1.0\r\n"
-                 "Connection: close\r\n\r\n");
-        send(client_fd, hdr, strlen(hdr), 0);
+        send_http_fmt(client_fd,
+                      "HTTP/1.1 200 OK\r\n"
+                      "Content-Type: text/html; charset=UTF-8\r\n"
+                      "Server: IPO_OS/1.0\r\n"
+                      "Connection: close\r\n\r\n");
         printf("[head] Directory %s\n", fs_path);
     } else {
-        char hdr[256];
-        snprintf(hdr, sizeof(hdr),
-                 "HTTP/1.1 404 Not Found\r\n"
-                 "Content-Type: text/html; charset=UTF-8\r\n"
-                 "Server: IPO_OS/1.0\r\n"
-                 "Connection: close\r\n\r\n");
-        send(client_fd, hdr, strlen(hdr), 0);
+        send_http_fmt(client_fd,
+                      "HTTP/1.1 404 Not Found\r\n"
+                      "Content-Type: text/html; charset=UTF-8\r\n"
+                      "Server: IPO_OS/1.0\r\n"
+                      "Connection: close\r\n\r\n");
         printf("[head] 404 Not Found %s\n", url_path);
     }
 }
@@ -379,7 +391,7 @@ static void send_head(int client_fd, const char *url_path, const char *fs_path) 
 /* OPTIONS: Pre-flight & method query */
 static void handle_options(int client_fd, const char *url_path) {
     (void)url_path;
-    const char resp[] =
+    const char *resp =
         "HTTP/1.1 204 No Content\r\n"
         "Allow: GET, HEAD, POST, PUT, DELETE, OPTIONS, PATCH, TRACE\r\n"
         "Access-Control-Allow-Origin: *\r\n"
@@ -394,15 +406,13 @@ static void handle_options(int client_fd, const char *url_path) {
 /* TRACE: Echo back received request */
 static void handle_trace(int client_fd, const dyn_buf_t *req_buf) {
     size_t echo_len = req_buf ? req_buf->size : 0;
-    char hdr[256];
-    snprintf(hdr, sizeof(hdr),
-             "HTTP/1.1 200 OK\r\n"
-             "Content-Type: message/http\r\n"
-             "Content-Length: %u\r\n"
-             "Server: IPO_OS/1.0\r\n"
-             "Connection: close\r\n\r\n",
-             (unsigned int)echo_len);
-    send(client_fd, hdr, strlen(hdr), 0);
+    send_http_fmt(client_fd,
+                  "HTTP/1.1 200 OK\r\n"
+                  "Content-Type: message/http\r\n"
+                  "Content-Length: %u\r\n"
+                  "Server: IPO_OS/1.0\r\n"
+                  "Connection: close\r\n\r\n",
+                  (unsigned int)echo_len);
     if (echo_len > 0) {
         send(client_fd, req_buf->data, echo_len, 0);
     }
@@ -412,7 +422,7 @@ static void handle_trace(int client_fd, const dyn_buf_t *req_buf) {
 /* DELETE: Remove file or directory */
 static void handle_delete(int client_fd, const char *url_path, const char *fs_path) {
     if (strcmp(fs_path, "/") == 0 || strcmp(url_path, "/") == 0) {
-        const char resp[] =
+        const char *resp =
             "HTTP/1.1 403 Forbidden\r\n"
             "Content-Type: text/plain; charset=UTF-8\r\n"
             "Content-Length: 32\r\n"
@@ -434,58 +444,53 @@ static void handle_delete(int client_fd, const char *url_path, const char *fs_pa
 
     int del_res = ipo_delete(fs_path);
     if (del_res != 0) {
-        char err_body[256];
-        snprintf(err_body, sizeof(err_body), "Failed to delete '%s' (code %d)\n", fs_path, del_res);
-        char hdr[256];
-        snprintf(hdr, sizeof(hdr),
-                 "HTTP/1.1 500 Internal Server Error\r\n"
-                 "Content-Type: text/plain; charset=UTF-8\r\n"
-                 "Content-Length: %u\r\n"
-                 "Server: IPO_OS/1.0\r\n"
-                 "Connection: close\r\n\r\n",
-                 (unsigned int)strlen(err_body));
-        send(client_fd, hdr, strlen(hdr), 0);
-        send(client_fd, err_body, strlen(err_body), 0);
+        dyn_str_t err_body;
+        dyn_str_init(&err_body, NULL);
+        dyn_str_printf(&err_body, "Failed to delete '%s' (code %d)\n", fs_path, del_res);
+        send_http_fmt(client_fd,
+                      "HTTP/1.1 500 Internal Server Error\r\n"
+                      "Content-Type: text/plain; charset=UTF-8\r\n"
+                      "Content-Length: %u\r\n"
+                      "Server: IPO_OS/1.0\r\n"
+                      "Connection: close\r\n\r\n",
+                      (unsigned int)err_body.len);
+        send(client_fd, dyn_str_c(&err_body), err_body.len, 0);
+        dyn_str_free(&err_body);
         printf("[delete] Failed to delete %s (code %d)\n", fs_path, del_res);
         return;
     }
 
     printf("[delete] Successfully deleted '%s'\n", fs_path);
 
+    dyn_str_t parent;
+    dyn_str_init(&parent, NULL);
+    get_parent_url(url_path, &parent);
+
     dyn_buf_t b;
     dyn_buf_init(&b, 512);
-    dyn_buf_append_str(&b, "<!DOCTYPE html><html><head><meta charset='utf-8'>");
-    
-    char parent[256];
-    get_parent_url(url_path, parent, sizeof(parent));
-    char refresh_tag[256];
-    snprintf(refresh_tag, sizeof(refresh_tag), "<meta http-equiv='refresh' content='1;url=%s'>", parent);
-    dyn_buf_append_str(&b, refresh_tag);
+    dyn_buf_append_printf(&b,
+                          "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+                          "<meta http-equiv='refresh' content='1;url=%s'>"
+                          "<title>Deleted</title>\n"
+                          "<style>body{font-family:monospace;background:#181818;color:#eee;padding:24px;text-align:center;}"
+                          ".card{background:#222;border:1px solid #30363d;border-radius:8px;max-width:500px;margin:40px auto;padding:24px;}"
+                          "a{color:#58a6ff;font-weight:bold;text-decoration:none;}</style></head><body>"
+                          "<div class='card'><h2 style='color:#3fb950;margin-top:0;'>✔ Deleted Successfully</h2>"
+                          "<p>Resource <code><b>%s</b></code> was deleted from IPO_FS.</p>"
+                          "<p style='color:#888;'>Redirecting to parent directory...</p>"
+                          "<p><a href='%s'>⬅ Return to %s</a></p></div></body></html>\n",
+                          dyn_str_c(&parent), url_path, dyn_str_c(&parent), dyn_str_c(&parent));
 
-    dyn_buf_append_str(&b, "<title>Deleted</title>\n"
-                           "<style>body{font-family:monospace;background:#181818;color:#eee;padding:24px;text-align:center;}"
-                           ".card{background:#222;border:1px solid #30363d;border-radius:8px;max-width:500px;margin:40px auto;padding:24px;}"
-                           "a{color:#58a6ff;font-weight:bold;text-decoration:none;}</style></head><body>"
-                           "<div class='card'><h2 style='color:#3fb950;margin-top:0;'>✔ Deleted Successfully</h2>");
-    char msg[512];
-    snprintf(msg, sizeof(msg),
-             "<p>Resource <code><b>%s</b></code> was deleted from IPO_FS.</p>"
-             "<p style='color:#888;'>Redirecting to parent directory...</p>"
-             "<p><a href='%s'>⬅ Return to %s</a></p></div></body></html>\n",
-             url_path, parent, parent);
-    dyn_buf_append_str(&b, msg);
-
-    char hdr[512];
-    snprintf(hdr, sizeof(hdr),
-             "HTTP/1.1 200 OK\r\n"
-             "Content-Type: text/html; charset=UTF-8\r\n"
-             "Content-Length: %u\r\n"
-             "Server: IPO_OS/1.0\r\n"
-             "Connection: close\r\n\r\n",
-             (unsigned int)b.size);
-    send(client_fd, hdr, strlen(hdr), 0);
+    send_http_fmt(client_fd,
+                  "HTTP/1.1 200 OK\r\n"
+                  "Content-Type: text/html; charset=UTF-8\r\n"
+                  "Content-Length: %u\r\n"
+                  "Server: IPO_OS/1.0\r\n"
+                  "Connection: close\r\n\r\n",
+                  (unsigned int)b.size);
     send(client_fd, b.data, b.size, 0);
     dyn_buf_free(&b);
+    dyn_str_free(&parent);
 }
 
 /* PATCH: Partial modification or appending to resource, streamed directly */
@@ -511,7 +516,7 @@ static void handle_patch_stream(int client_fd, const char *url_path, const char 
 
     int fd = ipo_open(fs_path);
     if (fd < 0) {
-        char err[] = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 26\r\nConnection: close\r\n\r\nFailed to open file\n";
+        const char *err = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 26\r\nConnection: close\r\n\r\nFailed to open file\n";
         send(client_fd, err, strlen(err), 0);
         return;
     }
@@ -526,14 +531,15 @@ static void handle_patch_stream(int client_fd, const char *url_path, const char 
         written += (uint32_t)to_write;
     }
 
-    char temp_chunk[2048];
+    const size_t chunk_cap = 2048u;
+    char *temp_chunk = (char *)malloc(chunk_cap);
     uint32_t last_activity = timer_millis();
 
-    while (!check_user_interrupted()) {
+    while (temp_chunk && !check_user_interrupted()) {
         if (content_len >= 0 && (long)written >= content_len) {
             break;
         }
-        size_t to_recv = sizeof(temp_chunk);
+        size_t to_recv = chunk_cap;
         if (content_len >= 0) {
             size_t rem = (size_t)content_len - written;
             if (rem < to_recv) to_recv = rem;
@@ -557,64 +563,56 @@ static void handle_patch_stream(int client_fd, const char *url_path, const char 
             io_wait();
         }
     }
+    free(temp_chunk);
 
     ipo_close(fd);
     printf("[patch] Patched %u bytes to '%s' at offset %u\n", written, fs_path, target_offset);
 
-    char resp_body[256];
-    snprintf(resp_body, sizeof(resp_body),
-             "Successfully patched %u bytes at offset %u in %s\n",
-             written, target_offset, fs_path);
-    char hdr[256];
-    snprintf(hdr, sizeof(hdr),
-             "HTTP/1.1 200 OK\r\n"
-             "Content-Type: text/plain; charset=UTF-8\r\n"
-             "Content-Length: %u\r\n"
-             "Server: IPO_OS/1.0\r\n"
-             "Connection: close\r\n\r\n",
-             (unsigned int)strlen(resp_body));
-    send(client_fd, hdr, strlen(hdr), 0);
-    send(client_fd, resp_body, strlen(resp_body), 0);
+    dyn_str_t resp_body;
+    dyn_str_init(&resp_body, NULL);
+    dyn_str_printf(&resp_body,
+                   "Successfully patched %u bytes at offset %u in %s\n",
+                   written, target_offset, fs_path);
+    send_http_fmt(client_fd,
+                  "HTTP/1.1 200 OK\r\n"
+                  "Content-Type: text/plain; charset=UTF-8\r\n"
+                  "Content-Length: %u\r\n"
+                  "Server: IPO_OS/1.0\r\n"
+                  "Connection: close\r\n\r\n",
+                  (unsigned int)resp_body.len);
+    send(client_fd, dyn_str_c(&resp_body), resp_body.len, 0);
+    dyn_str_free(&resp_body);
 }
 
 static void send_upload_success(int client_fd, const char *redirect_url, const char *filename, uint32_t bytes_written) {
     dyn_buf_t b;
     dyn_buf_init(&b, 1024);
-    dyn_buf_append_str(&b, "<!DOCTYPE html>\n<html><head><meta charset='utf-8'>");
-    
-    char refresh_tag[256];
-    snprintf(refresh_tag, sizeof(refresh_tag), "<meta http-equiv='refresh' content='1;url=%s'>", redirect_url);
-    dyn_buf_append_str(&b, refresh_tag);
-    
-    dyn_buf_append_str(&b, "<title>Upload Successful</title>\n"
-                           "<style>\n"
-                           "body { font-family: monospace; background: #181818; color: #eee; padding: 24px; text-align: center; }\n"
-                           ".card { background: #222; border: 1px solid #30363d; border-radius: 8px; max-width: 520px; margin: 40px auto; padding: 28px; box-shadow: 0 4px 12px rgba(0,0,0,0.5); }\n"
-                           "a { color: #58a6ff; text-decoration: none; font-weight: bold; }\n"
-                           "a:hover { text-decoration: underline; }\n"
-                           "</style></head><body>\n");
-    dyn_buf_append_str(&b, "<div class='card'>\n");
-    dyn_buf_append_str(&b, "<h2 style='color:#3fb950;margin-top:0;'>✔ File Saved Successfully!</h2>\n");
-    
-    char msg[512];
-    snprintf(msg, sizeof(msg),
-             "<p>Saved file <code><b>%s</b></code> (<b>%u</b> bytes) into current directory.</p>\n"
-             "<p style='color:#888;margin-top:16px;'>Redirecting back to folder in 1 second...</p>\n"
-             "<p style='margin-top:20px;'><a href='%s'>⬅ Return to Directory Listing</a></p>\n",
-             filename, bytes_written, redirect_url);
-    dyn_buf_append_str(&b, msg);
-    dyn_buf_append_str(&b, "</div></body></html>\n");
+    dyn_buf_append_printf(&b,
+                          "<!DOCTYPE html>\n<html><head><meta charset='utf-8'>"
+                          "<meta http-equiv='refresh' content='1;url=%s'>"
+                          "<title>Upload Successful</title>\n"
+                          "<style>\n"
+                          "body { font-family: monospace; background: #181818; color: #eee; padding: 24px; text-align: center; }\n"
+                          ".card { background: #222; border: 1px solid #30363d; border-radius: 8px; max-width: 520px; margin: 40px auto; padding: 28px; box-shadow: 0 4px 12px rgba(0,0,0,0.5); }\n"
+                          "a { color: #58a6ff; text-decoration: none; font-weight: bold; }\n"
+                          "a:hover { text-decoration: underline; }\n"
+                          "</style></head><body>\n"
+                          "<div class='card'>\n"
+                          "<h2 style='color:#3fb950;margin-top:0;'>✔ File Saved Successfully!</h2>\n"
+                          "<p>Saved file <code><b>%s</b></code> (<b>%u</b> bytes) into current directory.</p>\n"
+                          "<p style='color:#888;margin-top:16px;'>Redirecting back to folder in 1 second...</p>\n"
+                          "<p style='margin-top:20px;'><a href='%s'>⬅ Return to Directory Listing</a></p>\n"
+                          "</div></body></html>\n",
+                          redirect_url, filename, bytes_written, redirect_url);
 
-    char hdr[512];
-    snprintf(hdr, sizeof(hdr),
-             "HTTP/1.1 303 See Other\r\n"
-             "Location: %s\r\n"
-             "Content-Type: text/html; charset=UTF-8\r\n"
-             "Content-Length: %u\r\n"
-             "Server: IPO_OS/1.0\r\n"
-             "Connection: close\r\n\r\n",
-             redirect_url, (unsigned int)b.size);
-    send(client_fd, hdr, strlen(hdr), 0);
+    send_http_fmt(client_fd,
+                  "HTTP/1.1 303 See Other\r\n"
+                  "Location: %s\r\n"
+                  "Content-Type: text/html; charset=UTF-8\r\n"
+                  "Content-Length: %u\r\n"
+                  "Server: IPO_OS/1.0\r\n"
+                  "Connection: close\r\n\r\n",
+                  redirect_url, (unsigned int)b.size);
     send(client_fd, b.data, b.size, 0);
     dyn_buf_free(&b);
 }
@@ -622,33 +620,29 @@ static void send_upload_success(int client_fd, const char *redirect_url, const c
 static void send_upload_error(int client_fd, const char *redirect_url, const char *err_msg) {
     dyn_buf_t b;
     dyn_buf_init(&b, 1024);
-    dyn_buf_append_str(&b, "<!DOCTYPE html>\n<html><head><meta charset='utf-8'>");
-    dyn_buf_append_str(&b, "<title>Operation Failed</title>\n"
-                           "<style>\n"
-                           "body { font-family: monospace; background: #181818; color: #eee; padding: 24px; text-align: center; }\n"
-                           ".card { background: #222; border: 1px solid #f85149; border-radius: 8px; max-width: 520px; margin: 40px auto; padding: 28px; box-shadow: 0 4px 12px rgba(0,0,0,0.5); }\n"
-                           "a { color: #58a6ff; text-decoration: none; font-weight: bold; }\n"
-                           "a:hover { text-decoration: underline; }\n"
-                           "</style></head><body>\n");
-    dyn_buf_append_str(&b, "<div class='card'>\n");
-    dyn_buf_append_str(&b, "<h2 style='color:#f85149;margin-top:0;'>❌ Operation Failed</h2>\n");
-    char msg[512];
-    snprintf(msg, sizeof(msg),
-             "<p>%s</p>\n"
-             "<p style='margin-top:20px;'><a href='%s'>⬅ Return to Directory</a></p>\n",
-             err_msg ? err_msg : "An error occurred while saving the file.", redirect_url);
-    dyn_buf_append_str(&b, msg);
-    dyn_buf_append_str(&b, "</div></body></html>\n");
+    dyn_buf_append_printf(&b,
+                          "<!DOCTYPE html>\n<html><head><meta charset='utf-8'>"
+                          "<title>Operation Failed</title>\n"
+                          "<style>\n"
+                          "body { font-family: monospace; background: #181818; color: #eee; padding: 24px; text-align: center; }\n"
+                          ".card { background: #222; border: 1px solid #f85149; border-radius: 8px; max-width: 520px; margin: 40px auto; padding: 28px; box-shadow: 0 4px 12px rgba(0,0,0,0.5); }\n"
+                          "a { color: #58a6ff; text-decoration: none; font-weight: bold; }\n"
+                          "a:hover { text-decoration: underline; }\n"
+                          "</style></head><body>\n"
+                          "<div class='card'>\n"
+                          "<h2 style='color:#f85149;margin-top:0;'>❌ Operation Failed</h2>\n"
+                          "<p>%s</p>\n"
+                          "<p style='margin-top:20px;'><a href='%s'>⬅ Return to Directory</a></p>\n"
+                          "</div></body></html>\n",
+                          err_msg ? err_msg : "An error occurred while saving the file.", redirect_url);
 
-    char hdr[512];
-    snprintf(hdr, sizeof(hdr),
-             "HTTP/1.1 400 Bad Request\r\n"
-             "Content-Type: text/html; charset=UTF-8\r\n"
-             "Content-Length: %u\r\n"
-             "Server: IPO_OS/1.0\r\n"
-             "Connection: close\r\n\r\n",
-             (unsigned int)b.size);
-    send(client_fd, hdr, strlen(hdr), 0);
+    send_http_fmt(client_fd,
+                  "HTTP/1.1 400 Bad Request\r\n"
+                  "Content-Type: text/html; charset=UTF-8\r\n"
+                  "Content-Length: %u\r\n"
+                  "Server: IPO_OS/1.0\r\n"
+                  "Connection: close\r\n\r\n",
+                  (unsigned int)b.size);
     send(client_fd, b.data, b.size, 0);
     dyn_buf_free(&b);
 }
@@ -657,19 +651,26 @@ static void send_upload_error(int client_fd, const char *redirect_url, const cha
 static void handle_file_upload_stream(int client_fd, const char *url_path, const char *fs_path,
                                       const char *content_type, long content_len,
                                       const uint8_t *initial_body, size_t initial_body_len) {
-    char target_dir[256];
+    dyn_str_t target_dir, boundary, delim, end_delim, filename, dest_path;
+    dyn_str_init(&target_dir, NULL);
+    dyn_str_init(&boundary, NULL);
+    dyn_str_init(&delim, NULL);
+    dyn_str_init(&end_delim, NULL);
+    dyn_str_init(&filename, "upload.bin");
+    dyn_str_init(&dest_path, NULL);
+
     struct ipo_inode dest_st;
     memset(&dest_st, 0, sizeof(dest_st));
     bool is_dir = false;
 
     if (strcmp(fs_path, "/") == 0) {
         is_dir = true;
-        strncpy(target_dir, "/", sizeof(target_dir));
+        dyn_str_set(&target_dir, "/");
     } else if (ipo_stat(fs_path, &dest_st) == 0 && (dest_st.mode & IPO_INODE_TYPE_DIR)) {
         is_dir = true;
-        strncpy(target_dir, fs_path, sizeof(target_dir));
+        dyn_str_set(&target_dir, fs_path);
     } else {
-        get_parent_url(fs_path, target_dir, sizeof(target_dir));
+        get_parent_url(fs_path, &target_dir);
     }
 
     const char *bpos = my_strcasestr(content_type, "boundary=");
@@ -677,26 +678,19 @@ static void handle_file_upload_stream(int client_fd, const char *url_path, const
         /* Multipart upload from web browser form */
         bpos += 9;
         if (*bpos == '\"' || *bpos == '\'') bpos++;
-        char boundary[128];
-        size_t bi = 0;
         while (*bpos && *bpos != '\"' && *bpos != '\'' && *bpos != ';' &&
-               *bpos != ' ' && *bpos != '\r' && *bpos != '\n' && bi + 1 < sizeof(boundary)) {
-            boundary[bi++] = *bpos++;
+               *bpos != ' ' && *bpos != '\r' && *bpos != '\n') {
+            dyn_str_append_char(&boundary, *bpos++);
         }
-        boundary[bi] = '\0';
 
-        char delim[160];
-        snprintf(delim, sizeof(delim), "--%s", boundary);
-        size_t delim_len = strlen(delim);
+        dyn_str_printf(&delim, "--%s", dyn_str_c(&boundary));
 
-        /* Buffer for reading multipart header */
-        uint8_t mp_buf[4096];
-        size_t mp_buf_len = 0;
+        /* Dynamic buffer for reading multipart headers and payload */
+        dyn_buf_t mp_buf;
+        dyn_buf_init(&mp_buf, 4096);
 
         if (initial_body && initial_body_len > 0) {
-            size_t cp = (initial_body_len < sizeof(mp_buf)) ? initial_body_len : sizeof(mp_buf);
-            memcpy(mp_buf, initial_body, cp);
-            mp_buf_len = cp;
+            dyn_buf_append(&mp_buf, initial_body, initial_body_len);
         }
 
         /* Read more until we have the part header (terminated by \r\n\r\n or \n\n) */
@@ -705,27 +699,33 @@ static void handle_file_upload_stream(int client_fd, const char *url_path, const
         size_t hdr_sep = 4;
 
         while (timer_millis() - start_t < 8000) {
-            if (check_user_interrupted()) return;
+            if (check_user_interrupted()) {
+                dyn_buf_free(&mp_buf);
+                goto cleanup;
+            }
             net_poll();
 
-            hdr_end = mem_find(mp_buf, mp_buf_len, (const uint8_t *)"\r\n\r\n", 4);
+            hdr_end = mem_find(mp_buf.data, mp_buf.size, (const uint8_t *)"\r\n\r\n", 4);
             if (hdr_end) {
                 hdr_sep = 4;
                 break;
             }
-            hdr_end = mem_find(mp_buf, mp_buf_len, (const uint8_t *)"\n\n", 2);
+            hdr_end = mem_find(mp_buf.data, mp_buf.size, (const uint8_t *)"\n\n", 2);
             if (hdr_end) {
                 hdr_sep = 2;
                 break;
             }
 
-            if (mp_buf_len >= sizeof(mp_buf)) {
-                break; /* Header too long */
+            if (mp_buf.size == mp_buf.capacity) {
+                if (mp_buf.capacity >= 16u * 1024u * 1024u ||
+                    !dyn_buf_reserve(&mp_buf, mp_buf.capacity * 2u)) {
+                    break;
+                }
             }
 
-            ssize_t n = recv(client_fd, mp_buf + mp_buf_len, sizeof(mp_buf) - mp_buf_len, 0);
+            ssize_t n = recv(client_fd, mp_buf.data + mp_buf.size, mp_buf.capacity - mp_buf.size, 0);
             if (n > 0) {
-                mp_buf_len += (size_t)n;
+                mp_buf.size += (size_t)n;
             } else if (n == 0) {
                 break;
             } else {
@@ -736,70 +736,72 @@ static void handle_file_upload_stream(int client_fd, const char *url_path, const
 
         if (!hdr_end) {
             send_upload_error(client_fd, url_path, "Malformed multipart header or boundary missing");
-            return;
+            dyn_buf_free(&mp_buf);
+            goto cleanup;
         }
 
         /* Find boundary start */
-        const uint8_t *part_start = mem_find(mp_buf, (size_t)(hdr_end - mp_buf), (const uint8_t *)delim, delim_len);
-        if (!part_start) part_start = mp_buf;
-        else part_start += delim_len;
+        const uint8_t *part_start = mem_find(mp_buf.data, (size_t)(hdr_end - mp_buf.data),
+                                             (const uint8_t *)dyn_str_c(&delim), delim.len);
+        if (!part_start) part_start = mp_buf.data;
+        else part_start += delim.len;
 
         size_t part_hdr_len = (size_t)(hdr_end - part_start);
-        char part_hdr[512];
-        if (part_hdr_len >= sizeof(part_hdr)) part_hdr_len = sizeof(part_hdr) - 1;
+        char *part_hdr = (char *)malloc(part_hdr_len + 1u);
+        if (!part_hdr) {
+            send_upload_error(client_fd, url_path, "Out of memory parsing multipart header");
+            dyn_buf_free(&mp_buf);
+            goto cleanup;
+        }
         memcpy(part_hdr, part_start, part_hdr_len);
         part_hdr[part_hdr_len] = '\0';
 
-        char filename[128] = "upload.bin";
         const char *fn = my_strcasestr(part_hdr, "filename=");
         if (fn) {
             fn += 9;
             while (*fn == ' ') fn++;
             char q = 0;
             if (*fn == '\"' || *fn == '\'') q = *fn++;
-            size_t fi = 0;
-            while (*fn && fi + 1 < sizeof(filename)) {
+            dyn_str_set(&filename, "");
+            while (*fn) {
                 if (q && *fn == q) break;
                 if (!q && (*fn == ' ' || *fn == ';' || *fn == '\r' || *fn == '\n')) break;
-                filename[fi++] = *fn++;
+                dyn_str_append_char(&filename, *fn++);
             }
-            filename[fi] = '\0';
         }
-        sanitize_filename(filename, sizeof(filename));
+        free(part_hdr);
+        sanitize_filename(&filename);
 
         /* Determine destination file path */
-        char dest_path[256];
-        if (strcmp(target_dir, "/") == 0) {
-            snprintf(dest_path, sizeof(dest_path), "/%s", filename);
+        if (strcmp(dyn_str_c(&target_dir), "/") == 0) {
+            dyn_str_printf(&dest_path, "/%s", dyn_str_c(&filename));
         } else {
-            snprintf(dest_path, sizeof(dest_path), "%s/%s", target_dir, filename);
+            dyn_str_printf(&dest_path, "%s/%s", dyn_str_c(&target_dir), dyn_str_c(&filename));
         }
 
-        printf("[save] Multipart upload: streaming to '%s'...\n", dest_path);
+        printf("[save] Multipart upload: streaming to '%s'...\n", dyn_str_c(&dest_path));
 
-        ipo_delete(dest_path);
-        int c_res = ipo_create(dest_path, IPO_INODE_TYPE_FILE);
+        ipo_delete(dyn_str_c(&dest_path));
+        int c_res = ipo_create(dyn_str_c(&dest_path), IPO_INODE_TYPE_FILE);
         if (c_res < 0) {
             send_upload_error(client_fd, url_path, "Failed to create destination file");
-            return;
+            dyn_buf_free(&mp_buf);
+            goto cleanup;
         }
-        int fd = ipo_open(dest_path);
+        int fd = ipo_open(dyn_str_c(&dest_path));
         if (fd < 0) {
             send_upload_error(client_fd, url_path, "Failed to open destination file for writing");
-            return;
+            dyn_buf_free(&mp_buf);
+            goto cleanup;
         }
 
-        /* Move existing file data in mp_buf to start */
-        const uint8_t *file_data = hdr_end + hdr_sep;
-        size_t file_data_len = (size_t)((mp_buf + mp_buf_len) - file_data);
-        if (file_data_len > 0) {
-            memmove(mp_buf, file_data, file_data_len);
-        }
-        mp_buf_len = file_data_len;
+        /* Discard parsed part header, leaving initial payload bytes in mp_buf */
+        size_t consumed_hdr = (size_t)((hdr_end + hdr_sep) - mp_buf.data);
+        dyn_buf_consume(&mp_buf, NULL, consumed_hdr);
 
-        char end_delim[168];
-        snprintf(end_delim, sizeof(end_delim), "\r\n--%s", boundary);
-        size_t end_delim_len = strlen(end_delim);
+        dyn_str_printf(&end_delim, "\r\n--%s", dyn_str_c(&boundary));
+        const char *end_delim_str = dyn_str_c(&end_delim);
+        size_t end_delim_len = end_delim.len;
 
         uint32_t total_written = 0;
         uint32_t last_activity = timer_millis();
@@ -808,40 +810,41 @@ static void handle_file_upload_stream(int client_fd, const char *url_path, const
             net_poll();
 
             /* Check if ending boundary is in mp_buf */
-            const uint8_t *b_found = mem_find(mp_buf, mp_buf_len, (const uint8_t *)end_delim, end_delim_len);
-            if (!b_found) {
-                b_found = mem_find(mp_buf, mp_buf_len, (const uint8_t *)(end_delim + 1), end_delim_len - 1);
+            const uint8_t *b_found = mem_find(mp_buf.data, mp_buf.size, (const uint8_t *)end_delim_str, end_delim_len);
+            if (!b_found && end_delim_len > 1u) {
+                b_found = mem_find(mp_buf.data, mp_buf.size, (const uint8_t *)(end_delim_str + 1), end_delim_len - 1u);
             }
             if (b_found) {
-                size_t to_write = (size_t)(b_found - mp_buf);
+                size_t to_write = (size_t)(b_found - mp_buf.data);
                 if (to_write > 0) {
-                    ipo_write(fd, mp_buf, (uint32_t)to_write, total_written);
+                    ipo_write(fd, mp_buf.data, (uint32_t)to_write, total_written);
                     total_written += (uint32_t)to_write;
                 }
                 break;
             }
 
             /* No boundary yet: flush safe bytes to disk */
-            size_t safe_tail = end_delim_len + 16;
-            if (mp_buf_len > safe_tail) {
-                size_t to_write = mp_buf_len - safe_tail;
-                ipo_write(fd, mp_buf, (uint32_t)to_write, total_written);
+            size_t safe_tail = end_delim_len + 16u;
+            if (mp_buf.size > safe_tail) {
+                size_t to_write = mp_buf.size - safe_tail;
+                ipo_write(fd, mp_buf.data, (uint32_t)to_write, total_written);
                 total_written += (uint32_t)to_write;
-                memmove(mp_buf, mp_buf + to_write, safe_tail);
-                mp_buf_len = safe_tail;
+                dyn_buf_consume(&mp_buf, NULL, to_write);
             }
 
-            /* Read more data from socket */
-            size_t space = sizeof(mp_buf) - mp_buf_len;
-            ssize_t n = recv(client_fd, mp_buf + mp_buf_len, space, 0);
+            /* Ensure read window and fetch more data from socket */
+            if (!dyn_buf_reserve(&mp_buf, mp_buf.size + 4096u)) {
+                break;
+            }
+            ssize_t n = recv(client_fd, mp_buf.data + mp_buf.size, mp_buf.capacity - mp_buf.size, 0);
             if (n > 0) {
-                mp_buf_len += (size_t)n;
+                mp_buf.size += (size_t)n;
                 last_activity = timer_millis();
             } else if (n == 0) {
-                if (mp_buf_len > 0) {
-                    ipo_write(fd, mp_buf, (uint32_t)mp_buf_len, total_written);
-                    total_written += (uint32_t)mp_buf_len;
-                    mp_buf_len = 0;
+                if (mp_buf.size > 0) {
+                    ipo_write(fd, mp_buf.data, (uint32_t)mp_buf.size, total_written);
+                    total_written += (uint32_t)mp_buf.size;
+                    mp_buf.size = 0;
                 }
                 break;
             } else {
@@ -855,35 +858,33 @@ static void handle_file_upload_stream(int client_fd, const char *url_path, const
         }
 
         ipo_close(fd);
-        printf("[save] Multipart success! %u bytes written to '%s'\n", total_written, dest_path);
-        send_upload_success(client_fd, url_path, filename, total_written);
+        dyn_buf_free(&mp_buf);
+        printf("[save] Multipart success! %u bytes written to '%s'\n", total_written, dyn_str_c(&dest_path));
+        send_upload_success(client_fd, url_path, dyn_str_c(&filename), total_written);
     } else {
         /* Raw binary POST or PUT upload */
-        char filename[128] = "upload.bin";
-        char dest_path[256];
-
         if (is_dir) {
-            snprintf(dest_path, sizeof(dest_path), "%s%s%s",
-                     target_dir, (strcmp(target_dir, "/") == 0 ? "" : "/"), filename);
+            const char *tdir = dyn_str_c(&target_dir);
+            dyn_str_printf(&dest_path, "%s%s%s",
+                           tdir, (strcmp(tdir, "/") == 0 ? "" : "/"), dyn_str_c(&filename));
         } else {
-            strncpy(dest_path, fs_path, sizeof(dest_path) - 1);
-            dest_path[sizeof(dest_path) - 1] = '\0';
-            const char *fn = get_filename(dest_path);
-            if (fn && *fn) strncpy(filename, fn, sizeof(filename) - 1);
+            dyn_str_set(&dest_path, fs_path);
+            const char *fn = get_filename(dyn_str_c(&dest_path));
+            if (fn && *fn) dyn_str_set(&filename, fn);
         }
 
-        printf("[save] Raw upload: streaming to '%s' (content-length: %ld)...\n", dest_path, content_len);
+        printf("[save] Raw upload: streaming to '%s' (content-length: %ld)...\n", dyn_str_c(&dest_path), content_len);
 
-        ipo_delete(dest_path);
-        int c_res = ipo_create(dest_path, IPO_INODE_TYPE_FILE);
+        ipo_delete(dyn_str_c(&dest_path));
+        int c_res = ipo_create(dyn_str_c(&dest_path), IPO_INODE_TYPE_FILE);
         if (c_res < 0) {
             send_upload_error(client_fd, url_path, "Failed to create destination file");
-            return;
+            goto cleanup;
         }
-        int fd = ipo_open(dest_path);
+        int fd = ipo_open(dyn_str_c(&dest_path));
         if (fd < 0) {
             send_upload_error(client_fd, url_path, "Failed to open destination file for writing");
-            return;
+            goto cleanup;
         }
 
         uint32_t total_written = 0;
@@ -898,14 +899,15 @@ static void handle_file_upload_stream(int client_fd, const char *url_path, const
             total_written += (uint32_t)to_write;
         }
 
-        char temp_chunk[2048];
+        const size_t chunk_cap = 2048u;
+        char *temp_chunk = (char *)malloc(chunk_cap);
         uint32_t last_activity = timer_millis();
 
-        while (!check_user_interrupted()) {
+        while (temp_chunk && !check_user_interrupted()) {
             if (content_len >= 0 && (long)total_written >= content_len) {
                 break;
             }
-            size_t to_recv = sizeof(temp_chunk);
+            size_t to_recv = chunk_cap;
             if (content_len >= 0) {
                 size_t rem = (size_t)content_len - total_written;
                 if (rem < to_recv) to_recv = rem;
@@ -929,11 +931,43 @@ static void handle_file_upload_stream(int client_fd, const char *url_path, const
                 io_wait();
             }
         }
+        free(temp_chunk);
 
         ipo_close(fd);
-        printf("[save] Raw upload success! %u bytes written to '%s'\n", total_written, dest_path);
-        send_upload_success(client_fd, url_path, filename, total_written);
+        printf("[save] Raw upload success! %u bytes written to '%s'\n", total_written, dyn_str_c(&dest_path));
+        send_upload_success(client_fd, url_path, dyn_str_c(&filename), total_written);
     }
+
+cleanup:
+    dyn_str_free(&dest_path);
+    dyn_str_free(&filename);
+    dyn_str_free(&end_delim);
+    dyn_str_free(&delim);
+    dyn_str_free(&boundary);
+    dyn_str_free(&target_dir);
+}
+
+static char *list_dir_dynamic(const char *fs_path) {
+    size_t cap = 8192u;
+    char *buf = (char *)kmalloc(cap);
+    while (buf) {
+        int list_len = ipo_list_dir(fs_path, buf, (int)cap);
+        if (list_len < 0) {
+            kfree(buf);
+            return NULL;
+        }
+        if ((size_t)list_len + 260u < cap || cap >= 16u * 1024u * 1024u) {
+            return buf;
+        }
+        size_t new_cap = cap * 2u;
+        char *nb = (char *)krealloc(buf, new_cap);
+        if (!nb) {
+            return buf;
+        }
+        buf = nb;
+        cap = new_cap;
+    }
+    return NULL;
 }
 
 static void send_directory(int client_fd, const char *url_path, const char *fs_path,
@@ -942,136 +976,131 @@ static void send_directory(int client_fd, const char *url_path, const char *fs_p
     dyn_buf_init(&body, 2048);
 
     /* 1. Header and greeting text */
-    dyn_buf_append_str(&body, "<!DOCTYPE html>\n<html><head><meta charset='utf-8'>");
-    dyn_buf_append_str(&body, "<title>IPO_OS Server - ");
-    dyn_buf_append_str(&body, url_path);
-    dyn_buf_append_str(&body, "</title>\n");
-    dyn_buf_append_str(&body, "<style>\n"
-                              "body { font-family: monospace; background: #181818; color: #e0e0e0; padding: 24px; line-height: 1.5; }\n"
-                              "a { color: #58a6ff; text-decoration: none; }\n"
-                              "a:hover { text-decoration: underline; }\n"
-                              ".info { background: #222; border: 1px solid #333; border-radius: 6px; padding: 16px; margin-bottom: 24px; }\n"
-                              "ul { list-style: none; padding: 0; margin: 0; }\n"
-                              "li { padding: 8px 12px; border-bottom: 1px solid #282828; display: flex; align-items: center; }\n"
-                              "li:hover { background: #252525; }\n"
-                              ".tag { font-size: 11px; margin-left: 10px; color: #888; }\n"
-                              ".down { color: #f0883e; font-size: 12px; margin-left: auto; text-decoration: none !important; }\n"
-                              ".down:hover { text-decoration: underline !important; }\n"
-                              ".del { color: #f85149; font-size: 12px; margin-left: 12px; text-decoration: none !important; cursor: pointer; }\n"
-                              ".del:hover { text-decoration: underline !important; }\n"
-                              "button:hover { background: #2ea043 !important; }\n"
-                              "input[type=file] { cursor: pointer; }\n"
-                              "</style></head><body>\n");
-
-    dyn_buf_append_str(&body, "<div class='info'>\n");
-    dyn_buf_append_str(&body, "<h1 style='margin-top:0; color:#58a6ff;'>🚀 Hello from IPO_OS TCP/IP Stack!</h1>\n");
-    dyn_buf_append_str(&body, "<p><b>OS Kernel:</b> IPO_OS</p>\n");
-    dyn_buf_append_str(&body, "<p><b>Stack:</b> Custom RFC 793 / RFC 9293 TCP/IP stack</p>\n");
-
-    char info[256];
-    snprintf(info, sizeof(info), "<p><b>Your Client Address:</b> %s:%u</p>\n", client_ip_str, client_port);
-    dyn_buf_append_str(&body, info);
-
-    snprintf(info, sizeof(info), "<p><b>Total Requests Served:</b> %u &nbsp;|&nbsp; <b>Kernel Uptime:</b> %u s</p>\n",
-             request_counter, timer_seconds());
-    dyn_buf_append_str(&body, info);
-    dyn_buf_append_str(&body, "</div>\n");
+    dyn_buf_append_printf(&body,
+                          "<!DOCTYPE html>\n<html><head><meta charset='utf-8'>"
+                          "<title>IPO_OS Server - %s</title>\n"
+                          "<style>\n"
+                          "body { font-family: monospace; background: #181818; color: #e0e0e0; padding: 24px; line-height: 1.5; }\n"
+                          "a { color: #58a6ff; text-decoration: none; }\n"
+                          "a:hover { text-decoration: underline; }\n"
+                          ".info { background: #222; border: 1px solid #333; border-radius: 6px; padding: 16px; margin-bottom: 24px; }\n"
+                          "ul { list-style: none; padding: 0; margin: 0; }\n"
+                          "li { padding: 8px 12px; border-bottom: 1px solid #282828; display: flex; align-items: center; }\n"
+                          "li:hover { background: #252525; }\n"
+                          ".tag { font-size: 11px; margin-left: 10px; color: #888; }\n"
+                          ".down { color: #f0883e; font-size: 12px; margin-left: auto; text-decoration: none !important; }\n"
+                          ".down:hover { text-decoration: underline !important; }\n"
+                          ".del { color: #f85149; font-size: 12px; margin-left: 12px; text-decoration: none !important; cursor: pointer; }\n"
+                          ".del:hover { text-decoration: underline !important; }\n"
+                          "button:hover { background: #2ea043 !important; }\n"
+                          "input[type=file] { cursor: pointer; }\n"
+                          "</style></head><body>\n"
+                          "<div class='info'>\n"
+                          "<h1 style='margin-top:0; color:#58a6ff;'>🚀 Hello from IPO_OS TCP/IP Stack!</h1>\n"
+                          "<p><b>OS Kernel:</b> IPO_OS</p>\n"
+                          "<p><b>Stack:</b> Custom RFC 793 / RFC 9293 TCP/IP stack</p>\n"
+                          "<p><b>Your Client Address:</b> %s:%u</p>\n"
+                          "<p><b>Total Requests Served:</b> %u &nbsp;|&nbsp; <b>Kernel Uptime:</b> %u s</p>\n"
+                          "</div>\n",
+                          url_path, client_ip_str, client_port, request_counter, timer_seconds());
 
     /* 2. File Upload Form for current directory */
-    char upload_box[1024];
-    snprintf(upload_box, sizeof(upload_box),
-             "<div style='background:#1e1e1e;border:1px solid #30363d;border-radius:6px;padding:16px;margin-bottom:20px;'>\n"
-             "<h3 style='margin-top:0;margin-bottom:12px;color:#58a6ff;'>📤 Upload File to %s</h3>\n"
-             "<form method='POST' action='%s' enctype='multipart/form-data' style='display:flex;align-items:center;gap:12px;flex-wrap:wrap;'>\n"
-             "<input type='file' name='file' required style='background:#161b22;border:1px solid #30363d;padding:6px 10px;border-radius:4px;color:#c9d1d9;font-family:monospace;'>\n"
-             "<button type='submit' style='background:#238636;color:#ffffff;border:none;padding:8px 16px;border-radius:6px;cursor:pointer;font-weight:bold;font-family:monospace;'>⬆ Upload File</button>\n"
-             "</form>\n"
-             "</div>\n",
-             url_path, url_path);
-    dyn_buf_append_str(&body, upload_box);
+    dyn_buf_append_printf(&body,
+                          "<div style='background:#1e1e1e;border:1px solid #30363d;border-radius:6px;padding:16px;margin-bottom:20px;'>\n"
+                          "<h3 style='margin-top:0;margin-bottom:12px;color:#58a6ff;'>📤 Upload File to %s</h3>\n"
+                          "<form method='POST' action='%s' enctype='multipart/form-data' style='display:flex;align-items:center;gap:12px;flex-wrap:wrap;'>\n"
+                          "<input type='file' name='file' required style='background:#161b22;border:1px solid #30363d;padding:6px 10px;border-radius:4px;color:#c9d1d9;font-family:monospace;'>\n"
+                          "<button type='submit' style='background:#238636;color:#ffffff;border:none;padding:8px 16px;border-radius:6px;cursor:pointer;font-weight:bold;font-family:monospace;'>⬆ Upload File</button>\n"
+                          "</form>\n"
+                          "</div>\n",
+                          url_path, url_path);
 
     /* 3. Directory listing section */
-    char dir_title[256];
-    snprintf(dir_title, sizeof(dir_title), "<h2>📁 Directory: %s</h2>\n<div style='background:#1e1e1e;border:1px solid #333;border-radius:6px;'><ul>\n", url_path);
-    dyn_buf_append_str(&body, dir_title);
+    dyn_buf_append_printf(&body,
+                          "<h2>📁 Directory: %s</h2>\n<div style='background:#1e1e1e;border:1px solid #333;border-radius:6px;'><ul>\n",
+                          url_path);
 
     /* If not root, show Parent Directory link */
     if (strcmp(url_path, "/") != 0) {
-        char parent[256];
-        get_parent_url(url_path, parent, sizeof(parent));
-        char p_link[512];
-        snprintf(p_link, sizeof(p_link),
-                 "<li><span style='margin-right:8px;'>📂</span><a style='color:#d2a8ff;font-weight:bold;' href='%s'>.. (Parent Directory)</a></li>\n",
-                 parent);
-        dyn_buf_append_str(&body, p_link);
+        dyn_str_t parent;
+        dyn_str_init(&parent, NULL);
+        get_parent_url(url_path, &parent);
+        dyn_buf_append_printf(&body,
+                              "<li><span style='margin-right:8px;'>📂</span><a style='color:#d2a8ff;font-weight:bold;' href='%s'>.. (Parent Directory)</a></li>\n",
+                              dyn_str_c(&parent));
+        dyn_str_free(&parent);
     }
 
     /* Read directory entries */
-    char *dir_buf = (char *)kmalloc(8192);
+    char *dir_buf = list_dir_dynamic(fs_path);
     int entries_found = 0;
     if (dir_buf) {
-        int list_len = ipo_list_dir(fs_path, dir_buf, 8192);
-        if (list_len > 0) {
-            const char *p = dir_buf;
-            char entry[128];
-            while (*p) {
-                const char *nl = strchr(p, '\n');
-                size_t len = nl ? (size_t)(nl - p) : strlen(p);
-                if (len == 0) {
-                    if (!nl) break;
-                    p = nl + 1;
-                    continue;
-                }
-                if (len >= sizeof(entry)) len = sizeof(entry) - 1;
-                memcpy(entry, p, len);
-                entry[len] = '\0';
-                p = nl ? nl + 1 : p + len;
+        dyn_str_t entry, child_url, child_fs;
+        dyn_str_init(&entry, NULL);
+        dyn_str_init(&child_url, NULL);
+        dyn_str_init(&child_fs, NULL);
 
-                bool is_dir = false;
-                if (entry[len - 1] == '/') {
-                    is_dir = true;
-                    entry[len - 1] = '\0';
-                }
-
-                /* Construct URL and FS path for this entry */
-                char child_url[256];
-                if (strcmp(url_path, "/") == 0) {
-                    snprintf(child_url, sizeof(child_url), "/%s", entry);
-                } else {
-                    snprintf(child_url, sizeof(child_url), "%s/%s", url_path, entry);
-                }
-
-                char child_fs[256];
-                map_url_to_fspath(child_url, child_fs, sizeof(child_fs));
-
-                struct ipo_inode c_st;
-                memset(&c_st, 0, sizeof(c_st));
-                if (ipo_stat(child_fs, &c_st) == 0 && (c_st.mode & IPO_INODE_TYPE_DIR)) {
-                    is_dir = true;
-                }
-
-                char item_buf[600];
-                if (is_dir) {
-                    snprintf(item_buf, sizeof(item_buf),
-                             "<li><span style='margin-right:8px;'>📁</span>"
-                             "<a style='font-weight:bold;' href='%s'>%s/</a>"
-                             "<span class='tag'>[DIR]</span>"
-                             "<a class='del' href='javascript:void(0)' onclick=\"if(confirm('Delete directory %s?')){fetch('%s',{method:'DELETE'}).then(()=>location.reload());}\">[delete]</a></li>\n",
-                             child_url, entry, entry, child_url);
-                } else {
-                    uint32_t sz = (uint32_t)c_st.size;
-                    snprintf(item_buf, sizeof(item_buf),
-                             "<li><span style='margin-right:8px;'>📄</span>"
-                             "<a href='%s'>%s</a>"
-                             "<span class='tag'>(%u bytes)</span>"
-                             "<a class='down' href='%s' download>[download]</a>"
-                             "<a class='del' href='javascript:void(0)' onclick=\"if(confirm('Delete file %s?')){fetch('%s',{method:'DELETE'}).then(()=>location.reload());}\">[delete]</a></li>\n",
-                             child_url, entry, sz, child_url, entry, child_url);
-                }
-                dyn_buf_append_str(&body, item_buf);
-                entries_found++;
+        const char *p = dir_buf;
+        while (*p) {
+            const char *nl = strchr(p, '\n');
+            size_t len = nl ? (size_t)(nl - p) : strlen(p);
+            if (len == 0) {
+                if (!nl) break;
+                p = nl + 1;
+                continue;
             }
+            dyn_str_set(&entry, "");
+            for (size_t i = 0; i < len; i++) {
+                dyn_str_append_char(&entry, p[i]);
+            }
+            p = nl ? nl + 1 : p + len;
+
+            bool is_dir = false;
+            if (entry.cstr && entry.len > 0 && entry.cstr[entry.len - 1] == '/') {
+                is_dir = true;
+                entry.cstr[--entry.len] = '\0';
+            }
+
+            /* Construct URL and FS path for this entry */
+            if (strcmp(url_path, "/") == 0) {
+                dyn_str_printf(&child_url, "/%s", dyn_str_c(&entry));
+            } else {
+                dyn_str_printf(&child_url, "%s/%s", url_path, dyn_str_c(&entry));
+            }
+
+            map_url_to_fspath(dyn_str_c(&child_url), &child_fs);
+
+            struct ipo_inode c_st;
+            memset(&c_st, 0, sizeof(c_st));
+            if (ipo_stat(dyn_str_c(&child_fs), &c_st) == 0 && (c_st.mode & IPO_INODE_TYPE_DIR)) {
+                is_dir = true;
+            }
+
+            const char *ename = dyn_str_c(&entry);
+            const char *curl = dyn_str_c(&child_url);
+            if (is_dir) {
+                dyn_buf_append_printf(&body,
+                                      "<li><span style='margin-right:8px;'>📁</span>"
+                                      "<a style='font-weight:bold;' href='%s'>%s/</a>"
+                                      "<span class='tag'>[DIR]</span>"
+                                      "<a class='del' href='javascript:void(0)' onclick=\"if(confirm('Delete directory %s?')){fetch('%s',{method:'DELETE'}).then(()=>location.reload());}\">[delete]</a></li>\n",
+                                      curl, ename, ename, curl);
+            } else {
+                uint32_t sz = (uint32_t)c_st.size;
+                dyn_buf_append_printf(&body,
+                                      "<li><span style='margin-right:8px;'>📄</span>"
+                                      "<a href='%s'>%s</a>"
+                                      "<span class='tag'>(%u bytes)</span>"
+                                      "<a class='down' href='%s' download>[download]</a>"
+                                      "<a class='del' href='javascript:void(0)' onclick=\"if(confirm('Delete file %s?')){fetch('%s',{method:'DELETE'}).then(()=>location.reload());}\">[delete]</a></li>\n",
+                                      curl, ename, sz, curl, ename, curl);
+            }
+            entries_found++;
         }
+
+        dyn_str_free(&child_fs);
+        dyn_str_free(&child_url);
+        dyn_str_free(&entry);
         kfree(dir_buf);
     }
 
@@ -1081,15 +1110,13 @@ static void send_directory(int client_fd, const char *url_path, const char *fs_p
 
     dyn_buf_append_str(&body, "</ul></div></body></html>\n");
 
-    char hdr[512];
-    snprintf(hdr, sizeof(hdr),
-             "HTTP/1.1 200 OK\r\n"
-             "Content-Type: text/html; charset=UTF-8\r\n"
-             "Content-Length: %u\r\n"
-             "Server: IPO_OS/1.0\r\n"
-             "Connection: close\r\n\r\n",
-             (unsigned int)body.size);
-    send(client_fd, hdr, strlen(hdr), 0);
+    send_http_fmt(client_fd,
+                  "HTTP/1.1 200 OK\r\n"
+                  "Content-Type: text/html; charset=UTF-8\r\n"
+                  "Content-Length: %u\r\n"
+                  "Server: IPO_OS/1.0\r\n"
+                  "Connection: close\r\n\r\n",
+                  (unsigned int)body.size);
     send(client_fd, body.data, body.size, 0);
 
     dyn_buf_free(&body);
@@ -1110,20 +1137,22 @@ int main(int argc, char **argv) {
 
     /* Dynamically query real device IP from the network subsystem */
     net_if_t *netif = net_get_interface();
-    char ip_str[64] = "127.0.0.1";
+    dyn_str_t ip_str;
+    dyn_str_init(&ip_str, "127.0.0.1");
     if (netif && netif->ip != 0) {
-        ip_to_str(netif->ip, ip_str, sizeof(ip_str));
+        dyn_ip_to_str(netif->ip, &ip_str);
     }
 
     printf("============================================================\n");
     printf("   IPO_OS Full-Featured HTTP Server (RFC 7231)\n");
     printf("============================================================\n");
-    printf("Device IP   : %s (link %s)\n", ip_str, (netif && netif->link_up) ? "UP" : "DOWN");
+    printf("Device IP   : %s (link %s)\n", dyn_str_c(&ip_str), (netif && netif->link_up) ? "UP" : "DOWN");
     printf("Listening on: 0.0.0.0:%u (INADDR_ANY)\n", port);
     printf("Methods     : GET, HEAD, POST, PUT, DELETE, OPTIONS, PATCH, TRACE\n\n");
     printf("Open in any web browser or HTTP client:\n");
-    printf("  Root directory : http://%s:%u/\n", ip_str, port);
+    printf("  Root directory : http://%s:%u/\n", dyn_str_c(&ip_str), port);
     printf("Press ESC, 'q', or Ctrl+C to stop server.\n\n");
+    dyn_str_free(&ip_str);
 
     /* 1. Create stream socket */
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -1159,9 +1188,11 @@ int main(int argc, char **argv) {
 
     uint32_t request_counter = 0;
     uint32_t last_heartbeat = timer_millis();
+    const size_t temp_chunk_cap = 1024u;
+    char *temp_chunk = (char *)malloc(temp_chunk_cap);
 
     /* 4. Accept loop */
-    while (!check_user_interrupted()) {
+    while (temp_chunk && !check_user_interrupted()) {
         net_poll();
 
         struct sockaddr_in client_addr;
@@ -1183,18 +1214,18 @@ int main(int argc, char **argv) {
         }
 
         request_counter++;
-        char client_ip_str[64];
-        ip_to_str(ntohl(client_addr.sin_addr.s_addr), client_ip_str, sizeof(client_ip_str));
+        dyn_str_t client_ip_str;
+        dyn_str_init(&client_ip_str, NULL);
+        dyn_ip_to_str(ntohl(client_addr.sin_addr.s_addr), &client_ip_str);
         uint16_t client_port = ntohs(client_addr.sin_port);
 
         printf("\n[%u] Incoming client from %s:%u (socket fd %d)\n",
-               request_counter, client_ip_str, client_port, client_fd);
+               request_counter, dyn_str_c(&client_ip_str), client_port, client_fd);
 
         /* 5. Read client request header */
         dyn_buf_t req_buf;
         dyn_buf_init(&req_buf, 1024);
 
-        char temp_chunk[1024];
         ssize_t bytes_read;
         uint32_t read_start = timer_millis();
 
@@ -1203,7 +1234,7 @@ int main(int argc, char **argv) {
                 break;
             }
             net_poll();
-            bytes_read = recv(client_fd, temp_chunk, sizeof(temp_chunk) - 1, 0);
+            bytes_read = recv(client_fd, temp_chunk, temp_chunk_cap - 1u, 0);
             if (bytes_read > 0) {
                 temp_chunk[bytes_read] = '\0';
                 dyn_buf_append(&req_buf, temp_chunk, (size_t)bytes_read);
@@ -1240,60 +1271,73 @@ int main(int argc, char **argv) {
             header_len = req_buf.size;
         }
 
-        char method[16], url_path[256], query[256];
-        parse_http_request((const char *)req_buf.data, method, sizeof(method),
-                           url_path, sizeof(url_path), query, sizeof(query));
-        printf("[http] %s %s%s%s\n", method, url_path, (query[0] ? "?" : ""), query);
+        dyn_str_t method, url_path, query, fs_path, content_type;
+        dyn_str_init(&method, NULL);
+        dyn_str_init(&url_path, NULL);
+        dyn_str_init(&query, NULL);
+        dyn_str_init(&fs_path, NULL);
+        dyn_str_init(&content_type, NULL);
+
+        parse_http_request((const char *)req_buf.data, &method, &url_path, &query);
+        printf("[http] %s %s%s%s\n", dyn_str_c(&method), dyn_str_c(&url_path),
+               (query.len > 0 ? "?" : ""), dyn_str_c(&query));
 
         /* 6. Map URL path to IPO_FS filesystem path */
-        char fs_path[256];
-        map_url_to_fspath(url_path, fs_path, sizeof(fs_path));
-
-        char content_type[256];
-        parse_content_type((const char *)req_buf.data, header_len, content_type, sizeof(content_type));
-
+        map_url_to_fspath(dyn_str_c(&url_path), &fs_path);
+        parse_content_type((const char *)req_buf.data, header_len, &content_type);
         long content_len = parse_content_length((const char *)req_buf.data, header_len);
 
+        const char *m_str = dyn_str_c(&method);
+        const char *u_str = dyn_str_c(&url_path);
+        const char *f_str = dyn_str_c(&fs_path);
+
         /* 7. Dispatch HTTP Method */
-        if (strcmp(method, "GET") == 0) {
+        if (strcmp(m_str, "GET") == 0) {
             struct ipo_inode st;
             memset(&st, 0, sizeof(st));
-            int stat_res = ipo_stat(fs_path, &st);
+            int stat_res = ipo_stat(f_str, &st);
 
             if (stat_res == 0 && (st.mode & IPO_INODE_TYPE_DIR)) {
-                send_directory(client_fd, url_path, fs_path, client_ip_str, client_port, request_counter);
+                send_directory(client_fd, u_str, f_str, dyn_str_c(&client_ip_str), client_port, request_counter);
             } else if (stat_res == 0 && (st.mode & IPO_INODE_TYPE_FILE)) {
-                send_file(client_fd, fs_path, &st);
+                send_file(client_fd, f_str, &st);
             } else {
-                if (strcmp(fs_path, "/") == 0) {
-                    send_directory(client_fd, url_path, "/", client_ip_str, client_port, request_counter);
+                if (strcmp(f_str, "/") == 0) {
+                    send_directory(client_fd, u_str, "/", dyn_str_c(&client_ip_str), client_port, request_counter);
                 } else {
-                    send_404(client_fd, url_path);
+                    send_404(client_fd, u_str);
                 }
             }
-        } else if (strcmp(method, "HEAD") == 0) {
-            send_head(client_fd, url_path, fs_path);
-        } else if (strcmp(method, "POST") == 0 || strcmp(method, "PUT") == 0) {
-            handle_file_upload_stream(client_fd, url_path, fs_path, content_type,
+        } else if (strcmp(m_str, "HEAD") == 0) {
+            send_head(client_fd, u_str, f_str);
+        } else if (strcmp(m_str, "POST") == 0 || strcmp(m_str, "PUT") == 0) {
+            handle_file_upload_stream(client_fd, u_str, f_str, dyn_str_c(&content_type),
                                       content_len, initial_body, initial_body_bytes);
-        } else if (strcmp(method, "DELETE") == 0) {
-            handle_delete(client_fd, url_path, fs_path);
-        } else if (strcmp(method, "OPTIONS") == 0) {
-            handle_options(client_fd, url_path);
-        } else if (strcmp(method, "PATCH") == 0) {
-            handle_patch_stream(client_fd, url_path, fs_path, query, content_len,
+        } else if (strcmp(m_str, "DELETE") == 0) {
+            handle_delete(client_fd, u_str, f_str);
+        } else if (strcmp(m_str, "OPTIONS") == 0) {
+            handle_options(client_fd, u_str);
+        } else if (strcmp(m_str, "PATCH") == 0) {
+            handle_patch_stream(client_fd, u_str, f_str, dyn_str_c(&query), content_len,
                                 initial_body, initial_body_bytes);
-        } else if (strcmp(method, "TRACE") == 0) {
+        } else if (strcmp(m_str, "TRACE") == 0) {
             handle_trace(client_fd, &req_buf);
         } else {
-            send_method_not_allowed(client_fd, method);
+            send_method_not_allowed(client_fd, m_str);
         }
 
         /* 8. Clean up and close connection */
+        dyn_str_free(&content_type);
+        dyn_str_free(&fs_path);
+        dyn_str_free(&query);
+        dyn_str_free(&url_path);
+        dyn_str_free(&method);
+        dyn_str_free(&client_ip_str);
         dyn_buf_free(&req_buf);
         close(client_fd);
     }
 
+    free(temp_chunk);
     printf("\n[server] Shutting down server socket...\n");
     close(server_fd);
     keyboard_set_app_input_mode(false);

@@ -48,7 +48,7 @@ rcsid[] = "$Id: m_bbox.c,v 1.1 1997/02/03 22:45:10 b1 Exp $";
 
 
 
-int	mb_used = 6;
+int	mb_used = 32;
 
 
 void
@@ -106,7 +106,9 @@ int  I_GetTime (void)
 //
 void I_Init (void)
 {
+    printf("[doom_debug] Entering I_Init()\n");
     I_InitSound();
+    printf("[doom_debug] I_InitSound() returned\n");
     //  I_InitGraphics();
 }
 

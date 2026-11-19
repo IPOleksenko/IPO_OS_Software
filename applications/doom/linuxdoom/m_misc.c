@@ -504,19 +504,24 @@ void M_ScreenShot (void)
 {
     int		i;
     byte*	linear;
-    char	lbmname[12];
+    char	lbmname[256];
+    const char*	home = getenv("HOME");
+    int		prefix_len;
     
     // munge planar buffer to linear
     linear = screens[2];
     I_ReadScreen (linear);
     
     // find a file name to save it to
-    strcpy(lbmname,"DOOM00.pcx");
+    if (!home || !home[0])
+	home = "/data/doom";
+    snprintf(lbmname, sizeof(lbmname), "%s/DOOM00.pcx", home);
+    prefix_len = (int)strlen(lbmname) - 10;
 		
     for (i=0 ; i<=99 ; i++)
     {
-	lbmname[4] = i/10 + '0';
-	lbmname[5] = i%10 + '0';
+	lbmname[prefix_len + 4] = i/10 + '0';
+	lbmname[prefix_len + 5] = i%10 + '0';
 	if (access(lbmname,0) == -1)
 	    break;	// file doesn't exist
     }

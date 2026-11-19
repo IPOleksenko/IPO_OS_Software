@@ -1,3 +1,7 @@
+/*
+ * Userspace network configuration and IPv4 address formatting helpers.
+ */
+
 #include <net/net.h>
 #include <syscall.h>
 #include <stdio.h>
@@ -50,8 +54,9 @@ bool net_init(const net_config_t *config) {
     if (!config) {
         return false;
     }
-    return net_api_call(IPO_SYSCALL_NET_INIT, 1u,
-                        (uint32_t[]){ (uint32_t)(uintptr_t)config }) != 0;
+    int rc = net_api_call(IPO_SYSCALL_NET_INIT, 1u,
+                          (uint32_t[]){ (uint32_t)(uintptr_t)config });
+    return rc == 1;
 }
 
 void net_poll(void) {
@@ -59,8 +64,9 @@ void net_poll(void) {
 }
 
 net_if_t *net_get_interface(void) {
-    if (!net_api_call(IPO_SYSCALL_NET_GET_INTERFACE, 1u,
-                      (uint32_t[]){ (uint32_t)(uintptr_t)&interface_cache })) {
+    int rc = net_api_call(IPO_SYSCALL_NET_GET_INTERFACE, 1u,
+                          (uint32_t[]){ (uint32_t)(uintptr_t)&interface_cache });
+    if (rc != 1) {
         return NULL;
     }
     return &interface_cache;

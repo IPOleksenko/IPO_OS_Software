@@ -9,25 +9,59 @@
 #include <errno.h>
 #include <math.h>
 #include <syscall.h>
+#include <stdarg.h>
 
-/* Maximum internal error message buffer */
-static char s_dlerror_buf[256] = {0};
-static int  s_has_dlerror = 0;
+/* Last error message allocated on demand */
+static char *s_dlerror_buf = NULL;
+static int   s_has_dlerror = 0;
 
 static void set_dlerror(const char *msg) {
     if (!msg) {
-        s_dlerror_buf[0] = 0;
+        if (s_dlerror_buf) s_dlerror_buf[0] = '\0';
         s_has_dlerror = 0;
         return;
     }
-    strncpy(s_dlerror_buf, msg, sizeof(s_dlerror_buf) - 1);
-    s_dlerror_buf[sizeof(s_dlerror_buf) - 1] = 0;
+    size_t len = strlen(msg);
+    char *nb = (char *)realloc(s_dlerror_buf, len + 1);
+    if (!nb) return;
+    s_dlerror_buf = nb;
+    memcpy(s_dlerror_buf, msg, len + 1);
     s_has_dlerror = 1;
+}
+
+static char *dl_alloc_vprintf(const char *fmt, va_list ap) {
+    va_list aq;
+    va_copy(aq, ap);
+    int len = vsnprintf(NULL, 0, fmt, aq);
+    va_end(aq);
+    if (len < 0) return NULL;
+    char *buf = (char *)malloc((size_t)len + 1);
+    if (!buf) return NULL;
+    vsnprintf(buf, (size_t)len + 1, fmt, ap);
+    return buf;
+}
+
+static char *dl_alloc_printf(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    char *buf = dl_alloc_vprintf(fmt, ap);
+    va_end(ap);
+    return buf;
+}
+
+static void set_dlerror_fmt(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    char *msg = dl_alloc_vprintf(fmt, ap);
+    va_end(ap);
+    if (!msg) return;
+    set_dlerror(msg);
+    free(msg);
 }
 
 /* User registered symbols list (dlregister_symbol) */
 typedef struct registered_sym {
-    char name[64];
+    char *name;
     void *addr;
     struct registered_sym *next;
 } registered_sym_t;
@@ -205,8 +239,11 @@ int dlregister_symbol(const char *name, void *addr) {
     }
     registered_sym_t *node = (registered_sym_t *)malloc(sizeof(registered_sym_t));
     if (!node) return -1;
-    strncpy(node->name, name, sizeof(node->name) - 1);
-    node->name[sizeof(node->name) - 1] = 0;
+    node->name = strdup(name);
+    if (!node->name) {
+        free(node);
+        return -1;
+    }
     node->addr = addr;
     node->next = s_custom_syms;
     s_custom_syms = node;
@@ -321,29 +358,33 @@ void *dlopen(const char *filename, int flags) {
     /* Locate file: try exact path, then fallback to /applications/ and /lib/ */
     uint32_t file_size = 0;
     uint8_t *file_buf = load_file_buffer(filename, &file_size);
-    char effective_path[256];
-    strncpy(effective_path, filename, sizeof(effective_path) - 1);
-    effective_path[sizeof(effective_path) - 1] = 0;
+    char *effective_path = strdup(filename);
 
     if (!file_buf && !strchr(filename, '/')) {
-        snprintf(effective_path, sizeof(effective_path), "/applications/%s", filename);
-        file_buf = load_file_buffer(effective_path, &file_size);
-        if (!file_buf) {
-            snprintf(effective_path, sizeof(effective_path), "/lib/%s", filename);
+        free(effective_path);
+        effective_path = dl_alloc_printf("/applications/%s", filename);
+        if (effective_path) {
             file_buf = load_file_buffer(effective_path, &file_size);
+        }
+        if (!file_buf) {
+            free(effective_path);
+            effective_path = dl_alloc_printf("/lib/%s", filename);
+            if (effective_path) {
+                file_buf = load_file_buffer(effective_path, &file_size);
+            }
         }
     }
 
     if (!file_buf) {
-        char err[128];
-        snprintf(err, sizeof(err), "dlopen: unable to open file '%s'", filename);
-        set_dlerror(err);
+        free(effective_path);
+        set_dlerror_fmt("dlopen: unable to open file '%s'", filename);
         return NULL;
     }
 
     /* Validate ELF header */
     if (file_size < sizeof(Elf32_Ehdr)) {
         set_dlerror("dlopen: file too small for ELF header");
+        free(effective_path);
         free(file_buf);
         return NULL;
     }
@@ -351,16 +392,19 @@ void *dlopen(const char *filename, int flags) {
     if (eh->e_ident[EI_MAG0] != ELFMAG0 || eh->e_ident[EI_MAG1] != ELFMAG1 ||
         eh->e_ident[EI_MAG2] != ELFMAG2 || eh->e_ident[EI_MAG3] != ELFMAG3) {
         set_dlerror("dlopen: invalid ELF magic header");
+        free(effective_path);
         free(file_buf);
         return NULL;
     }
     if (eh->e_ident[EI_CLASS] != ELFCLASS32 || eh->e_machine != EM_386) {
-        set_dlerror("dlopen: unsupported architecture (expected 32-bit x86 ELF)");
+        set_dlerror("dlopen: unsupported architecture (expected 32-bit ELF)");
+        free(effective_path);
         free(file_buf);
         return NULL;
     }
     if (eh->e_type != ET_REL && eh->e_type != ET_DYN) {
         set_dlerror("dlopen: ELF type must be ET_REL or ET_DYN");
+        free(effective_path);
         free(file_buf);
         return NULL;
     }
@@ -368,11 +412,12 @@ void *dlopen(const char *filename, int flags) {
     dl_module_t *mod = (dl_module_t *)calloc(1, sizeof(dl_module_t));
     if (!mod) {
         set_dlerror("dlopen: out of memory allocating module descriptor");
+        free(effective_path);
         free(file_buf);
         return NULL;
     }
 
-    mod->path = strdup(effective_path);
+    mod->path = effective_path ? effective_path : strdup(filename);
     mod->elf_type = eh->e_type;
     mod->ref_count = 1;
     mod->flags = flags;
@@ -503,9 +548,7 @@ void *dlopen(const char *filename, int flags) {
                             if (ELF32_ST_BIND(sym->st_info) == STB_WEAK) {
                                 sym_val = 0;
                             } else {
-                                char err[128];
-                                snprintf(err, sizeof(err), "dlopen: unresolved external symbol '%s'", sname);
-                                set_dlerror(err);
+                                set_dlerror_fmt("dlopen: unresolved external symbol '%s'", sname);
                                 free(file_buf);
                                 dlclose((void *)mod);
                                 return NULL;
@@ -686,9 +729,7 @@ void *dlsym(void *handle, const char *symbol) {
         void *res = dlsym_resolve_global(symbol);
         if (res) return res;
 
-        char err[128];
-        snprintf(err, sizeof(err), "dlsym: symbol '%s' not found globally", symbol);
-        set_dlerror(err);
+        set_dlerror_fmt("dlsym: symbol '%s' not found globally", symbol);
         return NULL;
     }
 
@@ -696,10 +737,8 @@ void *dlsym(void *handle, const char *symbol) {
     dl_module_t *mod = (dl_module_t *)handle;
     void *res = dlsym_in_module(mod, symbol);
     if (!res) {
-        char err[128];
-        snprintf(err, sizeof(err), "dlsym: symbol '%s' not found in module '%s'",
-                 symbol, mod->path ? mod->path : "unnamed");
-        set_dlerror(err);
+        set_dlerror_fmt("dlsym: symbol '%s' not found in module '%s'",
+                        symbol, mod->path ? mod->path : "unnamed");
         return NULL;
     }
 

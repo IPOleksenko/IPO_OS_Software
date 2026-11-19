@@ -34,6 +34,8 @@ typedef struct {
     /* Identification strings */
     char *model;       /* Dynamically allocated, NUL-terminated */
     char *serial;      /* Dynamically allocated, NUL-terminated */
+    uint8_t hardware_id[16];
+    bool hardware_id_valid;
 
 } ata_device_t;
 

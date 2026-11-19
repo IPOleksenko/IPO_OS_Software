@@ -1,0 +1,113 @@
+#pragma once
+#include <cstdio>
+#include <iomanip>
+#include <string>
+
+namespace std {
+
+class ifstream {
+    FILE* m_fp = nullptr;
+    bool m_eof = false;
+
+public:
+    ifstream() = default;
+    explicit ifstream(const string& path, ios::openmode mode = ios::in) { open(path, mode); }
+    ifstream(const ifstream&) = delete;
+    ifstream& operator=(const ifstream&) = delete;
+    ~ifstream() { close(); }
+
+    void open(const string& path, ios::openmode mode = ios::in) {
+        close();
+        m_fp = fopen(path.c_str(), (mode & ios::binary) ? "rb" : "r");
+        m_eof = false;
+    }
+
+    bool is_open() const noexcept { return m_fp != nullptr; }
+    explicit operator bool() const noexcept { return m_fp != nullptr && !m_eof; }
+    void close() {
+        if (m_fp) {
+            fclose(m_fp);
+            m_fp = nullptr;
+        }
+    }
+
+    FILE* _handle() const noexcept { return m_fp; }
+    void _set_eof(bool e) noexcept { m_eof = e; }
+};
+
+class ofstream {
+    FILE* m_fp = nullptr;
+    bool m_fail = false;
+
+public:
+    ofstream() = default;
+    explicit ofstream(const string& path, ios::openmode mode = ios::out | ios::trunc) {
+        open(path, mode);
+    }
+    ofstream(const ofstream&) = delete;
+    ofstream& operator=(const ofstream&) = delete;
+    ~ofstream() { close(); }
+
+    void open(const string& path, ios::openmode mode = ios::out | ios::trunc) {
+        close();
+        const char* fmode = (mode & ios::app) ? "a" : "w";
+        if (mode & ios::binary) {
+            fmode = (mode & ios::app) ? "ab" : "wb";
+        }
+        m_fp = fopen(path.c_str(), fmode);
+        m_fail = (m_fp == nullptr);
+    }
+
+    bool is_open() const noexcept { return m_fp != nullptr; }
+    explicit operator bool() const noexcept { return m_fp != nullptr && !m_fail; }
+
+    void close() {
+        if (m_fp) {
+            fflush(m_fp);
+            fclose(m_fp);
+            m_fp = nullptr;
+        }
+    }
+
+    ofstream& operator<<(const string& s) {
+        if (m_fp && !s.empty()) {
+            if (fwrite(s.data(), 1, s.size(), m_fp) != s.size()) m_fail = true;
+        }
+        return *this;
+    }
+    ofstream& operator<<(const char* s) {
+        if (m_fp && s) {
+            size_t len = strlen(s);
+            if (len && fwrite(s, 1, len, m_fp) != len) m_fail = true;
+        }
+        return *this;
+    }
+    ofstream& operator<<(char c) {
+        if (m_fp && fwrite(&c, 1, 1, m_fp) != 1) m_fail = true;
+        return *this;
+    }
+    ofstream& operator<<(int v) {
+        if (m_fp && fprintf(m_fp, "%d", v) < 0) m_fail = true;
+        return *this;
+    }
+};
+
+inline bool getline(ifstream& in, string& out, char delim = '\n') {
+    out.clear();
+    FILE* fp = in._handle();
+    if (!fp) return false;
+    int ch;
+    bool got = false;
+    while ((ch = fgetc(fp)) != EOF) {
+        got = true;
+        if (ch == static_cast<unsigned char>(delim)) break;
+        out.push_back(static_cast<char>(ch));
+    }
+    if (!got) {
+        in._set_eof(true);
+        return false;
+    }
+    return true;
+}
+
+} // namespace std

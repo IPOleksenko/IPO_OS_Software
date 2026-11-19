@@ -20,7 +20,7 @@ Building libraries, applications, and compilers requires a 32-bit GCC/GCC++ tool
 
 ## 🔨 Building
 
-### Build all components:
+### Build all components (`lib`, `drivers`, `applications`, `toolchain`, `font-databases`):
 ```bash
 make
 # or
@@ -29,23 +29,32 @@ make all
 
 ### Build individual components:
 
-- **Libraries only:**
+- **Libraries only** (`build/lib/` — `libc.a`, `libm.a`, `libstdc++.a`, `libapp.a`, `libapp_api.a`, `libbearssl.a`, CRT objects, `libtcc1.a`, `libgcc.a`):
   ```bash
   make lib
   ```
-- **Applications only:**
+- **Loadable kernel drivers only** (`build/drivers/` — `touchpad.kmd`, `gamepad.kmd`, `rtl8139.kmd`, `custom_proto.kmd`):
+  ```bash
+  make drivers
+  ```
+- **Applications only** (`build/applications/` — user `.bin` executables including `links`, `tcc`, `doom`, `SENSE: The Game`, `binfmt`, `elf_loader`):
   ```bash
   make applications
   ```
-- **In-OS toolchain only:**
+- **In-OS toolchain only** (`build/toolchain/` — `gcc.elf`, `g++.elf`, binutils `.elf`, `lua`/`luac`, `nasm.elf`, `python.elf`):
   ```bash
   make toolchain
   ```
+- **Font databases only** (`build/fonts/` — `fixed.fnt`, `terminus.fnt`, `bold.fnt`):
+  ```bash
+  make font-databases
+  ```
 - **Clean build artifacts:**
   ```bash
-  make clean
+  make clean      # removes build/ and in-tree toolchain intermediates
+  make clean-all  # also deletes stray *.o and __pycache__ directories
   ```
-
+  
 ---
 
 ## 💾 Loading Applications onto a Virtual Disk
@@ -65,14 +74,14 @@ Additional options:
 ./load_to_disk.sh /path/to/new_disk.img --format  # Automatically format the disk if necessary
 ```
 
-### Method 2: Using `make load-apps` / `make make-apps` / `make install-disk`
+### Method 2: Using Makefile disk targets
 
-The disk image path is passed through the `DISK=` variable:
+The disk image path is passed through `DISK=` (or environment variable `DISK` / `IPO_DISK`):
 
 ```bash
-make load-apps DISK=/path/to/disk.img
-# or
-make make-apps DISK=/path/to/disk.img
+make create-disk DISK=/path/to/disk.img   # Create 512 MiB raw image if absent
+make format-disk DISK=/path/to/disk.img   # Format IPO_FS partition at START_LBA (default: 2048)
+make load-apps DISK=/path/to/disk.img     # Automatically passes --format and loads apps/libs/fonts/headers
 ```
 
 Alternatively, use an environment variable:
@@ -92,12 +101,12 @@ python3 tools/load_applications.py --disk /path/to/disk.img --format
 
 ### Method 4: Python API
 
-The `tools.load_applications` module exports a ready-to-use function, `load_applications_to_disk`:
+The `tools.load_applications` module exports `load_applications_to_disk`:
 
 ```python
 from tools.load_applications import load_applications_to_disk
 
-# Load applications, libraries, headers, and fonts onto the specified disk image
+# Load applications, toolchain, headers, libraries, and fonts onto the specified disk image
 status = load_applications_to_disk(
     image_path="/path/to/disk.img",
     start_lba=2048,
@@ -110,16 +119,18 @@ print(f"Result: {status}")
 
 ## 🛠️ Disk Utilities
 
-- **`tools/disk_editor.py`** — A fully featured interface for the IPO_FS file system:
+- **`tools/disk_editor.py`** — CLI editor for the `IPO_FS` filesystem (supports `format`, `ls`, `cat`, `mkdir`, `touch`, `put`, `rm`; defaults: `--image build/disk.img`, `--start-lba 2048`):
   ```bash
   python3 tools/disk_editor.py --image build/disk.img ls /
   python3 tools/disk_editor.py --image build/disk.img put local_file.txt /dest.txt
-  python3 tools/disk_editor.py --image build/disk.img get /remote.txt local.txt
+  python3 tools/disk_editor.py --image build/disk.img cat /remote.txt > local.txt
+  python3 tools/disk_editor.py --image build/disk.img mkdir /mydir
+  python3 tools/disk_editor.py --image build/disk.img rm /dest.txt
   python3 tools/disk_editor.py --image build/disk.img format
   ```
-- **`tools/build_font_db.py`** — Generates IFNT binary font tables (supports ASCII, Cyrillic, and Chinese characters).
-- **`tools/format_disk_via_os.py`** — Partitions and formats the system disk.
-- **`tools/create_live_image.py`** — Builds a bootable Live CD / Hybrid ISO.
+- **`tools/build_font_db.py`** — Generates `IFNT` binary font databases in `build/fonts/` (`fixed.fnt`, `terminus.fnt`, `bold.fnt`) covering ASCII, Cyrillic, and Chinese Hanzi glyphs (invoked by `make font-databases`).
+- **`tools/format_disk_via_os.py`** — Injects MBR partition 1 (`LBA 2048`) and boots `IPO_OS` (`--boot` and `--kernel`) in headless QEMU to format and mount the `IPO_FS` filesystem on the target disk image (default `--disk build/disk.img`, `--size-mb 128`).
+- **`tools/create_live_image.py`** — Builds a unified bootable raw Live USB disk image (`build/IPO_OS.img` by default, 512 MiB or matching `--disk`), combining `boot.bin`, `kernel.bin`, MBR partition table, `IPO_FS` superblocks (`2030`/`2039`), zeroed WAL journal, and `--disk` partition data (invoked by `make live-image`).
 
 ---
 
@@ -130,4 +141,3 @@ print(f"Result: {status}")
 # 📜 License
 
 This project is licensed under the [MIT License](./LICENSE).
-

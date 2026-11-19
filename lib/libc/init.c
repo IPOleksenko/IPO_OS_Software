@@ -1,6 +1,7 @@
 #include <stddef.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <syscall.h>
 
 typedef void (*func_ptr)(void);
@@ -105,28 +106,34 @@ uint64_t __libc_start_main(void *main_func, int argc, char **argv, char **envp) 
     uint32_t ret_edx = 0;
 
     if (is_struct) {
-        static uint8_t struct_buf[512];
-        for (size_t i = 0; i < sizeof(struct_buf); i++) {
-            struct_buf[i] = 0xDD;
+        static uint8_t *struct_buf = NULL;
+        const size_t struct_buf_cap = 512;
+        if (!struct_buf) {
+            struct_buf = (uint8_t *)malloc(struct_buf_cap);
         }
-
-        typedef void* (*struct_main_fn)(void *ret_buf, int argc, char **argv, char **envp);
-        struct_main_fn s_main = (struct_main_fn)main_func;
-        s_main(struct_buf, argc, argv, envp);
-
-        ret_eax = (uint32_t)(uintptr_t)struct_buf;
-        ret_edx = 0;
-
-        int last_written = -1;
-        for (int i = (int)sizeof(struct_buf) - 1; i >= 0; i--) {
-            if (struct_buf[i] != 0xDD) {
-                last_written = i;
-                break;
+        if (struct_buf) {
+            for (size_t i = 0; i < struct_buf_cap; i++) {
+                struct_buf[i] = 0xDD;
             }
+
+            typedef void* (*struct_main_fn)(void *ret_buf, int argc, char **argv, char **envp);
+            struct_main_fn s_main = (struct_main_fn)main_func;
+            s_main(struct_buf, argc, argv, envp);
+
+            ret_eax = (uint32_t)(uintptr_t)struct_buf;
+            ret_edx = 0;
+
+            int last_written = -1;
+            for (int i = (int)struct_buf_cap - 1; i >= 0; i--) {
+                if (struct_buf[i] != 0xDD) {
+                    last_written = i;
+                    break;
+                }
+            }
+            uint32_t written_size = (last_written >= 0) ? (uint32_t)(last_written + 1) : 0;
+            const char *fmt = __ipo_return_format ? __ipo_return_format : "struct";
+            ipo_set_return_custom(fmt, struct_buf, written_size);
         }
-        uint32_t written_size = (last_written >= 0) ? (uint32_t)(last_written + 1) : 0;
-        const char *fmt = __ipo_return_format ? __ipo_return_format : "struct";
-        ipo_set_return_custom(fmt, struct_buf, written_size);
     } else {
         typedef int (*scalar_main_fn)(int, char**, char**);
         scalar_main_fn scalar_main = (scalar_main_fn)main_func;

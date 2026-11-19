@@ -44,8 +44,8 @@ typedef struct {
     uint32_t magic;
     net_if_t default_if;
     rtl8139_dev_t rtl_dev;
-    uint8_t rx_buffer[RTL8139_RX_BUFFER_SIZE] __attribute__((aligned(4)));
-    uint8_t tx_buffers[4][RTL8139_TX_BUFFER_SIZE] __attribute__((aligned(4)));
+    uint8_t *rx_buffer;
+    uint8_t *tx_buffers[4];
     struct arp_entry *arp_cache;
     struct udp_socket *udp_sockets;
     arp_entry_t *arp_table;

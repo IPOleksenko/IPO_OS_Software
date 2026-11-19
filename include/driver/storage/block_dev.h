@@ -31,6 +31,8 @@ typedef struct block_device {
     const block_device_ops_t *ops;
     void               *priv_data;
     struct block_device *next;
+    uint8_t             hardware_id[16];
+    bool                hardware_id_valid;
 } block_device_t;
 
 void block_dev_init(void);
@@ -46,4 +48,3 @@ bool block_dev_write(block_device_t *bdev, uint64_t lba, uint16_t count, const v
 bool block_dev_flush(block_device_t *bdev);
 
 #endif /* _BLOCK_DEV_H */
-

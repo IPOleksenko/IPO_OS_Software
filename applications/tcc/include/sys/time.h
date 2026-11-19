@@ -4,7 +4,7 @@
 #include <stdint.h>
 
 struct timeval {
-    long tv_sec;
+    int64_t tv_sec;
     long tv_usec;
 };
 

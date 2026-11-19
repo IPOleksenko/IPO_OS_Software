@@ -1,0 +1,34 @@
+#pragma once
+#include <cstddef>
+
+namespace std {
+
+struct _Setw { int n; };
+struct _Setfill { char c; };
+struct _Setprecision { int n; };
+
+struct ios_base {
+    using fmtflags = unsigned int;
+    static constexpr fmtflags fixed = 1u << 0;
+    static constexpr fmtflags boolalpha = 1u << 1;
+};
+
+struct ios {
+    using openmode = unsigned int;
+    static constexpr openmode in = 1u << 0;
+    static constexpr openmode out = 1u << 1;
+    static constexpr openmode trunc = 1u << 2;
+    static constexpr openmode app = 1u << 3;
+    static constexpr openmode binary = 1u << 4;
+};
+
+inline _Setw setw(int n) noexcept { return {n}; }
+inline _Setfill setfill(char c) noexcept { return {c}; }
+inline _Setprecision setprecision(int n) noexcept { return {n}; }
+
+struct _Fixed_tag {};
+inline _Fixed_tag& fixed(_Fixed_tag& t) noexcept { return t; }
+inline constexpr _Fixed_tag _fixed_tag_instance{};
+using _Ios_Manip = _Fixed_tag& (*)(_Fixed_tag&);
+
+} // namespace std

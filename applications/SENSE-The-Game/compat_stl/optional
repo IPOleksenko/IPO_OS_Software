@@ -1,0 +1,83 @@
+#pragma once
+#include <new>
+#include <utility>
+
+namespace std {
+
+struct nullopt_t {
+    explicit constexpr nullopt_t(int) {}
+};
+inline constexpr nullopt_t nullopt{0};
+
+template <class T>
+class optional {
+    alignas(T) unsigned char m_storage[sizeof(T)];
+    bool m_has = false;
+
+    T* ptr() noexcept { return reinterpret_cast<T*>(m_storage); }
+    const T* ptr() const noexcept { return reinterpret_cast<const T*>(m_storage); }
+
+public:
+    constexpr optional() noexcept = default;
+    constexpr optional(nullopt_t) noexcept : m_has(false) {}
+
+    optional(const T& v) : m_has(true) { ::new (static_cast<void*>(m_storage)) T(v); }
+    optional(T&& v) : m_has(true) { ::new (static_cast<void*>(m_storage)) T(move(v)); }
+
+    optional(const optional& o) : m_has(o.m_has) {
+        if (m_has) ::new (static_cast<void*>(m_storage)) T(*o.ptr());
+    }
+    optional(optional&& o) noexcept : m_has(o.m_has) {
+        if (m_has) ::new (static_cast<void*>(m_storage)) T(move(*o.ptr()));
+    }
+
+    ~optional() { reset(); }
+
+    optional& operator=(nullopt_t) noexcept { reset(); return *this; }
+
+    optional& operator=(const T& v) {
+        if (m_has) *ptr() = v;
+        else { ::new (static_cast<void*>(m_storage)) T(v); m_has = true; }
+        return *this;
+    }
+
+    optional& operator=(T&& v) {
+        if (m_has) *ptr() = move(v);
+        else { ::new (static_cast<void*>(m_storage)) T(move(v)); m_has = true; }
+        return *this;
+    }
+
+    optional& operator=(const optional& o) {
+        if (this == &o) return *this;
+        if (!o.m_has) reset();
+        else *this = *o.ptr();
+        return *this;
+    }
+
+    optional& operator=(optional&& o) noexcept {
+        if (this == &o) return *this;
+        if (!o.m_has) reset();
+        else *this = move(*o.ptr());
+        return *this;
+    }
+
+    void reset() noexcept {
+        if (m_has) {
+            ptr()->~T();
+            m_has = false;
+        }
+    }
+
+    bool has_value() const noexcept { return m_has; }
+    explicit operator bool() const noexcept { return m_has; }
+    T& value() { return *ptr(); }
+    const T& value() const { return *ptr(); }
+    T& operator*() { return *ptr(); }
+    const T& operator*() const { return *ptr(); }
+    T* operator->() { return ptr(); }
+    const T* operator->() const { return ptr(); }
+    template <class U>
+    T value_or(U&& fallback) const { return m_has ? *ptr() : static_cast<T>(forward<U>(fallback)); }
+};
+
+} // namespace std

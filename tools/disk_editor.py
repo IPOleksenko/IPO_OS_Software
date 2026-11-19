@@ -422,8 +422,38 @@ class DiskImage:
             return 1
         if not path.startswith('/'):
             return -1
+    def split_escaped_path(self, path):
+        if not path or not path.startswith('/'):
+            return None
+        parts = []
+        i = 0
+        n = len(path)
+        while i < n:
+            while i < n and path[i] == '/':
+                i += 1
+            if i >= n:
+                break
+            comp = []
+            while i < n and path[i] != '/':
+                if path[i] == '\\' and i + 1 < n and path[i + 1] == '/':
+                    comp.append('/')
+                    i += 2
+                else:
+                    comp.append(path[i])
+                    i += 1
+            name = ''.join(comp)
+            if name == '.':
+                continue
+            if name == '..':
+                if parts:
+                    parts.pop()
+            elif name:
+                parts.append(name)
+        return parts
+
+    def _resolve_parts(self, parts):
         cur = 1
-        for name in [p for p in path.split('/') if p]:
+        for name in parts:
             inode = self.read_inode(cur)
             if not (inode['mode'] & 1):
                 return -1
@@ -433,14 +463,17 @@ class DiskImage:
             cur = ent['inode']
         return cur
 
+    def path_resolve(self, path):
+        parts = self.split_escaped_path(path)
+        if parts is None:
+            return -1
+        return self._resolve_parts(parts)
+
     def path_parent(self, path):
-        path = os.path.normpath(path)
-        if path == '/':
+        parts = self.split_escaped_path(path)
+        if not parts:
             return -1, ''
-        parts = [p for p in path.split('/') if p]
-        name = parts[-1]
-        parent = '/' + '/'.join(parts[:-1]) if len(parts) > 1 else '/'
-        return self.path_resolve(parent), name
+        return self._resolve_parts(parts[:-1]), parts[-1]
 
     def read_inode_bytes(self, inode, size, offset):
         if offset >= inode['size']:

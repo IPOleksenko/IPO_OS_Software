@@ -15,10 +15,10 @@
  *   2. Return from main().  The compositor task keeps drawing their window.
  *   3. Optionally call wm_destroy_window() before returning to remove it.
  *
- * This means `run wm_demo & wm_demo2` works correctly:
- *   - wm_demo  creates its windows, returns.
- *   - wm_demo2 creates its windows, returns.
- *   - The WM async task composites both window sets every tick.
+ * Multiple separate programs running simultaneously can each create windows
+ * independently:
+ *   - each program creates its windows and returns or runs an event loop.
+ *   - The WM async task composites all active window sets every tick.
  *
  * System overlay
  * ==============
@@ -46,7 +46,6 @@ typedef enum {
     WM_DECOR_DEFAULT = 0, /* Standard title bar + border                     */
     WM_DECOR_THIN,        /* 1-pixel border, no title bar                    */
     WM_DECOR_NONE,        /* No border or title bar at all                   */
-    WM_DECOR_CUSTOM,      /* Caller's draw_cb is responsible for all chrome  */
 } wm_decor_style_t;
 
 #define WM_FONT_W 6
@@ -57,12 +56,14 @@ typedef enum {
  * ========================================================================= */
 #define WM_EVENT_KEY_DOWN   0x00000001u
 #define WM_EVENT_KEY_UP     0x00000002u
+#define WM_EVENT_KEY_EXT    0x00000004u  /* full 32-bit keycode in low 31 bits; bit 31 = break */
 #define WM_EVENT_FOCUS_IN   0x00000010u
 #define WM_EVENT_FOCUS_OUT  0x00000020u
 #define WM_EVENT_CLOSE      0x00000100u
 #define WM_EVENT_RESIZE     0x00000200u
 #define WM_EVENT_MOVE       0x00000400u
 #define WM_EVENT_CLICK      0x00001000u  /* left mouse button down inside window */
+#define WM_EVENT_SHORTCUT   0x00002000u  /* custom registered shortcut fired (data = tag) */
 
 /* =========================================================================
  * Forward declaration
@@ -72,8 +73,11 @@ typedef struct wm_window wm_window_t;
 /* =========================================================================
  * Callback signatures
  * ========================================================================= */
-typedef void (*wm_draw_cb_t) (wm_window_t *win);
-typedef void (*wm_event_cb_t)(wm_window_t *win, uint32_t event, uint32_t data);
+/* Polled event record returned by wm_poll_event() */
+typedef struct {
+    uint32_t type;
+    uint32_t data;
+} wm_event_t;
 
 /* =========================================================================
  * Window options – pass to wm_create_window()
@@ -98,8 +102,6 @@ typedef struct {
     /* NULL = auto-allocate */
     uint8_t *framebuf;
 
-    wm_draw_cb_t  draw_cb;
-    wm_event_cb_t event_cb;
     void         *user_data;
 } wm_window_options_t;
 
@@ -116,8 +118,6 @@ typedef struct {
     .shape_mask  = NULL,              \
     .mask_w = 0, .mask_h = 0,         \
     .framebuf    = NULL,              \
-    .draw_cb     = NULL,              \
-    .event_cb    = NULL,              \
     .user_data   = NULL,              \
 }
 
@@ -150,8 +150,6 @@ struct wm_window {
     uint16_t mask_w, mask_h;
     bool     shape_mask_owned;  /* true if the WM owns a copied shape mask */
 
-    wm_draw_cb_t  draw_cb;
-    wm_event_cb_t event_cb;
     void         *user_data;
     uint32_t      owner_pid;
     int           window_id; // Workspace ID in batch mode
@@ -172,7 +170,7 @@ struct wm_window {
  *   can continue running.  All windows added via wm_create_window() are
  *   composited by this task.  wm_create_window() calls wm_session_start()
  *   automatically if no session is running yet.
- *   Exit: left-click [X Exit] button or press ESC/Q.
+ *   Exit: left-click the window or taskbar Close button.
  *
  * wm_session_run() — BLOCKING (single-app animated mode).
  *   Like wm_session_start() but blocks in a loop, calling draw_cb every
@@ -186,7 +184,6 @@ struct wm_window {
  * wm_session_active() — true while either mode is running.
  */
 void wm_session_start(void);   /* async, non-blocking */
-void wm_session_run(void);     /* blocking (animated single-app mode) */
 void wm_session_stop(void);
 bool wm_session_active(void);
 
@@ -213,6 +210,7 @@ void         wm_focus_prev(void);
 
 void wm_invalidate(wm_window_t *win);
 void wm_invalidate_all(void);
+bool wm_poll_event(wm_window_t *win, wm_event_t *out);
 
 void wm_set_fullscreen(wm_window_t *win, bool enable);
 void wm_minimize(wm_window_t *win);
@@ -223,19 +221,6 @@ bool wm_resize(wm_window_t *win, uint16_t nw, uint16_t nh);
 void wm_set_title(wm_window_t *win, const char *title);
 void wm_set_shape(wm_window_t *win, const uint8_t *mask, uint16_t mw, uint16_t mh);
 
-/**
- * wm_dispatch_key - Route a keyboard scancode.
- * Returns false if ESC/Q pressed and caller should exit.
- * NOTE: The session's async tick calls this automatically.
- * Apps using the old single-loop model can call it too.
- */
-bool wm_dispatch_key(uint8_t scancode);
-
-/**
- * wm_compose - Composite all windows + system overlay + cursor onto @backbuf.
- */
-void wm_compose(uint8_t *backbuf);
-
 /* =========================================================================
  * Drawing helpers  (operate on any uint8_t pixel buffer)
  * ========================================================================= */
@@ -244,7 +229,9 @@ void wm_buf_draw_line   (uint8_t *buf, uint16_t bw, uint16_t bh, int x0, int y0,
 void wm_buf_fill_rect   (uint8_t *buf, uint16_t bw, uint16_t bh, int x, int y, int w, int h, uint8_t color);
 void wm_buf_draw_rect   (uint8_t *buf, uint16_t bw, uint16_t bh, int x, int y, int w, int h, uint8_t color);
 void wm_buf_draw_char   (uint8_t *buf, uint16_t bw, uint16_t bh, int x, int y, char c,         uint8_t color);
+void wm_buf_draw_char_bg(uint8_t *buf, uint16_t bw, uint16_t bh, int x, int y, char c,         uint8_t fg, uint8_t bg);
 void wm_buf_draw_string (uint8_t *buf, uint16_t bw, uint16_t bh, int x, int y, const char *str, uint8_t color);
+void wm_buf_draw_string_bg(uint8_t *buf, uint16_t bw, uint16_t bh, int x, int y, const char *str, uint8_t fg, uint8_t bg);
 
 /* =========================================================================
  * Compositor tick  (called from terminal_console each kernel loop iteration)
@@ -252,7 +239,7 @@ void wm_buf_draw_string (uint8_t *buf, uint16_t bw, uint16_t bh, int x, int y, c
  *
  * Polls keyboard and mouse, composites all windows, draws cursor and the
  * system exit button, then flips the backbuffer to VRAM.
- * Stops the session on ESC/Q or left-click of the [X Exit] button.
+ * Stops the session when the window/taskbar Close button is clicked.
  *
  * Called automatically by terminal_console() when wm_session_active().
  * Kernel / driver code MUST NOT call this directly.
@@ -263,5 +250,17 @@ void wm_compositor_tick(void);
  * Get current display/compositor screen bounds in pixels.
  */
 void wm_get_screen_bounds(int *out_w, int *out_h);
+
+/**
+ * Show or hide the WM system cursor while this window is focused and the
+ * pointer is inside its client area. Applications that draw a custom cursor
+ * or hide the cursor completely should pass visible = false.
+ */
+void wm_set_cursor_visible(wm_window_t *win, bool visible);
+
+/**
+ * Query whether this window leaves the WM system cursor visible when focused.
+ */
+bool wm_get_cursor_visible(const wm_window_t *win);
 
 #endif /* LIB_WM_H */

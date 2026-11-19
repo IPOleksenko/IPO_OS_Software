@@ -41,10 +41,10 @@ static bool check_user_interrupted(void) {
     }
     keyboard_poll();
     uint8_t sc = keyboard_get_scancode();
-    if (sc == 0x01 || sc == 0x10) { // ESC or 'q'
+    if (sc == 0x01 || sc == 0x10) { /* ESC or 'q' */
         return true;
     }
-    if (sc == 0x2E && keyboard_is_ctrl_pressed()) { // Ctrl+C
+    if (sc == 0x2E && keyboard_is_ctrl_pressed()) { /* Ctrl+C */
         return true;
     }
     return false;
@@ -81,7 +81,8 @@ static bool ping_resolve(const char *hostname, ip4_addr_t *out_ip, uint32_t time
         (uint32_t)(uintptr_t)out_ip,
         timeout_ms
     };
-    bool res = (ipo_syscall(IPO_SYSCALL_NET_DNS_RESOLVE, 3u, args) != 0);
+    int rc = ipo_syscall(IPO_SYSCALL_NET_DNS_RESOLVE, 3u, args);
+    bool res = (rc == 1);
     dyn_buf_free(&clean_buf);
     return res;
 }
@@ -107,7 +108,7 @@ static bool ping_poll_reply(uint16_t id, uint16_t seq, icmp_echo_reply_t *reply,
         (uint32_t)(uintptr_t)reply,
         timeout_ms
     };
-    return ipo_syscall(IPO_SYSCALL_NET_ICMP_POLL, 4u, args) != 0;
+    return ipo_syscall(IPO_SYSCALL_NET_ICMP_POLL, 4u, args) == 1;
 }
 
 int main(int argc, char **argv) {
@@ -188,6 +189,11 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    if (!net_get_interface()) {
+        printf("ping: error: network subsystem unavailable (no network driver loaded)\n");
+        return 2;
+    }
+
     /* Resolve destination to IPv4 */
     ip4_addr_t dest_ip = 0;
     if (!ping_resolve(dest_name, &dest_ip, 3000)) {
@@ -195,15 +201,21 @@ int main(int argc, char **argv) {
         return 2;
     }
 
-    char ip_str[32];
-    ip_to_str(dest_ip, ip_str, sizeof(ip_str));
+    const size_t ip_cap = 32u;
+    char *ip_str = (char *)malloc(ip_cap);
+    if (!ip_str) return 1;
+    ip_to_str(dest_ip, ip_str, ip_cap);
 
     printf("PING %s (%s) %u(%u) bytes of data.\n",
            dest_name, ip_str, (unsigned int)packet_size, (unsigned int)(packet_size + 28));
 
-    uint8_t payload[1400];
+    uint8_t *payload = (uint8_t *)malloc((packet_size > 0u) ? (size_t)packet_size : 1u);
+    if (!payload) {
+        free(ip_str);
+        return 1;
+    }
     for (uint32_t i = 0; i < packet_size; i++) {
-        payload[i] = (uint8_t)(0x41 + (i % 26)); // 'A'..'Z' pattern
+        payload[i] = (uint8_t)(0x41 + (i % 26)); /* 'A'..'Z' pattern */
     }
 
     uint32_t transmitted = 0;
@@ -217,11 +229,8 @@ int main(int argc, char **argv) {
     uint16_t ping_id = (uint16_t)(timer_millis() & 0xFFFF);
     uint16_t seq = 1;
 
-    bool interrupted = false;
-
     while (count == 0 || seq <= count) {
         if (check_user_interrupted()) {
-            interrupted = true;
             break;
         }
 
@@ -243,7 +252,7 @@ int main(int argc, char **argv) {
                 uint64_t d_tsc = (tsc_end > tsc_start) ? (tsc_end - tsc_start) : 0;
                 /* 2000 cycles per microsecond (~2 GHz TSC clock) */
                 uint32_t rtt_us = (uint32_t)(d_tsc / 2000ULL);
-                if (rtt_us == 0) rtt_us = 100; // sub-millisecond floor (0.10 ms)
+                if (rtt_us == 0) rtt_us = 100; /* sub-millisecond floor (0.10 ms) */
 
                 if (rtt_us < min_us) min_us = rtt_us;
                 if (rtt_us > max_us) max_us = rtt_us;
@@ -281,7 +290,6 @@ int main(int argc, char **argv) {
         if (count == 0 || seq <= count) {
             wait_with_interrupt(interval_ms);
             if (check_user_interrupted()) {
-                interrupted = true;
                 break;
             }
         }
@@ -312,5 +320,7 @@ int main(int argc, char **argv) {
                (unsigned int)max_ms, (unsigned int)max_dec);
     }
 
+    free(payload);
+    free(ip_str);
     return (received > 0) ? 0 : 1;
 }

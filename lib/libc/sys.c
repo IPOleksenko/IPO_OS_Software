@@ -9,6 +9,7 @@
 #include <errno.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdarg.h>
 #include <stdlib.h>
 #include <dirent.h>
 
@@ -22,7 +23,7 @@ int ipo_syscall(uint32_t num, uint32_t argc, uint32_t *argv) {
         : "a"(num),
           "b"(argc),
           "c"(argv)
-        : "memory"
+        : "edx", "memory", "cc"
     );
     return ret;
 }
@@ -82,63 +83,125 @@ int fstat(int fd, struct stat *statbuf) {
     return 0;
 }
 
+static bool is_leap_year(int64_t year) {
+    int64_t m400 = year % 400;
+    if (m400 < 0) m400 += 400;
+    return (m400 % 4 == 0 && (m400 % 100 != 0 || m400 == 0));
+}
+
+static int get_month_days(int mon, int64_t year) {
+    switch (mon) {
+        case 0: case 2: case 4: case 6: case 7: case 9: case 11: return 31;
+        case 3: case 5: case 8: case 10: return 30;
+        case 1: return is_leap_year(year) ? 29 : 28;
+        default: return 0;
+    }
+}
+
+static bool query_rtc_token_i64(const char *fmt, int64_t *out_val) {
+    int need = ipo_rtc_get_str(fmt, NULL, 0u);
+    if (need <= 0) return false;
+    char *buf = (char *)malloc((size_t)need + 1u);
+    if (!buf) return false;
+    int got = ipo_rtc_get_str(fmt, buf, (uint32_t)need + 1u);
+    bool ok = (got > 0);
+    int64_t val = 0;
+    if (ok) {
+        int i = 0;
+        bool neg = (buf[0] == '-');
+        if (neg) i = 1;
+        for (; i < got && buf[i] >= '0' && buf[i] <= '9'; i++) {
+            if (val > (INT64_MAX - 9) / 10) {
+                val = INT64_MAX / 2;
+                break;
+            }
+            val = val * 10 + (buf[i] - '0');
+        }
+        if (neg) val = -val;
+    }
+    free(buf);
+    if (ok && out_val) *out_val = val;
+    return ok;
+}
+
 time_t time(time_t *t) {
-    time_t now = (time_t)ipo_time(NULL);
+    int64_t ts = 0;
+    time_t now;
+    if (query_rtc_token_i64("TS", &ts)) {
+        /* Shift year-0 timestamp to the 1970 origin for C library callers. */
+        now = (time_t)(ts - 62167219200LL);
+    } else {
+        now = (time_t)ipo_time(NULL);
+    }
     if (t) *t = now;
     return now;
 }
 
 clock_t clock(void) {
-    return (clock_t)(ipo_time(NULL) * 1000);
+    return (clock_t)(ipo_time(NULL) * 1000u);
 }
 
 double difftime(time_t time1, time_t time0) {
     return (double)(time1 - time0);
 }
 
-static struct tm static_tm;
+static struct tm *get_static_tm(void) {
+    static struct tm s_tm;
+    return &s_tm;
+}
 
 struct tm *gmtime(const time_t *timep) {
     if (!timep) return NULL;
-    time_t t = *timep;
+    int64_t t = (int64_t)*timep;
+    struct tm *tm_out = get_static_tm();
+    memset(tm_out, 0, sizeof(*tm_out));
 
-    memset(&static_tm, 0, sizeof(static_tm));
-    static_tm.tm_sec = t % 60;
-    t /= 60;
-    static_tm.tm_min = t % 60;
-    t /= 60;
-    static_tm.tm_hour = t % 24;
-    t /= 24;
-
-    static_tm.tm_wday = (t + 4) % 7; // 1970-01-01 was Thursday (4)
-
-    // Rough conversion for demonstration & toolchain time display
-    int year = 1970;
-    while (1) {
-        int days_in_year = ((year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)) ? 366 : 365;
-        if (t >= days_in_year) {
-            t -= days_in_year;
-            year++;
-        } else {
-            break;
-        }
+    int64_t rem_sec = t % 86400LL;
+    int64_t days = t / 86400LL;
+    if (rem_sec < 0) {
+        rem_sec += 86400LL;
+        days--;
     }
-    static_tm.tm_year = year - 1900;
-    static_tm.tm_yday = t;
 
-    int days_in_month[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
-    if (((year % 4 == 0 && year % 100 != 0) || (year % 400 == 0))) {
-        days_in_month[1] = 29;
+    tm_out->tm_sec  = (int)(rem_sec % 60LL);
+    rem_sec /= 60LL;
+    tm_out->tm_min  = (int)(rem_sec % 60LL);
+    tm_out->tm_hour = (int)(rem_sec / 60LL);
+
+    int64_t wday = (days + 4LL) % 7LL;
+    if (wday < 0) wday += 7LL;
+    tm_out->tm_wday = (int)wday;
+
+    /* 719528 days between year 0 (proleptic) and 1970-01-01 */
+    int64_t total_days = days + 719528LL;
+    int64_t q400 = total_days / 146097LL;
+    int64_t rem = total_days % 146097LL;
+    if (rem < 0) {
+        rem += 146097LL;
+        q400--;
     }
+
+    int64_t y_off = 0;
+    while (y_off < 400) {
+        int yd = is_leap_year(y_off) ? 366 : 365;
+        if (rem < yd) break;
+        rem -= yd;
+        y_off++;
+    }
+    int64_t year = q400 * 400LL + y_off;
+    tm_out->tm_year = (int)(year - 1900LL);
+    tm_out->tm_yday = (int)rem;
+
     int mon = 0;
-    while (mon < 12 && t >= days_in_month[mon]) {
-        t -= days_in_month[mon];
+    while (mon < 12) {
+        int mdays = get_month_days(mon, year);
+        if (rem < mdays) break;
+        rem -= mdays;
         mon++;
     }
-    static_tm.tm_mon = mon;
-    static_tm.tm_mday = t + 1;
-
-    return &static_tm;
+    tm_out->tm_mon = mon;
+    tm_out->tm_mday = (int)rem + 1;
+    return tm_out;
 }
 
 struct tm *localtime(const time_t *timep) {
@@ -147,39 +210,79 @@ struct tm *localtime(const time_t *timep) {
 
 time_t mktime(struct tm *timeptr) {
     if (!timeptr) return (time_t)-1;
-    // Simple inverse calculation
-    int year = timeptr->tm_year + 1900;
+    int64_t year = (int64_t)timeptr->tm_year + 1900LL;
     int mon = timeptr->tm_mon;
     int day = timeptr->tm_mday;
 
-    int days = 0;
-    for (int y = 1970; y < year; y++) {
-        days += ((y % 4 == 0 && y % 100 != 0) || (y % 400 == 0)) ? 366 : 365;
+    int64_t q400 = year / 400LL;
+    int64_t y_off = year % 400LL;
+    if (y_off < 0) {
+        y_off += 400LL;
+        q400--;
     }
-    int days_in_month[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
-    if (((year % 4 == 0 && year % 100 != 0) || (year % 400 == 0))) {
-        days_in_month[1] = 29;
+
+    int64_t total_days = q400 * 146097LL;
+    for (int64_t y = 0; y < y_off; y++) {
+        total_days += is_leap_year(y) ? 366LL : 365LL;
     }
     for (int m = 0; m < mon; m++) {
-        days += days_in_month[m];
+        total_days += (int64_t)get_month_days(m, year);
     }
-    days += (day - 1);
+    total_days += (int64_t)(day - 1);
 
-    time_t t = days * 86400 + timeptr->tm_hour * 3600 + timeptr->tm_min * 60 + timeptr->tm_sec;
-    return t;
+    int64_t days = total_days - 719528LL;
+    int64_t t = days * 86400LL + (int64_t)timeptr->tm_hour * 3600LL +
+                (int64_t)timeptr->tm_min * 60LL + (int64_t)timeptr->tm_sec;
+    return (time_t)t;
 }
 
-static char time_buf[64];
+static char *time_buf = NULL;
+static size_t time_buf_cap = 0;
+
 char *asctime(const struct tm *timeptr) {
     if (!timeptr) return NULL;
-    snprintf(time_buf, sizeof(time_buf), "%04d-%02d-%02d %02d:%02d:%02d\n",
-             timeptr->tm_year + 1900, timeptr->tm_mon + 1, timeptr->tm_mday,
-             timeptr->tm_hour, timeptr->tm_min, timeptr->tm_sec);
+    int year = timeptr->tm_year + 1900;
+    int mon = timeptr->tm_mon + 1;
+    int mday = timeptr->tm_mday;
+    int hour = timeptr->tm_hour;
+    int min = timeptr->tm_min;
+    int sec = timeptr->tm_sec;
+    int needed = snprintf(NULL, 0, "%04d-%02d-%02d %02d:%02d:%02d\n",
+                          year, mon, mday, hour, min, sec);
+    if (needed < 0) return NULL;
+    if ((size_t)needed + 1 > time_buf_cap) {
+        char *nb = (char *)realloc(time_buf, (size_t)needed + 1);
+        if (!nb) return NULL;
+        time_buf = nb;
+        time_buf_cap = (size_t)needed + 1;
+    }
+    snprintf(time_buf, time_buf_cap, "%04d-%02d-%02d %02d:%02d:%02d\n",
+             year, mon, mday, hour, min, sec);
     return time_buf;
 }
 
 char *ctime(const time_t *timep) {
     return asctime(localtime(timep));
+}
+
+static size_t strftime_append_fmt(char *dst, size_t max, size_t written, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    int len = vsnprintf(NULL, 0, fmt, ap);
+    va_end(ap);
+    if (len <= 0) return written;
+
+    char *tmp = (char *)malloc((size_t)len + 1);
+    if (!tmp) return written;
+    va_start(ap, fmt);
+    vsnprintf(tmp, (size_t)len + 1, fmt, ap);
+    va_end(ap);
+
+    for (int i = 0; i < len && written + 1 < max; i++) {
+        dst[written++] = tmp[i];
+    }
+    free(tmp);
+    return written;
 }
 
 size_t strftime(char *s, size_t max, const char *format, const struct tm *tm) {
@@ -189,56 +292,49 @@ size_t strftime(char *s, size_t max, const char *format, const struct tm *tm) {
     while (*f && written + 1 < max) {
         if (*f == '%') {
             f++;
-            char buf[32];
-            int n = 0;
             switch (*f) {
             case 'Y':
-                n = snprintf(buf, sizeof(buf), "%04d", tm ? tm->tm_year + 1900 : 2026);
+                written = strftime_append_fmt(s, max, written, "%04d", tm ? tm->tm_year + 1900 : 2026);
                 break;
             case 'y':
-                n = snprintf(buf, sizeof(buf), "%02d", tm ? (tm->tm_year + 1900) % 100 : 26);
+                written = strftime_append_fmt(s, max, written, "%02d", tm ? (tm->tm_year + 1900) % 100 : 26);
                 break;
             case 'm':
-                n = snprintf(buf, sizeof(buf), "%02d", tm ? tm->tm_mon + 1 : 1);
+                written = strftime_append_fmt(s, max, written, "%02d", tm ? tm->tm_mon + 1 : 1);
                 break;
             case 'd':
-                n = snprintf(buf, sizeof(buf), "%02d", tm ? tm->tm_mday : 1);
+                written = strftime_append_fmt(s, max, written, "%02d", tm ? tm->tm_mday : 1);
                 break;
             case 'H':
-                n = snprintf(buf, sizeof(buf), "%02d", tm ? tm->tm_hour : 0);
+                written = strftime_append_fmt(s, max, written, "%02d", tm ? tm->tm_hour : 0);
                 break;
             case 'M':
-                n = snprintf(buf, sizeof(buf), "%02d", tm ? tm->tm_min : 0);
+                written = strftime_append_fmt(s, max, written, "%02d", tm ? tm->tm_min : 0);
                 break;
             case 'S':
-                n = snprintf(buf, sizeof(buf), "%02d", tm ? tm->tm_sec : 0);
+                written = strftime_append_fmt(s, max, written, "%02d", tm ? tm->tm_sec : 0);
                 break;
             case 'F':
-                n = snprintf(buf, sizeof(buf), "%04d-%02d-%02d",
-                             tm ? tm->tm_year + 1900 : 2026,
-                             tm ? tm->tm_mon + 1 : 1,
-                             tm ? tm->tm_mday : 1);
+                written = strftime_append_fmt(s, max, written, "%04d-%02d-%02d",
+                                              tm ? tm->tm_year + 1900 : 2026,
+                                              tm ? tm->tm_mon + 1 : 1,
+                                              tm ? tm->tm_mday : 1);
                 break;
             case 'T':
-                n = snprintf(buf, sizeof(buf), "%02d:%02d:%02d",
-                             tm ? tm->tm_hour : 0,
-                             tm ? tm->tm_min : 0,
-                             tm ? tm->tm_sec : 0);
+                written = strftime_append_fmt(s, max, written, "%02d:%02d:%02d",
+                                              tm ? tm->tm_hour : 0,
+                                              tm ? tm->tm_min : 0,
+                                              tm ? tm->tm_sec : 0);
                 break;
             case '%':
-                buf[0] = '%';
-                buf[1] = '\0';
-                n = 1;
+                s[written++] = '%';
                 break;
             default:
-                buf[0] = '%';
-                buf[1] = *f;
-                buf[2] = '\0';
-                n = *f ? 2 : 1;
+                s[written++] = '%';
+                if (*f && written + 1 < max) {
+                    s[written++] = *f;
+                }
                 break;
-            }
-            for (int i = 0; i < n && written + 1 < max; i++) {
-                s[written++] = buf[i];
             }
             if (*f) f++;
         } else {
@@ -252,39 +348,56 @@ size_t strftime(char *s, size_t max, const char *format, const struct tm *tm) {
 int gettimeofday(struct timeval *tv, struct timezone *tz) {
     (void)tz;
     if (tv) {
-        tv->tv_sec = time(NULL);
-        tv->tv_usec = 0;
+        int64_t ms_val = 0LL;
+        if (query_rtc_token_i64("TMS", &ms_val)) {
+            int64_t sec_part = (ms_val / 1000LL) - 62167219200LL;
+            long usec_part = (long)((ms_val % 1000LL) * 1000LL);
+            if (usec_part < 0) {
+                usec_part += 1000000L;
+                sec_part -= 1LL;
+            }
+            tv->tv_sec = sec_part;
+            tv->tv_usec = usec_part;
+            return 0;
+        }
+        static int s_init = 0;
+        static uint32_t s_base_ms = 0;
+        static time_t s_base_sec = 0;
+        uint32_t ms = (uint32_t)ipo_syscall(IPO_SYSCALL_MILLIS, 0u, NULL);
+        if (!s_init) {
+            s_base_sec = time(NULL);
+            s_base_ms = ms;
+            s_init = 1;
+        }
+        uint32_t elapsed_ms = ms - s_base_ms;
+        tv->tv_sec = s_base_sec + (time_t)(elapsed_ms / 1000u);
+        tv->tv_usec = (long)((elapsed_ms % 1000u) * 1000u);
     }
     return 0;
 }
 
-static sighandler_t signal_handlers[32] = {0};
+static int signal_syscall_result(int result) {
+    if (result >= 0) return 0;
+    errno = result == -2 ? ESRCH : (result == -3 ? EPERM : EINVAL);
+    return -1;
+}
 
 sighandler_t signal(int signum, sighandler_t handler) {
-    if (signum < 0 || signum >= 32) {
-        errno = EINVAL;
-        return SIG_ERR;
-    }
-    sighandler_t old = signal_handlers[signum];
-    signal_handlers[signum] = handler;
-    return old;
+    struct sigaction action;
+    struct sigaction old_action;
+    memset(&action, 0, sizeof(action));
+    action.sa_handler = handler;
+    if (sigaction(signum, &action, &old_action) < 0) return SIG_ERR;
+    return old_action.sa_handler;
 }
 
 int raise(int sig) {
-    if (sig < 0 || sig >= 32) {
-        errno = EINVAL;
-        return -1;
-    }
-    sighandler_t h = signal_handlers[sig];
-    if (h == SIG_IGN) return 0;
-    if (h == SIG_DFL || !h) {
-        if (sig == SIGSEGV || sig == SIGABRT || sig == SIGILL || sig == SIGFPE) {
-            exit(128 + sig);
-        }
-        return 0;
-    }
-    h(sig);
-    return 0;
+    return kill(ipo_getpid(), sig);
+}
+
+int kill(pid_t pid, int sig) {
+    uint32_t args[2] = {(uint32_t)pid, (uint32_t)sig};
+    return signal_syscall_result(ipo_syscall(IPO_SYSCALL_KILL, 2u, args));
 }
 
 pid_t wait(int *wstatus) {
@@ -627,18 +740,30 @@ DIR *opendir(const char *name) {
         return NULL;
     }
     memset(d, 0, sizeof(*d));
-    d->buf = (char *)malloc(8192);
+    size_t cap = 8192;
+    d->buf = (char *)malloc(cap);
     if (!d->buf) {
         free(d);
         errno = ENOMEM;
         return NULL;
     }
-    int count = ipo_list_dir(name, d->buf, 8192);
-    if (count < 0) {
-        free(d->buf);
-        free(d);
-        errno = ENOENT;
-        return NULL;
+    int count = 0;
+    while (1) {
+        count = ipo_list_dir(name, d->buf, (int)cap);
+        if (count < 0) {
+            free(d->buf);
+            free(d);
+            errno = ENOENT;
+            return NULL;
+        }
+        if ((size_t)count + 260 < cap || cap >= 16u * 1024u * 1024u) {
+            break;
+        }
+        size_t new_cap = cap * 2;
+        char *nb = (char *)realloc(d->buf, new_cap);
+        if (!nb) break;
+        d->buf = nb;
+        cap = new_cap;
     }
     d->buf_len = count;
     d->buf_pos = 0;
@@ -763,23 +888,53 @@ int sigismember(const sigset_t *set, int signum) {
 }
 
 int sigprocmask(int how, const sigset_t *set, sigset_t *oldset) {
-    (void)how; (void)set; (void)oldset;
-    return 0;
+    uint32_t requested = set ? (uint32_t)*set : 0u;
+    uint32_t old_mask = 0u;
+    uint32_t args[3] = {
+        (uint32_t)how,
+        set ? (uint32_t)(uintptr_t)&requested : 0u,
+        oldset ? (uint32_t)(uintptr_t)&old_mask : 0u
+    };
+    int result = signal_syscall_result(
+        ipo_syscall(IPO_SYSCALL_SIGPROCMASK, 3u, args));
+    if (result == 0 && oldset) *oldset = old_mask;
+    return result;
 }
 
 int sigaction(int signum, const struct sigaction *act, struct sigaction *oldact) {
-    if (signum < 0 || signum >= 32) {
-        errno = EINVAL;
-        return -1;
+    uint32_t handler = act ? (uint32_t)(uintptr_t)act->sa_handler : 0u;
+    uint32_t mask = act ? (uint32_t)act->sa_mask : 0u;
+    uint32_t old_handler = 0u;
+    uint32_t old_mask = 0u;
+    uint32_t old_flags = 0u;
+    uint32_t args[8] = {
+        (uint32_t)signum,
+        handler,
+        mask,
+        oldact ? (uint32_t)(uintptr_t)&old_handler : 0u,
+        oldact ? (uint32_t)(uintptr_t)&old_mask : 0u,
+        act ? (uint32_t)act->sa_flags : 0u,
+        oldact ? (uint32_t)(uintptr_t)&old_flags : 0u,
+        act ? 1u : 0u
+    };
+    int result = signal_syscall_result(
+        ipo_syscall(IPO_SYSCALL_SIGACTION, 8u, args));
+    if (result == 0 && oldact) {
+        memset(oldact, 0, sizeof(*oldact));
+        oldact->sa_handler = (sighandler_t)(uintptr_t)old_handler;
+        oldact->sa_mask = old_mask;
+        oldact->sa_flags = (int)old_flags;
     }
-    if (oldact) {
-        memset(oldact, 0, sizeof(struct sigaction));
-        oldact->sa_handler = signal_handlers[signum];
-    }
-    if (act) {
-        signal_handlers[signum] = act->sa_handler;
-    }
-    return 0;
+    return result;
+}
+
+int sigaltstack(const stack_t *ss, stack_t *old_ss) {
+    uint32_t args[2] = {
+        ss ? (uint32_t)(uintptr_t)ss : 0u,
+        old_ss ? (uint32_t)(uintptr_t)old_ss : 0u
+    };
+    return signal_syscall_result(
+        ipo_syscall(IPO_SYSCALL_SIGALTSTACK, 2u, args));
 }
 
 int __clock_gettime64(int clk_id, void *tp) {
@@ -823,9 +978,41 @@ int __gettimeofday64(struct timeval *tv, void *tz) {
 
 ssize_t getrandom(void *buf, size_t buflen, unsigned int flags) {
     (void)flags;
-    uint8_t *p = (uint8_t *)buf;
-    for (size_t i = 0; i < buflen; i++) {
-        p[i] = (uint8_t)(rand() & 0xFF);
+    if ((!buf && buflen != 0u) || buflen > INT32_MAX) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (buflen == 0u) return 0;
+
+    static int has_rdrand = -1;
+    if (has_rdrand < 0) {
+        uint32_t eax = 1u, ebx, ecx, edx;
+        __asm__ volatile("cpuid"
+                         : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
+                         : "a"(1u), "c"(0u));
+        has_rdrand = (ecx & (1u << 30)) != 0u;
+    }
+    if (!has_rdrand) {
+        errno = ENOSYS;
+        return -1;
+    }
+
+    uint8_t *output = (uint8_t *)buf;
+    size_t remaining = buflen;
+    while (remaining > 0u) {
+        uint32_t word;
+        uint8_t ready = 0;
+        for (unsigned attempt = 0; attempt < 10u && !ready; attempt++) {
+            __asm__ volatile("rdrand %0; setc %1"
+                             : "=r"(word), "=qm"(ready));
+        }
+        if (!ready) {
+            errno = EIO;
+            return -1;
+        }
+        for (unsigned byte = 0; byte < 4u && remaining > 0u; byte++, remaining--) {
+            *output++ = (uint8_t)(word >> (byte * 8u));
+        }
     }
     return (ssize_t)buflen;
 }
@@ -864,4 +1051,3 @@ int mkstemp(char *tmpl) {
     }
     return open(tmpl, O_RDWR | O_CREAT | O_EXCL, 0600);
 }
-

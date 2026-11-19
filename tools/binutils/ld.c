@@ -434,8 +434,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    // Step 2: Extract and categorize sections
-    // Standard output sections: .text, .rodata, .data, .bss
+    /* Extract and categorize allocatable sections (.text, .rodata, .data, .bss) */
     uint32_t text_size = 0, rodata_size = 0, data_size = 0, bss_size = 0;
 
     for (int o = 0; o < num_input_objs; o++) {
@@ -609,7 +608,7 @@ int main(int argc, char **argv) {
         sym_dso->value = 0;
     }
 
-    // Step 3: Resolve all symbols
+    /* Resolve defined global symbols across all input objects */
     for (int o = 0; o < num_input_objs; o++) {
         InputObject *obj = &input_objs[o];
         const Elf32_Ehdr *eh = (const Elf32_Ehdr *)obj->data;
@@ -642,7 +641,7 @@ int main(int argc, char **argv) {
         }
     }
 
-    // Step 4: Perform Relocations
+    /* Apply SHT_REL relocations after section layout is finalized */
     for (int o = 0; o < num_input_objs; o++) {
         InputObject *obj = &input_objs[o];
         const Elf32_Ehdr *eh = (const Elf32_Ehdr *)obj->data;
@@ -709,14 +708,14 @@ int main(int argc, char **argv) {
         }
     }
 
-    // Step 5: Determine entry point
+    /* Resolve output entry point symbol, defaulting to the start of .text */
     uint32_t entry_point = text_start_vaddr;
     Symbol *entry_sym = find_symbol(entry_symbol_name);
     if (entry_sym && entry_sym->defined) {
         entry_point = entry_sym->value;
     }
 
-    // Step 6: Generate output ELF32 binary
+    /* Emit the linked ELF32 executable */
     FILE *fout = fopen(output_filename, "wb");
     if (!fout) {
         perror("ld: cannot create output file");

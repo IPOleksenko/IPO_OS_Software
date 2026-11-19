@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
+#include <stdarg.h>
 
 /**
  * Universal dynamically-resizable byte buffer.
@@ -20,6 +21,7 @@ bool   dyn_buf_reserve(dyn_buf_t *buf, size_t needed_cap);
 bool   dyn_buf_append(dyn_buf_t *buf, const void *src, size_t len);
 bool   dyn_buf_append_byte(dyn_buf_t *buf, uint8_t byte);
 bool   dyn_buf_append_str(dyn_buf_t *buf, const char *str);
+bool   dyn_buf_append_printf(dyn_buf_t *buf, const char *fmt, ...);
 size_t dyn_buf_consume(dyn_buf_t *buf, void *dest, size_t len);
 void   dyn_buf_reset(dyn_buf_t *buf);
 void   dyn_buf_free(dyn_buf_t *buf);
@@ -38,6 +40,10 @@ void   dyn_str_init(dyn_str_t *ds, const char *initial);
 bool   dyn_str_set(dyn_str_t *ds, const char *val);
 bool   dyn_str_append(dyn_str_t *ds, const char *suffix);
 bool   dyn_str_append_char(dyn_str_t *ds, char c);
+bool   dyn_str_vprintf(dyn_str_t *ds, const char *fmt, va_list ap);
+bool   dyn_str_printf(dyn_str_t *ds, const char *fmt, ...);
+bool   dyn_str_append_vprintf(dyn_str_t *ds, const char *fmt, va_list ap);
+bool   dyn_str_append_printf(dyn_str_t *ds, const char *fmt, ...);
 const char *dyn_str_c(const dyn_str_t *ds);
 void   dyn_str_free(dyn_str_t *ds);
 

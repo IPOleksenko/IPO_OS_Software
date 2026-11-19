@@ -1,5 +1,5 @@
 # ==============================================================================
-# IPO_Applications - In-OS Toolchain Binaries (Binutils, GCC, Python, Lua, NASM)
+# IPO_OS_Software - In-OS Toolchain Binaries (Binutils, GCC, Python, Lua, NASM)
 # ==============================================================================
 
 .PHONY: toolchain clean-toolchain
@@ -80,7 +80,7 @@ $(TOOLCHAIN_DIR)/nm.elf: $(TOOLCHAIN_DIR)/nm.o $(USER_CRT0) $(USER_CRTI) $(USER_
 	$(LD) -m elf_i386 -q -T $(LIB_DIR)/linker.ld $(USER_CRT0) $(USER_CRTI) $< $(USER_LIBC_A) $(USER_LIBM_A) $(LIBGCC_A) $(USER_CRTN) -o $@
 
 # ------------------------------------------------------------------------------
-# Lua 5.3 runtime
+# Lua 5.4 runtime
 # ------------------------------------------------------------------------------
 $(TOOLCHAIN_DIR)/lua/lua.elf $(TOOLCHAIN_DIR)/lua/luac.elf: $(USER_LIBC_A) $(USER_LIBM_A) $(LIBGCC_A) $(USER_CRT0) $(USER_CRTI) $(USER_CRTN) $(LIB_DIR)/linker.ld
 	@mkdir -p $(TOOLCHAIN_DIR)/lua
@@ -110,3 +110,7 @@ $(TOOLCHAIN_DIR)/python.elf: $(APPS_DIR)/micropython/micropython_shim.c $(USER_L
 
 clean-toolchain:
 	rm -rf $(TOOLCHAIN_DIR)
+	@$(MAKE) -C $(APPS_DIR)/lua/src clean >/dev/null 2>&1 || true
+	@$(MAKE) -C $(APPS_DIR)/nasm clean >/dev/null 2>&1 || true
+	@rm -f $(APPS_DIR)/nasm/config.log $(APPS_DIR)/nasm/libnasm.a $(APPS_DIR)/lua/src/liblua.a
+	@rm -rf $(APPS_DIR)/micropython/ports/unix/build-minimal

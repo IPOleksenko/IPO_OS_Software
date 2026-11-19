@@ -1,21 +1,39 @@
 # ==============================================================================
-# IPO_Applications - Userland Applications
+# IPO_OS_Software - Userland Applications
 # ==============================================================================
 
-.PHONY: applications apps clean-applications clean-apps
+.PHONY: applications clean-applications
 
 APPS_SRCS_RAW    := $(shell find $(APPS_DIR) -maxdepth 2 -name "*.c" -type f)
-GENERIC_APP_SRCS := $(filter-out $(APPS_DIR)/tcc/% $(APPS_DIR)/lua/% $(APPS_DIR)/micropython/% $(APPS_DIR)/nasm/% $(APPS_DIR)/doom/% $(APPS_DIR)/lib/% $(APPS_DIR)/dltest/plugin_sample.c $(APPS_DIR)/binfmt/% $(APPS_DIR)/elf_loader/%, $(APPS_SRCS_RAW))
+GENERIC_APP_SRCS := $(filter-out $(APPS_DIR)/tcc/% $(APPS_DIR)/lua/% $(APPS_DIR)/micropython/% $(APPS_DIR)/nasm/% $(APPS_DIR)/doom/% $(APPS_DIR)/links/% $(APPS_DIR)/binfmt/% $(APPS_DIR)/elf_loader/% $(APPS_DIR)/SENSE-The-Game/%, $(APPS_SRCS_RAW))
+SENSE_PORT_DIR   := $(APPS_DIR)/SENSE-The-Game
+SENSE_UPSTREAM   := $(THIRD_PARTY_DIR)/SENSE-The-Game/app/src/main
+SENSE_CPP_DIR    := $(SENSE_UPSTREAM)/cpp
+SENSE_ASSETS_DIR := $(SENSE_UPSTREAM)/assets
+SENSE_BUILD_DIR  := $(APPS_BUILD)/SENSE-The-Game
+SENSE_BIN        := $(SENSE_BUILD_DIR)/SENSE: The Game.bin
+SENSE_STAMP      := $(SENSE_BUILD_DIR)/SENSE-The-Game.stamp
+SENSE_HAVE_UPSTREAM := $(and $(wildcard $(SENSE_CPP_DIR)/main.cpp),$(wildcard $(SENSE_ASSETS_DIR)/icon.bmp))
+
 APPS_BINS        := $(patsubst $(APPS_DIR)/%.c, $(APPS_BUILD)/%.bin, $(GENERIC_APP_SRCS)) \
+                    $(APPS_BUILD)/links/links.bin \
                     $(APPS_BUILD)/tcc/tcc.bin \
                     $(APPS_BUILD)/doom/doom.bin \
+                    $(if $(SENSE_HAVE_UPSTREAM),$(SENSE_STAMP)) \
                     $(APPS_BUILD)/binfmt/binfmt.bin \
                     $(APPS_BUILD)/elf_loader/elf_loader.bin
 
 APP_ENTRY_OBJ    := $(APPS_BUILD)/entry.o
 
 applications: lib $(APPS_BINS)
-apps: applications
+
+.PHONY: links links-force
+links: lib $(APPS_BUILD)/links/links.bin
+
+links-force:
+
+$(APPS_BUILD)/links/links.bin: links-force $(USER_LIBC_A) $(USER_LIBM_A) $(USER_LIBCXX_A) $(APP_LIB_A) $(BEARSSL_LIB_A)
+	$(MAKE) -C $(APPS_DIR)/links links
 
 $(APP_ENTRY_OBJ): $(APPS_DIR)/entry.s
 	@mkdir -p $(dir $@)
@@ -44,7 +62,7 @@ $(APPS_BUILD)/tcc/tcc.bin: $(APPS_BUILD)/tcc/tcc.o $(APPS_BUILD)/tcc/setjmp.o $(
 	echo "[applications] ✓ Created: $@ ($$SIZE bytes)"
 
 # ------------------------------------------------------------------------------
-# Official DOOM (linuxdoom-1.10)
+# DOOM
 # ------------------------------------------------------------------------------
 DOOM_DIR      := $(APPS_DIR)/doom
 DOOM_CORE_DIR := $(DOOM_DIR)/linuxdoom
@@ -115,7 +133,7 @@ DOOM_SRCS := \
 	$(DOOM_DIR)/i_main.c \
 	$(DOOM_DIR)/ipo_libc_compat.c
 
-DOOM_OBJS := $(patsubst $(APPS_DIR)/%.c, $(APPS_BUILD)/%.o, $(DOOM_SRCS))
+DOOM_OBJS := $(patsubst $(DOOM_DIR)/%.c, $(APPS_BUILD)/doom/%.o, $(DOOM_SRCS))
 
 DOOM_CFLAGS := -m32 -O2 \
 	-std=gnu89 \
@@ -135,7 +153,7 @@ DOOM_CFLAGS := -m32 -O2 \
 	-Wno-implicit-function-declaration \
 	-Wno-implicit-int
 
-$(APPS_BUILD)/doom/%.o: $(APPS_DIR)/doom/%.c
+$(APPS_BUILD)/doom/%.o: $(DOOM_DIR)/%.c
 	@mkdir -p $(dir $@)
 	$(CC) -c $< -o $@ $(DOOM_CFLAGS)
 
@@ -150,6 +168,108 @@ $(APPS_BUILD)/doom/doom.bin: $(DOOM_OBJS) $(APP_ENTRY_OBJ) $(APP_LIB_A) $(USER_L
 	@rm -f $@.elf
 	@SIZE=$$(stat -c%s "$@" 2>/dev/null || stat -f%z "$@" 2>/dev/null); \
 	echo "[applications] ✓ Created: $@ ($$SIZE bytes)"
+
+# ------------------------------------------------------------------------------
+# SENSE: The Game External Port (C++17 + Compat SDL2/IMG/Mixer/TTF)
+# Compiled only when upstream sources exist in $(SENSE_CPP_DIR).
+# ------------------------------------------------------------------------------
+.PHONY: SENSE-The-Game
+
+ifneq ($(SENSE_HAVE_UPSTREAM),)
+
+SENSE_CPP_SRCS := \
+	$(SENSE_CPP_DIR)/main.cpp \
+	$(SENSE_CPP_DIR)/application/audio.cpp \
+	$(SENSE_CPP_DIR)/application/game.cpp \
+	$(SENSE_CPP_DIR)/application/renderer.cpp \
+	$(SENSE_CPP_DIR)/application/window.cpp \
+	$(SENSE_CPP_DIR)/assets/assets.cpp \
+	$(SENSE_CPP_DIR)/assets/checkpoints.cpp \
+	$(SENSE_CPP_DIR)/objects/background.cpp \
+	$(SENSE_CPP_DIR)/objects/decor.cpp \
+	$(SENSE_CPP_DIR)/objects/end.cpp \
+	$(SENSE_CPP_DIR)/objects/player.cpp \
+	$(SENSE_CPP_DIR)/objects/road.cpp \
+	$(SENSE_CPP_DIR)/objects/scale.cpp \
+	$(SENSE_CPP_DIR)/objects/text.cpp \
+	$(SENSE_CPP_DIR)/utils/icon.cpp \
+	$(SENSE_CPP_DIR)/utils/modding.cpp \
+	$(SENSE_CPP_DIR)/utils/music.cpp \
+	$(SENSE_CPP_DIR)/utils/sfx.cpp \
+	$(SENSE_CPP_DIR)/utils/text_manager.cpp \
+	$(SENSE_CPP_DIR)/utils/texture.cpp
+
+SENSE_CPP_OBJS := $(patsubst $(SENSE_CPP_DIR)/%.cpp,$(SENSE_BUILD_DIR)/upstream/%.o,$(SENSE_CPP_SRCS)) \
+	$(SENSE_BUILD_DIR)/sense_cxx_rt.o
+SENSE_SDL_OBJS := $(SENSE_BUILD_DIR)/compat_sdl/sense_sdl.o \
+	$(SENSE_BUILD_DIR)/compat_sdl/sense_ttf.o \
+	$(SENSE_BUILD_DIR)/compat_sdl/sense_mem.o \
+	$(SENSE_BUILD_DIR)/wuffs/wuffs-v0.4.o \
+	$(SENSE_BUILD_DIR)/wuffs/image_wuffs.o
+
+SENSE_CXXFLAGS := $(APPS_CFLAGS) -std=gnu++17 -nostdinc++ -fexceptions -fno-rtti \
+	-fno-threadsafe-statics -MMD -MP -D_STDBOOL_H -D__bool_true_false_are_defined=1 \
+	-I$(SENSE_PORT_DIR)/compat_stl \
+	-I$(SENSE_PORT_DIR)/compat_sdl \
+	-I$(SENSE_CPP_DIR) \
+	-I$(SENSE_CPP_DIR)/application \
+	-I$(SENSE_CPP_DIR)/assets \
+	-I$(SENSE_CPP_DIR)/objects \
+	-I$(SENSE_CPP_DIR)/utils
+
+SENSE_SDL_CFLAGS := $(APPS_CFLAGS) -std=gnu11 -MMD -MP \
+	-I$(SENSE_PORT_DIR)/compat_sdl \
+	-I$(THIRD_PARTY_DIR)/northstar_media
+
+SENSE-The-Game: lib $(SENSE_STAMP)
+
+-include $(SENSE_CPP_OBJS:.o=.d) $(SENSE_SDL_OBJS:.o=.d)
+
+$(SENSE_BUILD_DIR)/upstream/assets/assets.o: $(SENSE_CPP_DIR)/assets/assets.cpp | check-submodules
+	@mkdir -p $(dir $@)
+	$(CXX) -c $< -o $@ $(SENSE_CXXFLAGS) -Wa,-I$(SENSE_ASSETS_DIR)
+
+$(SENSE_BUILD_DIR)/upstream/%.o: $(SENSE_CPP_DIR)/%.cpp | check-submodules
+	@mkdir -p $(dir $@)
+	$(CXX) -c $< -o $@ $(SENSE_CXXFLAGS)
+
+$(SENSE_BUILD_DIR)/sense_cxx_rt.o: $(SENSE_PORT_DIR)/sense_cxx_rt.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) -c $< -o $@ $(SENSE_CXXFLAGS)
+
+$(SENSE_BUILD_DIR)/compat_sdl/%.o: $(SENSE_PORT_DIR)/compat_sdl/%.c
+	@mkdir -p $(dir $@)
+	$(CC) -c $< -o $@ $(SENSE_SDL_CFLAGS)
+
+$(SENSE_BUILD_DIR)/wuffs/wuffs-v0.4.o: $(THIRD_PARTY_DIR)/wuffs/wuffs-v0.4.c
+	@mkdir -p $(dir $@)
+	$(CC) -c $< -o $@ $(APPS_CFLAGS) -std=gnu11 -DWUFFS_IMPLEMENTATION -Wno-unused-function -Wno-unused-parameter
+
+$(SENSE_BUILD_DIR)/wuffs/image_wuffs.o: $(THIRD_PARTY_DIR)/northstar_media/image_wuffs.c $(APPS_DIR)/links/port/media/glib.h
+	@mkdir -p $(dir $@)
+	$(CC) -c $< -o $@ $(APPS_CFLAGS) -std=gnu11 -I$(APPS_DIR)/links/port/media -iquote $(THIRD_PARTY_DIR)/northstar_media -iquote $(THIRD_PARTY_DIR)/wuffs -Wno-unused-function
+
+$(SENSE_STAMP): $(SENSE_CPP_OBJS) $(SENSE_SDL_OBJS) $(USER_CRT0) $(APP_LIB_A) $(USER_LIBC_A) $(USER_LIBM_A) $(LIB_DIR)/linker.ld
+	@mkdir -p $(dir $@)
+	@echo "[applications] Building SENSE: The Game port: $(SENSE_BIN)"
+	@$(CC) $(APPS_CFLAGS) -no-pie -Wl,-T,$(LIB_DIR)/linker.ld -Wl,-q \
+		$(USER_CRT0) $(SENSE_CPP_OBJS) $(SENSE_SDL_OBJS) \
+		-Wl,--allow-multiple-definition \
+		-Wl,--start-group $(USER_LIBC_A) $(USER_LIBM_A) $(APP_LIB_A) -lgcc -Wl,--end-group \
+		-o $@.elf -nostdlib -nostartfiles 2>&1 | grep -v "PIE\|relocation" || true
+	@test -f $@.elf
+	@cp $@.elf "$(SENSE_BIN)"
+	@rm -f $@.elf
+	@touch $@
+	@SIZE=$$(stat -c%s "$(SENSE_BIN)" 2>/dev/null || stat -f%z "$(SENSE_BIN)" 2>/dev/null); \
+	echo "[applications] ✓ Created: $(SENSE_BIN) ($$SIZE bytes)"
+
+else
+
+SENSE-The-Game:
+	@echo "[applications] Skipping SENSE: The Game: sources not found in $(SENSE_UPSTREAM)"
+
+endif
 
 # ------------------------------------------------------------------------------
 # Dynamic Binary Format Manager (binfmt)
@@ -218,6 +338,3 @@ $(APPS_BUILD)/%.bin: $(APPS_BUILD)/%.o $(APP_ENTRY_OBJ) $(APP_LIB_A) $(USER_LIBC
 clean-applications:
 	@echo "[applications] Cleaning built applications..."
 	@rm -rf $(APPS_BUILD)
-
-clean-apps: clean-applications
-

@@ -1,0 +1,46 @@
+#pragma once
+#include <utility>
+
+namespace std {
+
+template <class... Ts>
+struct tuple;
+
+template <>
+struct tuple<> {};
+
+template <class Head, class... Tail>
+struct tuple<Head, Tail...> : tuple<Tail...> {
+    Head value;
+    tuple() = default;
+    constexpr tuple(Head h, Tail... t) : tuple<Tail...>(static_cast<Tail&&>(t)...), value(static_cast<Head&&>(h)) {}
+};
+
+template <class... Ts>
+constexpr tuple<Ts&...> tie(Ts&... args) noexcept {
+    return tuple<Ts&...>(args...);
+}
+
+template <class A, class B>
+struct _TiePair {
+    A& a;
+    B& b;
+    _TiePair& operator=(const pair<A, B>& p) {
+        a = p.first;
+        b = p.second;
+        return *this;
+    }
+    template <class U, class V>
+    _TiePair& operator=(const pair<U, V>& p) {
+        a = static_cast<A>(p.first);
+        b = static_cast<B>(p.second);
+        return *this;
+    }
+};
+
+template <class A, class B>
+constexpr _TiePair<A, B> tie(A& a, B& b) noexcept {
+    return _TiePair<A, B>{a, b};
+}
+
+} // namespace std

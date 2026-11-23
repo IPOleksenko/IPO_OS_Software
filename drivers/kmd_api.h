@@ -21,8 +21,8 @@ typedef struct driver {
     int  (*on_command)(const char *cmd, int argc, char **argv);
     char (*on_char_output)(char c);
 
-    int  (*read)(void *buffer, size_t size, uint32_t offset);
-    int  (*write)(const void *buffer, size_t size, uint32_t offset);
+    int  (*read)(void *buffer, size_t size, uint64_t offset);
+    int  (*write)(const void *buffer, size_t size, uint64_t offset);
     int  (*ioctl)(uint32_t cmd, void *arg);
 
     void *owner;
@@ -180,12 +180,16 @@ extern uint16_t pci_read_word(uint8_t bus, uint8_t slot, uint8_t func, uint8_t o
 extern uint8_t  pci_read_byte(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset);
 extern void     pci_write_dword(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset, uint32_t val);
 extern void     pci_write_word(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset, uint16_t val);
+extern bool     pci_bar_is_io(const kmd_pci_device_t *dev, uint8_t bar_idx);
+extern bool     pci_bar_is_64bit(const kmd_pci_device_t *dev, uint8_t bar_idx);
+extern uint64_t pci_get_bar_addr(const kmd_pci_device_t *dev, uint8_t bar_idx);
+extern void    *pci_map_bar(uint64_t phys_addr, size_t size);
 
-extern void    *ipo_hw_map_mmio(uint32_t phys_addr, uint32_t size, uint32_t flags, uint32_t owner_pid);
+extern void    *ipo_hw_map_mmio(uint64_t phys_addr, uint32_t size, uint32_t flags, uint32_t owner_pid);
 extern int      ipo_hw_unmap_mmio(void *virt_addr, uint32_t size, uint32_t caller_pid);
-extern void    *ipo_hw_alloc_dma(uint32_t size, uint32_t alignment, uint32_t *out_phys, uint32_t owner_pid);
+extern void    *ipo_hw_alloc_dma(uint32_t size, uint32_t alignment, uint64_t *out_phys, uint32_t owner_pid);
 extern int      ipo_hw_free_dma(void *virt_addr, uint32_t caller_pid);
-extern uint32_t ipo_hw_virt_to_phys(const void *virt_addr, uint32_t caller_pid);
+extern uint64_t ipo_hw_virt_to_phys(const void *virt_addr, uint32_t caller_pid);
 
 extern void    *kmalloc(size_t size);
 extern void    *krealloc(void *ptr, size_t size);

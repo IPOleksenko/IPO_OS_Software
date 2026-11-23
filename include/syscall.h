@@ -25,6 +25,11 @@
 #define IPO_SYSCALL_FS_RENAME    0x1017u
 #define IPO_SYSCALL_FS_CLOSE     0x1018u
 #define IPO_SYSCALL_FS_SEEK      0x1019u
+#define IPO_SYSCALL_FS_TRUNCATE  0x101Au
+#define IPO_SYSCALL_FS_FTRUNCATE 0x101Bu
+#define IPO_SYSCALL_FS_MKDIR     0x101Cu
+#define IPO_SYSCALL_FS_RMDIR     0x101Du
+#define IPO_SYSCALL_FS_LSEEK64   0x101Eu
 
 #define IPO_SYSCALL_EXEC         0x1020u
 #define IPO_SYSCALL_READ         0x1021u
@@ -174,6 +179,9 @@
 #define IPO_SYSCALL_AUDIO_STREAM_SET_VOL  0x10DAu
 #define IPO_SYSCALL_AUDIO_STREAM_PROGRESS 0x10DBu
 #define IPO_SYSCALL_AUDIO_STREAM_UPDATE   0x10DCu
+#define IPO_SYSCALL_AUDIO_SET_FP_CONFIG   0x10DDu
+#define IPO_SYSCALL_AUDIO_GET_FP_CONFIG   0x10DEu
+#define IPO_SYSCALL_AUDIO_GET_STATS       0x10DFu
 
 #define IPO_SYSCALL_BINFMT_REGISTER   0x10E0u
 #define IPO_SYSCALL_BINFMT_UNREGISTER 0x10E1u
@@ -193,6 +201,7 @@
 #define IPO_SYSCALL_IPC_PIPE_WRITE    0x10FBu
 #define IPO_SYSCALL_IPC_NOTIFY_SEND   0x10FCu
 #define IPO_SYSCALL_IPC_NOTIFY_WAIT   0x10FDu
+#define IPO_SYSCALL_IPC_PIPE_POLL     0x10FEu
 
 #define IPO_SYSCALL_SHM_CREATE        0x1100u
 #define IPO_SYSCALL_SHM_OPEN          0x1101u
@@ -224,6 +233,13 @@
 #define IPO_SYSCALL_INPUT_DEV_POLL_EVENT  0x114Au
 #define IPO_SYSCALL_INPUT_DEV_GET_STATE   0x114Bu
 #define IPO_SYSCALL_MOUSE_INJECT          0x114Cu
+#define IPO_SYSCALL_INPUT_SET_HOTKEY_MODE 0x114Du
+#define IPO_SYSCALL_INPUT_GET_HOTKEY_MODE 0x114Eu
+
+#define IPO_HOTKEY_MODE_DEFAULT         0x00u
+#define IPO_HOTKEY_MODE_DISABLE_OS      0x01u
+#define IPO_HOTKEY_MODE_OVERRIDE_APP    0x02u
+#define IPO_HOTKEY_MODE_INCLUDE_CTRL_C  0x04u
 
 /* Low-Level PS/2 Hooks & Transactions */
 #define IPO_SYSCALL_PS2_HOOK_REGISTER     0x1150u
@@ -262,11 +278,15 @@
 /* Extended Window Manager Syscalls */
 #define IPO_SYSCALL_WM_SET_CURSOR_VISIBLE 0x1190u
 #define IPO_SYSCALL_WM_GET_CURSOR_VISIBLE 0x1191u
+#define IPO_SYSCALL_WM_GET_SCREEN_BOUNDS  0x1192u
+#define IPO_SYSCALL_WM_SET_CURSOR_SCALE   0x1193u
+#define IPO_SYSCALL_WM_GET_CURSOR_SCALE   0x1194u
 
 /* Dynamic Kernel Module (.kmd), Extension Registry & Universal Data Channel Syscalls */
 #define IPO_SYSCALL_KMOD_LOAD             0x11A0u
 #define IPO_SYSCALL_KMOD_UNLOAD           0x11A1u
 #define IPO_SYSCALL_KMOD_COUNT            0x11A2u
+#define IPO_SYSCALL_KMOD_LOAD_MEM         0x11A3u
 #define IPO_SYSCALL_EXT_REGISTER          0x11A4u
 #define IPO_SYSCALL_EXT_UNREGISTER        0x11A5u
 #define IPO_SYSCALL_EXT_CALL              0x11A6u
@@ -295,6 +315,83 @@
 #define IPO_SYSCALL_DYNMOD_RESTORE        0x11C6u
 #define IPO_SYSCALL_DYNMOD_LIST           0x11C7u
 #define IPO_SYSCALL_DYNMOD_COMPUTE_DEMO   0x11C8u
+
+/* Public Audio Device & Stream Platform API */
+#define IPO_SYSCALL_AUDIO_API_VERSION     0x11D0u
+#define IPO_SYSCALL_AUDIO_GET_DEV_COUNT   0x11D1u
+#define IPO_SYSCALL_AUDIO_GET_DEV_INFO    0x11D2u
+#define IPO_SYSCALL_AUDIO_OPEN            0x11D3u
+#define IPO_SYSCALL_AUDIO_CLOSE           0x11D4u
+#define IPO_SYSCALL_AUDIO_WRITE           0x11D5u
+#define IPO_SYSCALL_AUDIO_READ            0x11D6u
+#define IPO_SYSCALL_AUDIO_HANDLE_PAUSE    0x11D7u
+#define IPO_SYSCALL_AUDIO_HANDLE_SET_VOL  0x11D8u
+#define IPO_SYSCALL_AUDIO_HANDLE_CLOCK    0x11D9u
+#define IPO_SYSCALL_AUDIO_STREAM_CLOCK    0x11DAu
+#define IPO_SYSCALL_AUDIO_SET_MASTER_VOL  0x11DBu
+#define IPO_SYSCALL_AUDIO_GET_MASTER_VOL  0x11DCu
+
+/* Public Graphics, Color & TrueColor/RGBA64F Surface API */
+#define IPO_SYSCALL_GFX_API_VERSION       0x11E0u
+#define IPO_SYSCALL_GFX_GET_CAPS          0x11E1u
+#define IPO_SYSCALL_GFX_ENUM_MODES        0x11E2u
+#define IPO_SYSCALL_GFX_SET_MODE          0x11E3u
+#define IPO_SYSCALL_GFX_GET_MODE          0x11E4u
+#define IPO_SYSCALL_GFX_SELECT_FORMAT     0x11E5u
+#define IPO_SYSCALL_GFX_PRESENT_WINDOW    0x11E6u
+#define IPO_SYSCALL_GFX_PRESENT_SCREEN    0x11E7u
+#define IPO_SYSCALL_GFX_GET_STATS         0x11E8u
+#define IPO_SYSCALL_GFX_GET_PALETTE32     0x11E9u
+#define IPO_SYSCALL_GFX_BGA_OP            0x11EAu
+
+/* Hardware / Virtualized GPU (VirtIO-GPU / VirGL) API */
+#define IPO_SYSCALL_GPU_GET_INFO          0x11F0u
+#define IPO_SYSCALL_GPU_SET_MODE          0x11F1u
+#define IPO_SYSCALL_GPU_CTX_CREATE        0x11F2u
+#define IPO_SYSCALL_GPU_CTX_DESTROY       0x11F3u
+#define IPO_SYSCALL_GPU_RES_CREATE        0x11F4u
+#define IPO_SYSCALL_GPU_RES_UPLOAD        0x11F5u
+#define IPO_SYSCALL_GPU_RES_DESTROY       0x11F6u
+#define IPO_SYSCALL_GPU_SUBMIT_BATCH      0x11F7u
+
+/* Threading Extensions, High-Res Clocks, Futex & Virtual Memory Mapping */
+#define IPO_SYSCALL_THREAD_DETACH         0x1200u
+#define IPO_SYSCALL_THREAD_SET_TLS        0x1201u
+#define IPO_SYSCALL_THREAD_GET_TLS        0x1202u
+#define IPO_SYSCALL_CLOCK_GETTIME         0x1203u
+#define IPO_SYSCALL_NANOSLEEP             0x1204u
+#define IPO_SYSCALL_FUTEX                 0x1205u
+#define IPO_SYSCALL_MMAP                  0x1206u
+#define IPO_SYSCALL_MUNMAP                0x1207u
+#define IPO_SYSCALL_MPROTECT              0x1208u
+
+#define IPO_CLOCK_REALTIME                0u
+#define IPO_CLOCK_MONOTONIC               1u
+
+#define IPO_FUTEX_WAIT                    0u
+#define IPO_FUTEX_WAKE                    1u
+#define IPO_FUTEX_WAIT_TS                 2u
+
+#define IPO_PROT_NONE                     0u
+#define IPO_PROT_READ                     1u
+#define IPO_PROT_WRITE                    2u
+#define IPO_PROT_EXEC                     4u
+
+#define IPO_MAP_SHARED                    0x01u
+#define IPO_MAP_PRIVATE                   0x02u
+#define IPO_MAP_FIXED                     0x10u
+#define IPO_MAP_ANONYMOUS                 0x20u
+#define IPO_MAP_ANON                      IPO_MAP_ANONYMOUS
+
+typedef struct {
+    uint64_t tv_sec;
+    uint64_t tv_nsec;
+} ipo_timespec_t;
+
+typedef struct {
+    uint32_t mutex_addr;
+    uint32_t timeout_ms;
+} ipo_cond_timedwait_req_t;
 
 #define IPO_SYSCALL_EXIT         0xFFFFu
 
@@ -442,6 +539,67 @@ static inline int ipo_seek(int fd, int32_t offset, int whence) {
     args[1] = (uint32_t)offset;
     args[2] = (uint32_t)whence;
     return ipo_syscall(IPO_SYSCALL_FS_SEEK, 3u, args);
+}
+
+static inline int ipo_read64(int fd, void *buf, uint32_t count, uint64_t offset) {
+    uint32_t args[5];
+    args[0] = (uint32_t)fd;
+    args[1] = (uint32_t)(uintptr_t)buf;
+    args[2] = count;
+    args[3] = (uint32_t)(offset & 0xFFFFFFFFu);
+    args[4] = (uint32_t)(offset >> 32);
+    return ipo_syscall(IPO_SYSCALL_FS_READ, 5u, args);
+}
+
+static inline int ipo_write64(int fd, const void *buf, uint32_t count, uint64_t offset) {
+    uint32_t args[5];
+    args[0] = (uint32_t)fd;
+    args[1] = (uint32_t)(uintptr_t)buf;
+    args[2] = count;
+    args[3] = (uint32_t)(offset & 0xFFFFFFFFu);
+    args[4] = (uint32_t)(offset >> 32);
+    return ipo_syscall(IPO_SYSCALL_FS_WRITE, 5u, args);
+}
+
+static inline int64_t ipo_lseek64(int fd, int64_t offset, int whence) {
+    int64_t pos = -1;
+    uint64_t uoff = (uint64_t)offset;
+    uint32_t args[5];
+    args[0] = (uint32_t)fd;
+    args[1] = (uint32_t)(uoff & 0xFFFFFFFFu);
+    args[2] = (uint32_t)(uoff >> 32);
+    args[3] = (uint32_t)whence;
+    args[4] = (uint32_t)(uintptr_t)&pos;
+    if (ipo_syscall(IPO_SYSCALL_FS_LSEEK64, 5u, args) < 0) return -1;
+    return pos;
+}
+
+static inline int ipo_truncate64(const char *path, uint64_t size) {
+    uint32_t args[3];
+    args[0] = (uint32_t)(uintptr_t)path;
+    args[1] = (uint32_t)(size & 0xFFFFFFFFu);
+    args[2] = (uint32_t)(size >> 32);
+    return ipo_syscall(IPO_SYSCALL_FS_TRUNCATE, 3u, args);
+}
+
+static inline int ipo_ftruncate64(int fd, uint64_t size) {
+    uint32_t args[3];
+    args[0] = (uint32_t)fd;
+    args[1] = (uint32_t)(size & 0xFFFFFFFFu);
+    args[2] = (uint32_t)(size >> 32);
+    return ipo_syscall(IPO_SYSCALL_FS_FTRUNCATE, 3u, args);
+}
+
+static inline int ipo_mkdir(const char *path) {
+    uint32_t args[1];
+    args[0] = (uint32_t)(uintptr_t)path;
+    return ipo_syscall(IPO_SYSCALL_FS_MKDIR, 1u, args);
+}
+
+static inline int ipo_rmdir(const char *path) {
+    uint32_t args[1];
+    args[0] = (uint32_t)(uintptr_t)path;
+    return ipo_syscall(IPO_SYSCALL_FS_RMDIR, 1u, args);
 }
 
 static inline void *ipo_sbrk(int32_t increment) {
@@ -831,6 +989,15 @@ static inline int ipo_sys_input_dev_emit(uint32_t dev_id, const void *ev) {
     return ipo_syscall(IPO_SYSCALL_INPUT_DEV_EMIT, 2u, args);
 }
 
+static inline int ipo_sys_input_set_hotkey_mode(uint32_t mode_flags) {
+    uint32_t args[1] = { mode_flags };
+    return ipo_syscall(IPO_SYSCALL_INPUT_SET_HOTKEY_MODE, 1u, args);
+}
+
+static inline uint32_t ipo_sys_input_get_hotkey_mode(void) {
+    return (uint32_t)ipo_syscall(IPO_SYSCALL_INPUT_GET_HOTKEY_MODE, 0u, (void *)0);
+}
+
 static inline uint32_t ipo_sys_input_dev_list(void *out_arr, uint32_t max_count) {
     uint32_t args[2] = { (uint32_t)(uintptr_t)out_arr, max_count };
     return (uint32_t)ipo_syscall(IPO_SYSCALL_INPUT_DEV_LIST, 2u, args);
@@ -971,6 +1138,76 @@ static inline uint32_t ipo_sys_device_register(const void *info) {
 static inline int ipo_sys_device_unregister(uint32_t dev_id) {
     uint32_t args[1] = { dev_id };
     return ipo_syscall(IPO_SYSCALL_DEV_UNREGISTER, 1u, args);
+}
+
+static inline int ipo_sys_gpu_get_info(void *out_info) {
+    uint32_t args[1] = { (uint32_t)(uintptr_t)out_info };
+    return ipo_syscall(IPO_SYSCALL_GPU_GET_INFO, 1u, args);
+}
+
+static inline int ipo_sys_gpu_set_mode(uint32_t mode) {
+    uint32_t args[1] = { mode };
+    return ipo_syscall(IPO_SYSCALL_GPU_SET_MODE, 1u, args);
+}
+
+static inline int ipo_sys_gpu_ctx_create(uint32_t *out_ctx_id, const char *debug_name) {
+    uint32_t args[2] = { (uint32_t)(uintptr_t)out_ctx_id, (uint32_t)(uintptr_t)debug_name };
+    return ipo_syscall(IPO_SYSCALL_GPU_CTX_CREATE, 2u, args);
+}
+
+static inline int ipo_sys_gpu_ctx_destroy(uint32_t ctx_id) {
+    uint32_t args[1] = { ctx_id };
+    return ipo_syscall(IPO_SYSCALL_GPU_CTX_DESTROY, 1u, args);
+}
+
+static inline int ipo_sys_gpu_res_create(uint32_t ctx_id, const void *desc, uint32_t *out_res_id) {
+    uint32_t args[3] = { ctx_id, (uint32_t)(uintptr_t)desc, (uint32_t)(uintptr_t)out_res_id };
+    return ipo_syscall(IPO_SYSCALL_GPU_RES_CREATE, 3u, args);
+}
+
+static inline int ipo_sys_gpu_res_upload(const void *upload_desc) {
+    uint32_t args[1] = { (uint32_t)(uintptr_t)upload_desc };
+    return ipo_syscall(IPO_SYSCALL_GPU_RES_UPLOAD, 1u, args);
+}
+
+static inline int ipo_sys_gpu_res_destroy(uint32_t res_id) {
+    uint32_t args[1] = { res_id };
+    return ipo_syscall(IPO_SYSCALL_GPU_RES_DESTROY, 1u, args);
+}
+
+static inline int ipo_sys_gpu_submit_batch(const void *batch_desc) {
+    uint32_t args[1] = { (uint32_t)(uintptr_t)batch_desc };
+    return ipo_syscall(IPO_SYSCALL_GPU_SUBMIT_BATCH, 1u, args);
+}
+
+static inline int ipo_clock_gettime(uint32_t clock_id, ipo_timespec_t *ts) {
+    uint32_t args[2] = { clock_id, (uint32_t)(uintptr_t)ts };
+    return ipo_syscall(IPO_SYSCALL_CLOCK_GETTIME, 2u, args);
+}
+
+static inline int ipo_nanosleep(const ipo_timespec_t *req, ipo_timespec_t *rem) {
+    uint32_t args[2] = { (uint32_t)(uintptr_t)req, (uint32_t)(uintptr_t)rem };
+    return ipo_syscall(IPO_SYSCALL_NANOSLEEP, 2u, args);
+}
+
+static inline int ipo_futex(volatile uint32_t *uaddr, uint32_t op, uint32_t val, uint32_t timeout_or_ts) {
+    uint32_t args[4] = { (uint32_t)(uintptr_t)uaddr, op, val, timeout_or_ts };
+    return ipo_syscall(IPO_SYSCALL_FUTEX, 4u, args);
+}
+
+static inline void *ipo_mmap(void *hint, uint32_t len, uint32_t prot, uint32_t flags) {
+    uint32_t args[4] = { (uint32_t)(uintptr_t)hint, len, prot, flags };
+    return (void *)(uintptr_t)(uint32_t)ipo_syscall(IPO_SYSCALL_MMAP, 4u, args);
+}
+
+static inline int ipo_munmap(void *addr, uint32_t len) {
+    uint32_t args[2] = { (uint32_t)(uintptr_t)addr, len };
+    return ipo_syscall(IPO_SYSCALL_MUNMAP, 2u, args);
+}
+
+static inline int ipo_mprotect(void *addr, uint32_t len, uint32_t prot) {
+    uint32_t args[3] = { (uint32_t)(uintptr_t)addr, len, prot };
+    return ipo_syscall(IPO_SYSCALL_MPROTECT, 3u, args);
 }
 
 #ifdef __cplusplus

@@ -82,13 +82,16 @@ $(TOOLCHAIN_DIR)/nm.elf: $(TOOLCHAIN_DIR)/nm.o $(USER_CRT0) $(USER_CRTI) $(USER_
 # ------------------------------------------------------------------------------
 # Lua 5.4 runtime
 # ------------------------------------------------------------------------------
-$(TOOLCHAIN_DIR)/lua/lua.elf $(TOOLCHAIN_DIR)/lua/luac.elf: $(USER_LIBC_A) $(USER_LIBM_A) $(LIBGCC_A) $(USER_CRT0) $(USER_CRTI) $(USER_CRTN) $(LIB_DIR)/linker.ld
+$(TOOLCHAIN_DIR)/lua/lua.elf: $(USER_LIBC_A) $(USER_LIBM_A) $(LIBGCC_A) $(USER_CRT0) $(USER_CRTI) $(USER_CRTN) $(LIB_DIR)/linker.ld
 	@mkdir -p $(TOOLCHAIN_DIR)/lua
 	cd $(APPS_DIR)/lua/src && $(MAKE) clean && $(MAKE) a CC="$(CC) -m32 -nostdinc -I$(INCLUDE_DIR)" AR="$(AR) rcs" RANLIB="ranlib" MYCFLAGS="-DLUA_USE_POSIX -DLUA_USE_C89 -ffreestanding -fno-builtin -fno-pic -fno-pie"
 	$(CC) -m32 -nostdinc -I$(INCLUDE_DIR) -c $(APPS_DIR)/lua/src/lua.c -o $(APPS_DIR)/lua/src/lua.o -DLUA_COMPAT_5_3 -DLUA_USE_POSIX -DLUA_USE_C89 -ffreestanding -fno-builtin -fno-pic -fno-pie
 	$(CC) -m32 -nostdinc -I$(INCLUDE_DIR) -c $(APPS_DIR)/lua/src/luac.c -o $(APPS_DIR)/lua/src/luac.o -DLUA_COMPAT_5_3 -DLUA_USE_POSIX -DLUA_USE_C89 -ffreestanding -fno-builtin -fno-pic -fno-pie
 	$(LD) -m elf_i386 -q -T $(LIB_DIR)/linker.ld $(USER_CRT0) $(USER_CRTI) $(APPS_DIR)/lua/src/lua.o $(APPS_DIR)/lua/src/liblua.a $(USER_LIBC_A) $(USER_LIBM_A) $(LIBGCC_A) $(USER_CRTN) -o $(TOOLCHAIN_DIR)/lua/lua.elf
 	$(LD) -m elf_i386 -q -T $(LIB_DIR)/linker.ld $(USER_CRT0) $(USER_CRTI) $(APPS_DIR)/lua/src/luac.o $(APPS_DIR)/lua/src/liblua.a $(USER_LIBC_A) $(USER_LIBM_A) $(LIBGCC_A) $(USER_CRTN) -o $(TOOLCHAIN_DIR)/lua/luac.elf
+
+$(TOOLCHAIN_DIR)/lua/luac.elf: $(TOOLCHAIN_DIR)/lua/lua.elf
+	@true
 
 # ------------------------------------------------------------------------------
 # NASM assembler
@@ -97,7 +100,7 @@ $(TOOLCHAIN_DIR)/nasm.elf: $(USER_LIBC_A) $(USER_LIBM_A) $(LIBGCC_A) $(USER_CRT0
 	@mkdir -p $(TOOLCHAIN_DIR)
 	@mkdir -p $(APPS_DIR)/nasm/doc && touch $(APPS_DIR)/nasm/doc/Makefile.in
 	$(MAKE) -C $(APPS_DIR)/nasm asm/nasm.o libnasm.a
-	cd $(APPS_DIR)/nasm && $(LD) -m elf_i386 -q -T $(LIB_DIR)/linker.ld $(USER_CRT0) $(USER_CRTI) asm/nasm.o libnasm.a $(USER_LIBC_A) $(USER_LIBM_A) $(LIBGCC_A) $(USER_CRTN) -o $(TOOLCHAIN_DIR)/nasm.elf
+	cd $(APPS_DIR)/nasm && $(LD) -m elf_i386 -q --allow-multiple-definition -T $(LIB_DIR)/linker.ld $(USER_CRT0) $(USER_CRTI) asm/nasm.o libnasm.a $(USER_LIBC_A) $(USER_LIBM_A) $(LIBGCC_A) $(USER_CRTN) -o $(TOOLCHAIN_DIR)/nasm.elf
 
 # ------------------------------------------------------------------------------
 # MicroPython runtime

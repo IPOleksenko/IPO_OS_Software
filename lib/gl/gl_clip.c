@@ -55,6 +55,22 @@ static int clip_against_plane(const gl_vertex_t *in, int n_in, gl_vertex_t *out,
     return n_out;
 }
 
+/* Return true if triangle is culled; screen win[1] points down so CCW front faces have negative signed area. */
+static bool gl_tri_culled(const GLContext *ctx, const gl_vertex_t *v0,
+                          const gl_vertex_t *v1, const gl_vertex_t *v2) {
+    if (!ctx->cull_face_enabled) return false;
+    if (ctx->cull_face_mode == GL_FRONT_AND_BACK) return true;
+    float ax = v1->win[0] - v0->win[0];
+    float ay = v1->win[1] - v0->win[1];
+    float bx = v2->win[0] - v0->win[0];
+    float by = v2->win[1] - v0->win[1];
+    float cross = ax * by - ay * bx;
+    bool is_front = (ctx->front_face == GL_CCW) ? (cross < 0.0f) : (cross > 0.0f);
+    if (ctx->cull_face_mode == GL_BACK && !is_front) return true;
+    if (ctx->cull_face_mode == GL_FRONT && is_front) return true;
+    return false;
+}
+
 void gl_clip_and_render_polygon(GLContext *ctx, gl_vertex_t *verts, int nverts) {
     if (!ctx || nverts < 3) return;
 
@@ -86,8 +102,9 @@ void gl_clip_and_render_polygon(GLContext *ctx, gl_vertex_t *verts, int nverts) 
 
             float half_w = (float)ctx->vp_w * 0.5f;
             float half_h = (float)ctx->vp_h * 0.5f;
+            int top_vp_y = ctx->height - (ctx->vp_y + ctx->vp_h);
             float center_x = (float)ctx->vp_x + half_w;
-            float center_y = (float)ctx->vp_y + half_h;
+            float center_y = (float)top_vp_y + half_h;
 
             float inv_w0 = 1.0f / w0;
             verts[0].inv_w = inv_w0;
@@ -108,18 +125,7 @@ void gl_clip_and_render_polygon(GLContext *ctx, gl_vertex_t *verts, int nverts) 
             verts[2].win[2] = ((verts[2].clip[2] * inv_w2) + 1.0f) * 0.5f;
 
             /* Early Back-face culling check */
-            if (ctx->cull_face_enabled) {
-                float ax = verts[1].win[0] - verts[0].win[0];
-                float ay = verts[1].win[1] - verts[0].win[1];
-                float bx = verts[2].win[0] - verts[0].win[0];
-                float by = verts[2].win[1] - verts[0].win[1];
-                float cross = ax * by - ay * bx;
-
-                bool is_front = (ctx->front_face == GL_CCW) ? (cross > 0.0f) : (cross < 0.0f);
-                if (ctx->cull_face_mode == GL_BACK && !is_front) return;
-                if (ctx->cull_face_mode == GL_FRONT && is_front) return;
-                if (ctx->cull_face_mode == GL_FRONT_AND_BACK) return;
-            }
+            if (gl_tri_culled(ctx, &verts[0], &verts[1], &verts[2])) return;
 
             gl_rasterize_triangle(ctx, &verts[0], &verts[1], &verts[2]);
             return;
@@ -168,8 +174,9 @@ void gl_clip_and_render_polygon(GLContext *ctx, gl_vertex_t *verts, int nverts) 
     /* Transform remaining clipped vertices to screen coordinates */
     float half_w = (float)ctx->vp_w * 0.5f;
     float half_h = (float)ctx->vp_h * 0.5f;
+    int top_vp_y = ctx->height - (ctx->vp_y + ctx->vp_h);
     float center_x = (float)ctx->vp_x + half_w;
-    float center_y = (float)ctx->vp_y + half_h;
+    float center_y = (float)top_vp_y + half_h;
 
     for (int i = 0; i < count; i++) {
         gl_vertex_t *v = &curr_in[i];
@@ -182,18 +189,7 @@ void gl_clip_and_render_polygon(GLContext *ctx, gl_vertex_t *verts, int nverts) 
     }
 
     /* Back-face culling check */
-    if (ctx->cull_face_enabled) {
-        float ax = curr_in[1].win[0] - curr_in[0].win[0];
-        float ay = curr_in[1].win[1] - curr_in[0].win[1];
-        float bx = curr_in[2].win[0] - curr_in[0].win[0];
-        float by = curr_in[2].win[1] - curr_in[0].win[1];
-        float cross = ax * by - ay * bx;
-
-        bool is_front = (ctx->front_face == GL_CCW) ? (cross > 0.0f) : (cross < 0.0f);
-        if (ctx->cull_face_mode == GL_BACK && !is_front) return;
-        if (ctx->cull_face_mode == GL_FRONT && is_front) return;
-        if (ctx->cull_face_mode == GL_FRONT_AND_BACK) return;
-    }
+    if (gl_tri_culled(ctx, &curr_in[0], &curr_in[1], &curr_in[2])) return;
 
     /* Triangle fan rasterization */
     for (int i = 1; i < count - 1; i++) {

@@ -12,6 +12,7 @@
 #include "mp4_player.h"
 
 #include <stdio.h>
+#include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
@@ -30,6 +31,7 @@
 #include <vga.h>
 #include <vga_gfx.h>
 #include <wm.h>
+#include <ipo/gfx.h>
 #include <driver/input/keyboard.h>
 #include <driver/input/mouse.h>
 #include <driver/audio_core.h>
@@ -83,6 +85,7 @@ extern struct graphics_driver ipo_driver;
 static uint32_t *s_fb32 = NULL;
 static uint8_t  *s_fb8_base = NULL;
 static uint8_t  *s_lut_near = NULL;
+static bool      s_use_truecolor32 = false;
 
 static uint8_t s_pal_r[256];
 static uint8_t s_pal_g[256];
@@ -121,36 +124,127 @@ typedef enum {
     CURSOR_IBEAM = 2
 } cursor_kind_t;
 
+static const char *gui_str(const char *s) {
+    return s ? s : "";
+}
+
+static bool gui_set_str(char **dst, const char *src) {
+    if (!dst) return false;
+    if (!src) src = "";
+    size_t len = strlen(src);
+    if (len == SIZE_MAX) return false;
+    char *copy = (char *)malloc(len + 1u);
+    if (!copy) return false;
+    memcpy(copy, src, len + 1u);
+    free(*dst);
+    *dst = copy;
+    return true;
+}
+
+static bool gui_set_strn(char **dst, const char *src, size_t len) {
+    if (!dst) return false;
+    if (!src) len = 0;
+    if (len == SIZE_MAX) return false;
+    char *copy = (char *)malloc(len + 1u);
+    if (!copy) return false;
+    if (len > 0) memcpy(copy, src, len);
+    copy[len] = '\0';
+    free(*dst);
+    *dst = copy;
+    return true;
+}
+
+static char *gui_fmt_alloc(const char *fmt, ...) {
+    if (!fmt) return NULL;
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(NULL, 0, fmt, ap);
+    va_end(ap);
+    if (n < 0) return NULL;
+    size_t sz = (size_t)n + 1u;
+    char *buf = (char *)malloc(sz);
+    if (!buf) return NULL;
+    va_start(ap, fmt);
+    vsnprintf(buf, sz, fmt, ap);
+    va_end(ap);
+    return buf;
+}
+
+static bool gui_set_fmt(char **dst, const char *fmt, ...) {
+    if (!dst || !fmt) return false;
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(NULL, 0, fmt, ap);
+    va_end(ap);
+    if (n < 0) return false;
+    size_t sz = (size_t)n + 1u;
+    char *buf = (char *)malloc(sz);
+    if (!buf) return false;
+    va_start(ap, fmt);
+    vsnprintf(buf, sz, fmt, ap);
+    va_end(ap);
+    free(*dst);
+    *dst = buf;
+    return true;
+}
+
+static bool gui_dyn_ensure(char **buf, size_t *cap, size_t need_bytes) {
+    if (!buf || !cap || need_bytes == 0) return false;
+    if (*buf && *cap >= need_bytes) return true;
+    size_t new_cap = (*cap > 0) ? *cap : 64u;
+    while (new_cap < need_bytes) {
+        if (new_cap > SIZE_MAX / 2u) {
+            new_cap = need_bytes;
+            break;
+        }
+        new_cap *= 2u;
+    }
+    char *nb = (char *)realloc(*buf, new_cap);
+    if (!nb) return false;
+    if (!*buf) nb[0] = '\0';
+    *buf = nb;
+    *cap = new_cap;
+    return true;
+}
+
+static bool gui_dyn_set(char **buf, size_t *cap, int *out_len, const char *src) {
+    if (!src) src = "";
+    size_t slen = strlen(src);
+    if (slen >= (size_t)0x7fffffff) return false;
+    if (!gui_dyn_ensure(buf, cap, slen + 1u)) return false;
+    memcpy(*buf, src, slen + 1u);
+    if (out_len) *out_len = (int)slen;
+    return true;
+}
+
 typedef struct {
     bool used;
     struct graphics_device *dev;
     bool is_home;
     bool is_video;
-    char title[96];
-    char url[2048];
-    char video_url[2048];
-    char video_title[128];
+    char *title;
+    char *url;
+    char *video_url;
+    char *video_title;
 } ipo_tab_t;
 
 typedef struct {
-    char label[32];
-    char url[2048];
+    char *label;
+    char *url;
     uint32_t badge_color;
     char badge_char;
     bool custom;
 } ipo_bookmark_t;
 
-#define MAX_BOOKMARKS 12
-
 typedef struct {
-    char title[96];
-    char url[2048];
+    char *title;
+    char *url;
     uint32_t visit_ms;
 } ipo_hist_entry_t;
 
 typedef struct {
-    char label[96];
-    char url[2048];
+    char *label;
+    char *url;
     bool is_search;
     bool is_bookmark;
 } ipo_ac_item_t;
@@ -165,37 +259,41 @@ typedef enum {
     DL_ERROR
 } dl_state_t;
 
-#define MAX_DL_SLOTS 6
 typedef struct {
     bool used;
     dl_state_t state;
-    char url[2048];
-    char cur_url[2048];
+    char *url;
+    char *cur_url;
     char *filename;
     char *dest;
-    char host[128];
-    char path[1536];
+    char *host;
+    char *path;
     int port;
     bool is_https;
     int redirects;
+    char **redirect_history;
+    size_t redirect_count;
+    size_t redirect_cap;
     int sock;
     SSL_CTX *ctx;
     SSL *ssl;
     int fd;
-    char hdr_buf[8192];
+    char *hdr_buf;
     size_t hdr_len;
+    size_t hdr_cap;
     bool headers_done;
     int status_code;
     bool chunked;
     int chunk_state;
     size_t chunk_rem;
-    char chunk_line[64];
+    char *chunk_line;
     size_t chunk_line_len;
+    size_t chunk_line_cap;
     int64_t content_length;
     uint64_t downloaded_bytes;
     uint32_t start_ms;
     uint32_t end_ms;
-    char err_msg[64];
+    char *err_msg;
 } dl_slot_t;
 
 /* Embedded Video Player State */
@@ -269,54 +367,181 @@ static int s_tabs_cap = 0;
 static int s_active_tab = 0;
 static int s_tab_scroll = 0;
 
-static ipo_bookmark_t s_bookmarks[MAX_BOOKMARKS];
+static ipo_bookmark_t *s_bookmarks = NULL;
 static int s_bookmark_count = 0;
+static int s_bookmark_cap = 0;
+
+static bool ensure_bookmark_cap(int need) {
+    if (need <= s_bookmark_cap) return true;
+    int new_cap = s_bookmark_cap ? s_bookmark_cap : 16;
+    while (new_cap < need) {
+        if (new_cap > INT32_MAX / 2) return false;
+        new_cap *= 2;
+    }
+    if ((size_t)new_cap > SIZE_MAX / sizeof(ipo_bookmark_t)) return false;
+    ipo_bookmark_t *nb = (ipo_bookmark_t *)realloc(s_bookmarks, (size_t)new_cap * sizeof(ipo_bookmark_t));
+    if (!nb) return false;
+    memset(nb + s_bookmark_cap, 0, (size_t)(new_cap - s_bookmark_cap) * sizeof(ipo_bookmark_t));
+    s_bookmarks = nb;
+    s_bookmark_cap = new_cap;
+    return true;
+}
 
 static ipo_hist_entry_t *s_history = NULL;
 static int s_history_count = 0;
 static int s_history_cap = 0;
 
-static ipo_ac_item_t s_ac_items[5];
+static ipo_ac_item_t *s_ac_items = NULL;
 static int s_ac_count = 0;
+static int s_ac_cap = 0;
 static int s_ac_sel = -1;
 
 static int s_zoom_pct = 100;
 static int s_ctx_x = 200, s_ctx_y = 200;
 static bool s_ctx_has_link = false;
-static char s_ctx_link_url[2048] = "";
+static char *s_ctx_link_url = NULL;
 static bool s_dragging_vscroll = false;
 static int  s_dragging_textbox = 0; /* 1=omnibox, 2=hero, 3=find */
 
-static dl_slot_t s_dls[MAX_DL_SLOTS];
+static dl_slot_t *s_dls = NULL;
+static int s_dls_cap = 0;
 
 static focus_target_t s_focus = FOCUS_VIEWPORT;
 static overlay_kind_t s_overlay = OVL_NONE;
 static cursor_kind_t s_cursor = CURSOR_ARROW;
 
-static char s_omnibox_text[2048];
-static int  s_omnibox_len = 0;
-static int  s_omnibox_cursor = 0;
-static int  s_omnibox_scroll = 0;
-static bool s_omnibox_sel_all = false;
+static char  *s_omnibox_text = NULL;
+static size_t s_omnibox_cap = 0;
+static int    s_omnibox_len = 0;
+static int    s_omnibox_cursor = 0;
+static int    s_omnibox_scroll = 0;
+static bool   s_omnibox_sel_all = false;
 static uint32_t s_omnibox_last_click_ms = 0;
 
-static char s_hero_text[512];
-static int  s_hero_len = 0;
-static int  s_hero_cursor = 0;
-static int  s_hero_scroll = 0;
-static bool s_hero_sel_all = false;
+static char  *s_hero_text = NULL;
+static size_t s_hero_cap = 0;
+static int    s_hero_len = 0;
+static int    s_hero_cursor = 0;
+static int    s_hero_scroll = 0;
+static bool   s_hero_sel_all = false;
 static uint32_t s_hero_last_click_ms = 0;
 
-static char s_find_text[256];
-static int  s_find_len = 0;
-static int  s_find_cursor = 0;
-static int  s_find_scroll = 0;
-static bool s_find_sel_all = false;
+static char  *s_find_text = NULL;
+static size_t s_find_cap = 0;
+static int    s_find_len = 0;
+static int    s_find_cursor = 0;
+static int    s_find_scroll = 0;
+static bool   s_find_sel_all = false;
 static uint32_t s_find_last_click_ms = 0;
 
-static char s_status_msg[160] = "Ready";
-static char s_pending_initial_video[2048] = "";
-static char s_pending_tab_url[2048] = "";
+static char *s_status_msg = NULL;
+static char *s_pending_initial_video = NULL;
+static char *s_pending_tab_url = NULL;
+
+static void tab_free_fields(ipo_tab_t *tab) {
+    if (!tab) return;
+    free(tab->title);
+    free(tab->url);
+    free(tab->video_url);
+    free(tab->video_title);
+    tab->title = NULL;
+    tab->url = NULL;
+    tab->video_url = NULL;
+    tab->video_title = NULL;
+}
+
+static void ac_clear_items(void) {
+    for (int i = 0; i < s_ac_count; i++) {
+        free(s_ac_items[i].label);
+        free(s_ac_items[i].url);
+        s_ac_items[i].label = NULL;
+        s_ac_items[i].url = NULL;
+    }
+    s_ac_count = 0;
+}
+
+static bool ac_ensure_cap(int need) {
+    if (need <= s_ac_cap) return true;
+    int new_cap = (s_ac_cap > 0) ? s_ac_cap : 8;
+    while (new_cap < need) {
+        if (new_cap > 0x3fffffff) {
+            new_cap = need;
+            break;
+        }
+        new_cap *= 2;
+    }
+    ipo_ac_item_t *arr = (ipo_ac_item_t *)realloc(s_ac_items, (size_t)new_cap * sizeof(ipo_ac_item_t));
+    if (!arr) return false;
+    memset(arr + s_ac_cap, 0, (size_t)(new_cap - s_ac_cap) * sizeof(ipo_ac_item_t));
+    s_ac_items = arr;
+    s_ac_cap = new_cap;
+    return true;
+}
+
+static void dl_slot_free_redirect_history(dl_slot_t *dl) {
+    if (!dl) return;
+    for (size_t i = 0; i < dl->redirect_count; i++) {
+        free(dl->redirect_history[i]);
+    }
+    free(dl->redirect_history);
+    dl->redirect_history = NULL;
+    dl->redirect_count = 0;
+    dl->redirect_cap = 0;
+}
+
+static bool dl_slot_seen_url(const dl_slot_t *dl, const char *url) {
+    if (!dl || !url) return false;
+    for (size_t i = 0; i < dl->redirect_count; i++) {
+        if (dl->redirect_history[i] && strcmp(dl->redirect_history[i], url) == 0) return true;
+    }
+    return false;
+}
+
+static bool dl_slot_record_url(dl_slot_t *dl, const char *url) {
+    if (!dl || !url) return false;
+    if (dl->redirect_count >= dl->redirect_cap) {
+        size_t new_cap = dl->redirect_cap ? dl->redirect_cap * 2u : 8u;
+        if (new_cap > SIZE_MAX / sizeof(char *)) return false;
+        char **arr = (char **)realloc(dl->redirect_history, new_cap * sizeof(char *));
+        if (!arr) return false;
+        dl->redirect_history = arr;
+        dl->redirect_cap = new_cap;
+    }
+    size_t len = strlen(url);
+    if (len == SIZE_MAX) return false;
+    char *copy = (char *)malloc(len + 1u);
+    if (!copy) return false;
+    memcpy(copy, url, len + 1u);
+    dl->redirect_history[dl->redirect_count++] = copy;
+    return true;
+}
+
+static void dl_slot_free_strings(dl_slot_t *dl) {
+    if (!dl) return;
+    free(dl->url);
+    free(dl->cur_url);
+    free(dl->filename);
+    free(dl->dest);
+    free(dl->host);
+    free(dl->path);
+    free(dl->hdr_buf);
+    free(dl->chunk_line);
+    free(dl->err_msg);
+    dl_slot_free_redirect_history(dl);
+    dl->url = NULL;
+    dl->cur_url = NULL;
+    dl->filename = NULL;
+    dl->dest = NULL;
+    dl->host = NULL;
+    dl->path = NULL;
+    dl->hdr_buf = NULL;
+    dl->hdr_cap = 0;
+    dl->hdr_len = 0;
+    dl->chunk_line = NULL;
+    dl->chunk_line_cap = 0;
+    dl->chunk_line_len = 0;
+    dl->err_msg = NULL;
+}
 
 /* Mouse & Keyboard state tracking */
 static int  s_mx = 400, s_my = 300;
@@ -398,73 +623,73 @@ static struct session *dev_to_session(struct graphics_device *dev) {
  * Cyrillic + UTF-8 8x16 Font Table
  * ========================================================================= */
 static const uint8_t s_cyr_upper[32][16] = {
-    /* А */ {0x00,0x00,0x18,0x3C,0x66,0x66,0x66,0x7E,0x66,0x66,0x66,0x66,0x00,0x00,0x00,0x00},
-    /* Б */ {0x00,0x00,0x7E,0x60,0x60,0x60,0x7C,0x66,0x66,0x66,0x66,0x7C,0x00,0x00,0x00,0x00},
-    /* В */ {0x00,0x00,0x7C,0x66,0x66,0x66,0x7C,0x66,0x66,0x66,0x66,0x7C,0x00,0x00,0x00,0x00},
-    /* Г */ {0x00,0x00,0x7E,0x60,0x60,0x60,0x60,0x60,0x60,0x60,0x60,0x60,0x00,0x00,0x00,0x00},
-    /* Д */ {0x00,0x00,0x1E,0x36,0x36,0x36,0x36,0x36,0x36,0x36,0x7F,0x63,0x63,0x00,0x00,0x00},
-    /* Е */ {0x00,0x00,0x7E,0x60,0x60,0x60,0x7C,0x60,0x60,0x60,0x60,0x7E,0x00,0x00,0x00,0x00},
-    /* Ж */ {0x00,0x00,0x63,0x6B,0x6B,0x3E,0x1C,0x3E,0x6B,0x6B,0x6B,0x63,0x00,0x00,0x00,0x00},
-    /* З */ {0x00,0x00,0x3C,0x66,0x06,0x06,0x1C,0x06,0x06,0x06,0x66,0x3C,0x00,0x00,0x00,0x00},
-    /* И */ {0x00,0x00,0x66,0x66,0x66,0x6E,0x7E,0x76,0x66,0x66,0x66,0x66,0x00,0x00,0x00,0x00},
-    /* Й */ {0x00,0x18,0x00,0x66,0x66,0x6E,0x7E,0x76,0x66,0x66,0x66,0x66,0x00,0x00,0x00,0x00},
-    /* К */ {0x00,0x00,0x66,0x66,0x6C,0x78,0x70,0x78,0x6C,0x66,0x66,0x66,0x00,0x00,0x00,0x00},
-    /* Л */ {0x00,0x00,0x1E,0x36,0x36,0x36,0x36,0x36,0x36,0x36,0x66,0xC6,0x00,0x00,0x00,0x00},
-    /* М */ {0x00,0x00,0xC3,0xE7,0xFF,0xFF,0xDB,0xC3,0xC3,0xC3,0xC3,0xC3,0x00,0x00,0x00,0x00},
-    /* Н */ {0x00,0x00,0x66,0x66,0x66,0x66,0x7E,0x66,0x66,0x66,0x66,0x66,0x00,0x00,0x00,0x00},
-    /* О */ {0x00,0x00,0x3C,0x66,0x66,0x66,0x66,0x66,0x66,0x66,0x66,0x3C,0x00,0x00,0x00,0x00},
-    /* П */ {0x00,0x00,0x7E,0x66,0x66,0x66,0x66,0x66,0x66,0x66,0x66,0x66,0x00,0x00,0x00,0x00},
-    /* Р */ {0x00,0x00,0x7C,0x66,0x66,0x66,0x7C,0x60,0x60,0x60,0x60,0x60,0x00,0x00,0x00,0x00},
-    /* С */ {0x00,0x00,0x3C,0x66,0x60,0x60,0x60,0x60,0x60,0x60,0x66,0x3C,0x00,0x00,0x00,0x00},
-    /* Т */ {0x00,0x00,0x7E,0x18,0x18,0x18,0x18,0x18,0x18,0x18,0x18,0x18,0x00,0x00,0x00,0x00},
-    /* У */ {0x00,0x00,0x66,0x66,0x66,0x66,0x3C,0x18,0x18,0x30,0x60,0x60,0x00,0x00,0x00,0x00},
-    /* Ф */ {0x00,0x00,0x18,0x7E,0xDB,0xDB,0xDB,0xDB,0x7E,0x18,0x18,0x18,0x00,0x00,0x00,0x00},
-    /* Х */ {0x00,0x00,0x66,0x66,0x3C,0x18,0x18,0x3C,0x66,0x66,0x66,0x66,0x00,0x00,0x00,0x00},
-    /* Ц */ {0x00,0x00,0x66,0x66,0x66,0x66,0x66,0x66,0x66,0x66,0x7F,0x03,0x03,0x00,0x00,0x00},
-    /* Ч */ {0x00,0x00,0x66,0x66,0x66,0x66,0x3E,0x06,0x06,0x06,0x06,0x06,0x00,0x00,0x00,0x00},
-    /* Ш */ {0x00,0x00,0xDB,0xDB,0xDB,0xDB,0xDB,0xDB,0xDB,0xDB,0xDB,0xFF,0x00,0x00,0x00,0x00},
-    /* Щ */ {0x00,0x00,0xDB,0xDB,0xDB,0xDB,0xDB,0xDB,0xDB,0xDB,0xFF,0x03,0x03,0x00,0x00,0x00},
-    /* Ъ */ {0x00,0x00,0xF0,0x30,0x30,0x30,0x3C,0x36,0x36,0x36,0x36,0x3C,0x00,0x00,0x00,0x00},
-    /* Ы */ {0x00,0x00,0xC6,0xC6,0xC6,0xC6,0xF6,0xCE,0xCE,0xCE,0xCE,0xF6,0x00,0x00,0x00,0x00},
-    /* Ь */ {0x00,0x00,0x60,0x60,0x60,0x60,0x7C,0x66,0x66,0x66,0x66,0x7C,0x00,0x00,0x00,0x00},
-    /* Э */ {0x00,0x00,0x3C,0x66,0x06,0x06,0x3E,0x06,0x06,0x06,0x66,0x3C,0x00,0x00,0x00,0x00},
-    /* Ю */ {0x00,0x00,0xCE,0xDB,0xDB,0xDB,0xFB,0xDB,0xDB,0xDB,0xDB,0xCE,0x00,0x00,0x00,0x00},
-    /* Я */ {0x00,0x00,0x3E,0x66,0x66,0x66,0x3E,0x1E,0x36,0x66,0x66,0x66,0x00,0x00,0x00,0x00}
+    /* U+0410 */ {0x00,0x00,0x18,0x3C,0x66,0x66,0x66,0x7E,0x66,0x66,0x66,0x66,0x00,0x00,0x00,0x00},
+    /* U+0411 */ {0x00,0x00,0x7E,0x60,0x60,0x60,0x7C,0x66,0x66,0x66,0x66,0x7C,0x00,0x00,0x00,0x00},
+    /* U+0412 */ {0x00,0x00,0x7C,0x66,0x66,0x66,0x7C,0x66,0x66,0x66,0x66,0x7C,0x00,0x00,0x00,0x00},
+    /* U+0413 */ {0x00,0x00,0x7E,0x60,0x60,0x60,0x60,0x60,0x60,0x60,0x60,0x60,0x00,0x00,0x00,0x00},
+    /* U+0414 */ {0x00,0x00,0x1E,0x36,0x36,0x36,0x36,0x36,0x36,0x36,0x7F,0x63,0x63,0x00,0x00,0x00},
+    /* U+0415 */ {0x00,0x00,0x7E,0x60,0x60,0x60,0x7C,0x60,0x60,0x60,0x60,0x7E,0x00,0x00,0x00,0x00},
+    /* U+0416 */ {0x00,0x00,0x63,0x6B,0x6B,0x3E,0x1C,0x3E,0x6B,0x6B,0x6B,0x63,0x00,0x00,0x00,0x00},
+    /* U+0417 */ {0x00,0x00,0x3C,0x66,0x06,0x06,0x1C,0x06,0x06,0x06,0x66,0x3C,0x00,0x00,0x00,0x00},
+    /* U+0418 */ {0x00,0x00,0x66,0x66,0x66,0x6E,0x7E,0x76,0x66,0x66,0x66,0x66,0x00,0x00,0x00,0x00},
+    /* U+0419 */ {0x00,0x18,0x00,0x66,0x66,0x6E,0x7E,0x76,0x66,0x66,0x66,0x66,0x00,0x00,0x00,0x00},
+    /* U+041A */ {0x00,0x00,0x66,0x66,0x6C,0x78,0x70,0x78,0x6C,0x66,0x66,0x66,0x00,0x00,0x00,0x00},
+    /* U+041B */ {0x00,0x00,0x1E,0x36,0x36,0x36,0x36,0x36,0x36,0x36,0x66,0xC6,0x00,0x00,0x00,0x00},
+    /* U+041C */ {0x00,0x00,0xC3,0xE7,0xFF,0xFF,0xDB,0xC3,0xC3,0xC3,0xC3,0xC3,0x00,0x00,0x00,0x00},
+    /* U+041D */ {0x00,0x00,0x66,0x66,0x66,0x66,0x7E,0x66,0x66,0x66,0x66,0x66,0x00,0x00,0x00,0x00},
+    /* U+041E */ {0x00,0x00,0x3C,0x66,0x66,0x66,0x66,0x66,0x66,0x66,0x66,0x3C,0x00,0x00,0x00,0x00},
+    /* U+041F */ {0x00,0x00,0x7E,0x66,0x66,0x66,0x66,0x66,0x66,0x66,0x66,0x66,0x00,0x00,0x00,0x00},
+    /* U+0420 */ {0x00,0x00,0x7C,0x66,0x66,0x66,0x7C,0x60,0x60,0x60,0x60,0x60,0x00,0x00,0x00,0x00},
+    /* U+0421 */ {0x00,0x00,0x3C,0x66,0x60,0x60,0x60,0x60,0x60,0x60,0x66,0x3C,0x00,0x00,0x00,0x00},
+    /* U+0422 */ {0x00,0x00,0x7E,0x18,0x18,0x18,0x18,0x18,0x18,0x18,0x18,0x18,0x00,0x00,0x00,0x00},
+    /* U+0423 */ {0x00,0x00,0x66,0x66,0x66,0x66,0x3C,0x18,0x18,0x30,0x60,0x60,0x00,0x00,0x00,0x00},
+    /* U+0424 */ {0x00,0x00,0x18,0x7E,0xDB,0xDB,0xDB,0xDB,0x7E,0x18,0x18,0x18,0x00,0x00,0x00,0x00},
+    /* U+0425 */ {0x00,0x00,0x66,0x66,0x3C,0x18,0x18,0x3C,0x66,0x66,0x66,0x66,0x00,0x00,0x00,0x00},
+    /* U+0426 */ {0x00,0x00,0x66,0x66,0x66,0x66,0x66,0x66,0x66,0x66,0x7F,0x03,0x03,0x00,0x00,0x00},
+    /* U+0427 */ {0x00,0x00,0x66,0x66,0x66,0x66,0x3E,0x06,0x06,0x06,0x06,0x06,0x00,0x00,0x00,0x00},
+    /* U+0428 */ {0x00,0x00,0xDB,0xDB,0xDB,0xDB,0xDB,0xDB,0xDB,0xDB,0xDB,0xFF,0x00,0x00,0x00,0x00},
+    /* U+0429 */ {0x00,0x00,0xDB,0xDB,0xDB,0xDB,0xDB,0xDB,0xDB,0xDB,0xFF,0x03,0x03,0x00,0x00,0x00},
+    /* U+042A */ {0x00,0x00,0xF0,0x30,0x30,0x30,0x3C,0x36,0x36,0x36,0x36,0x3C,0x00,0x00,0x00,0x00},
+    /* U+042B */ {0x00,0x00,0xC6,0xC6,0xC6,0xC6,0xF6,0xCE,0xCE,0xCE,0xCE,0xF6,0x00,0x00,0x00,0x00},
+    /* U+042C */ {0x00,0x00,0x60,0x60,0x60,0x60,0x7C,0x66,0x66,0x66,0x66,0x7C,0x00,0x00,0x00,0x00},
+    /* U+042D */ {0x00,0x00,0x3C,0x66,0x06,0x06,0x3E,0x06,0x06,0x06,0x66,0x3C,0x00,0x00,0x00,0x00},
+    /* U+042E */ {0x00,0x00,0xCE,0xDB,0xDB,0xDB,0xFB,0xDB,0xDB,0xDB,0xDB,0xCE,0x00,0x00,0x00,0x00},
+    /* U+042F */ {0x00,0x00,0x3E,0x66,0x66,0x66,0x3E,0x1E,0x36,0x66,0x66,0x66,0x00,0x00,0x00,0x00}
 };
 
 static const uint8_t s_cyr_lower[32][16] = {
-    /* а */ {0x00,0x00,0x00,0x00,0x00,0x3C,0x06,0x3E,0x66,0x66,0x66,0x3E,0x00,0x00,0x00,0x00},
-    /* б */ {0x00,0x00,0x0E,0x1C,0x60,0x7C,0x66,0x66,0x66,0x66,0x66,0x3C,0x00,0x00,0x00,0x00},
-    /* в */ {0x00,0x00,0x00,0x00,0x00,0x7C,0x66,0x7C,0x66,0x66,0x66,0x7C,0x00,0x00,0x00,0x00},
-    /* г */ {0x00,0x00,0x00,0x00,0x00,0x7E,0x60,0x60,0x60,0x60,0x60,0x60,0x00,0x00,0x00,0x00},
-    /* д */ {0x00,0x00,0x00,0x00,0x00,0x3E,0x36,0x36,0x36,0x36,0x7F,0x63,0x63,0x00,0x00,0x00},
-    /* е */ {0x00,0x00,0x00,0x00,0x00,0x3C,0x66,0x7E,0x60,0x60,0x66,0x3C,0x00,0x00,0x00,0x00},
-    /* ж */ {0x00,0x00,0x00,0x00,0x00,0xDB,0x5A,0x3C,0x3C,0x5A,0xDB,0xDB,0x00,0x00,0x00,0x00},
-    /* з */ {0x00,0x00,0x00,0x00,0x00,0x3C,0x66,0x1C,0x06,0x06,0x66,0x3C,0x00,0x00,0x00,0x00},
-    /* и */ {0x00,0x00,0x00,0x00,0x00,0x66,0x66,0x6E,0x7E,0x76,0x66,0x66,0x00,0x00,0x00,0x00},
-    /* й */ {0x00,0x00,0x18,0x00,0x00,0x66,0x66,0x6E,0x7E,0x76,0x66,0x66,0x00,0x00,0x00,0x00},
-    /* к */ {0x00,0x00,0x00,0x00,0x00,0x66,0x6C,0x78,0x78,0x6C,0x66,0x66,0x00,0x00,0x00,0x00},
-    /* л */ {0x00,0x00,0x00,0x00,0x00,0x3E,0x36,0x36,0x36,0x36,0x66,0xC6,0x00,0x00,0x00,0x00},
-    /* м */ {0x00,0x00,0x00,0x00,0x00,0xC3,0xE7,0xFF,0xDB,0xC3,0xC3,0xC3,0x00,0x00,0x00,0x00},
-    /* н */ {0x00,0x00,0x00,0x00,0x00,0x66,0x66,0x7E,0x66,0x66,0x66,0x66,0x00,0x00,0x00,0x00},
-    /* о */ {0x00,0x00,0x00,0x00,0x00,0x3C,0x66,0x66,0x66,0x66,0x66,0x3C,0x00,0x00,0x00,0x00},
-    /* п */ {0x00,0x00,0x00,0x00,0x00,0x7E,0x66,0x66,0x66,0x66,0x66,0x66,0x00,0x00,0x00,0x00},
-    /* р */ {0x00,0x00,0x00,0x00,0x00,0x7C,0x66,0x66,0x66,0x7C,0x60,0x60,0x60,0x00,0x00,0x00},
-    /* с */ {0x00,0x00,0x00,0x00,0x00,0x3C,0x66,0x60,0x60,0x60,0x66,0x3C,0x00,0x00,0x00,0x00},
-    /* т */ {0x00,0x00,0x00,0x00,0x00,0x7E,0x18,0x18,0x18,0x18,0x18,0x18,0x00,0x00,0x00,0x00},
-    /* у */ {0x00,0x00,0x00,0x00,0x00,0x66,0x66,0x66,0x66,0x3E,0x06,0x66,0x3C,0x00,0x00,0x00},
-    /* ф */ {0x00,0x00,0x00,0x18,0x00,0x3C,0x5A,0xDB,0xDB,0x5A,0x3C,0x18,0x18,0x00,0x00,0x00},
-    /* х */ {0x00,0x00,0x00,0x00,0x00,0x66,0x3C,0x18,0x18,0x3C,0x66,0x66,0x00,0x00,0x00,0x00},
-    /* ц */ {0x00,0x00,0x00,0x00,0x00,0x66,0x66,0x66,0x66,0x66,0x7F,0x03,0x03,0x00,0x00,0x00},
-    /* ч */ {0x00,0x00,0x00,0x00,0x00,0x66,0x66,0x66,0x3E,0x06,0x06,0x06,0x00,0x00,0x00,0x00},
-    /* ш */ {0x00,0x00,0x00,0x00,0x00,0xDB,0xDB,0xDB,0xDB,0xDB,0xDB,0xFF,0x00,0x00,0x00,0x00},
-    /* щ */ {0x00,0x00,0x00,0x00,0x00,0xDB,0xDB,0xDB,0xDB,0xDB,0xFF,0x03,0x03,0x00,0x00,0x00},
-    /* ъ */ {0x00,0x00,0x00,0x00,0x00,0xF0,0x30,0x3C,0x36,0x36,0x36,0x3C,0x00,0x00,0x00,0x00},
-    /* ы */ {0x00,0x00,0x00,0x00,0x00,0xC6,0xC6,0xF6,0xCE,0xCE,0xCE,0xF6,0x00,0x00,0x00,0x00},
-    /* ь */ {0x00,0x00,0x00,0x00,0x00,0x60,0x60,0x7C,0x66,0x66,0x66,0x7C,0x00,0x00,0x00,0x00},
-    /* э */ {0x00,0x00,0x00,0x00,0x00,0x3C,0x66,0x06,0x3E,0x06,0x66,0x3C,0x00,0x00,0x00,0x00},
-    /* ю */ {0x00,0x00,0x00,0x00,0x00,0xCE,0xDB,0xFB,0xDB,0xDB,0xDB,0xCE,0x00,0x00,0x00,0x00},
-    /* я */ {0x00,0x00,0x00,0x00,0x00,0x3E,0x66,0x3E,0x1E,0x36,0x66,0x66,0x00,0x00,0x00,0x00}
+    /* U+0430 */ {0x00,0x00,0x00,0x00,0x00,0x3C,0x06,0x3E,0x66,0x66,0x66,0x3E,0x00,0x00,0x00,0x00},
+    /* U+0431 */ {0x00,0x00,0x0E,0x1C,0x60,0x7C,0x66,0x66,0x66,0x66,0x66,0x3C,0x00,0x00,0x00,0x00},
+    /* U+0432 */ {0x00,0x00,0x00,0x00,0x00,0x7C,0x66,0x7C,0x66,0x66,0x66,0x7C,0x00,0x00,0x00,0x00},
+    /* U+0433 */ {0x00,0x00,0x00,0x00,0x00,0x7E,0x60,0x60,0x60,0x60,0x60,0x60,0x00,0x00,0x00,0x00},
+    /* U+0434 */ {0x00,0x00,0x00,0x00,0x00,0x3E,0x36,0x36,0x36,0x36,0x7F,0x63,0x63,0x00,0x00,0x00},
+    /* U+0435 */ {0x00,0x00,0x00,0x00,0x00,0x3C,0x66,0x7E,0x60,0x60,0x66,0x3C,0x00,0x00,0x00,0x00},
+    /* U+0436 */ {0x00,0x00,0x00,0x00,0x00,0xDB,0x5A,0x3C,0x3C,0x5A,0xDB,0xDB,0x00,0x00,0x00,0x00},
+    /* U+0437 */ {0x00,0x00,0x00,0x00,0x00,0x3C,0x66,0x1C,0x06,0x06,0x66,0x3C,0x00,0x00,0x00,0x00},
+    /* U+0438 */ {0x00,0x00,0x00,0x00,0x00,0x66,0x66,0x6E,0x7E,0x76,0x66,0x66,0x00,0x00,0x00,0x00},
+    /* U+0439 */ {0x00,0x00,0x18,0x00,0x00,0x66,0x66,0x6E,0x7E,0x76,0x66,0x66,0x00,0x00,0x00,0x00},
+    /* U+043A */ {0x00,0x00,0x00,0x00,0x00,0x66,0x6C,0x78,0x78,0x6C,0x66,0x66,0x00,0x00,0x00,0x00},
+    /* U+043B */ {0x00,0x00,0x00,0x00,0x00,0x3E,0x36,0x36,0x36,0x36,0x66,0xC6,0x00,0x00,0x00,0x00},
+    /* U+043C */ {0x00,0x00,0x00,0x00,0x00,0xC3,0xE7,0xFF,0xDB,0xC3,0xC3,0xC3,0x00,0x00,0x00,0x00},
+    /* U+043D */ {0x00,0x00,0x00,0x00,0x00,0x66,0x66,0x7E,0x66,0x66,0x66,0x66,0x00,0x00,0x00,0x00},
+    /* U+043E */ {0x00,0x00,0x00,0x00,0x00,0x3C,0x66,0x66,0x66,0x66,0x66,0x3C,0x00,0x00,0x00,0x00},
+    /* U+043F */ {0x00,0x00,0x00,0x00,0x00,0x7E,0x66,0x66,0x66,0x66,0x66,0x66,0x00,0x00,0x00,0x00},
+    /* U+0440 */ {0x00,0x00,0x00,0x00,0x00,0x7C,0x66,0x66,0x66,0x7C,0x60,0x60,0x60,0x00,0x00,0x00},
+    /* U+0441 */ {0x00,0x00,0x00,0x00,0x00,0x3C,0x66,0x60,0x60,0x60,0x66,0x3C,0x00,0x00,0x00,0x00},
+    /* U+0442 */ {0x00,0x00,0x00,0x00,0x00,0x7E,0x18,0x18,0x18,0x18,0x18,0x18,0x00,0x00,0x00,0x00},
+    /* U+0443 */ {0x00,0x00,0x00,0x00,0x00,0x66,0x66,0x66,0x66,0x3E,0x06,0x66,0x3C,0x00,0x00,0x00},
+    /* U+0444 */ {0x00,0x00,0x00,0x18,0x00,0x3C,0x5A,0xDB,0xDB,0x5A,0x3C,0x18,0x18,0x00,0x00,0x00},
+    /* U+0445 */ {0x00,0x00,0x00,0x00,0x00,0x66,0x3C,0x18,0x18,0x3C,0x66,0x66,0x00,0x00,0x00,0x00},
+    /* U+0446 */ {0x00,0x00,0x00,0x00,0x00,0x66,0x66,0x66,0x66,0x66,0x7F,0x03,0x03,0x00,0x00,0x00},
+    /* U+0447 */ {0x00,0x00,0x00,0x00,0x00,0x66,0x66,0x66,0x3E,0x06,0x06,0x06,0x00,0x00,0x00,0x00},
+    /* U+0448 */ {0x00,0x00,0x00,0x00,0x00,0xDB,0xDB,0xDB,0xDB,0xDB,0xDB,0xFF,0x00,0x00,0x00,0x00},
+    /* U+0449 */ {0x00,0x00,0x00,0x00,0x00,0xDB,0xDB,0xDB,0xDB,0xDB,0xFF,0x03,0x03,0x00,0x00,0x00},
+    /* U+044A */ {0x00,0x00,0x00,0x00,0x00,0xF0,0x30,0x3C,0x36,0x36,0x36,0x3C,0x00,0x00,0x00,0x00},
+    /* U+044B */ {0x00,0x00,0x00,0x00,0x00,0xC6,0xC6,0xF6,0xCE,0xCE,0xCE,0xF6,0x00,0x00,0x00,0x00},
+    /* U+044C */ {0x00,0x00,0x00,0x00,0x00,0x60,0x60,0x7C,0x66,0x66,0x66,0x7C,0x00,0x00,0x00,0x00},
+    /* U+044D */ {0x00,0x00,0x00,0x00,0x00,0x3C,0x66,0x06,0x3E,0x06,0x66,0x3C,0x00,0x00,0x00,0x00},
+    /* U+044E */ {0x00,0x00,0x00,0x00,0x00,0xCE,0xDB,0xFB,0xDB,0xDB,0xDB,0xCE,0x00,0x00,0x00,0x00},
+    /* U+044F */ {0x00,0x00,0x00,0x00,0x00,0x3E,0x66,0x3E,0x1E,0x36,0x66,0x66,0x00,0x00,0x00,0x00}
 };
 
 static const uint8_t s_cyr_yo_upper[16] = {0x00,0x24,0x00,0x7E,0x60,0x60,0x7C,0x60,0x60,0x60,0x60,0x7E,0x00,0x00,0x00,0x00};
@@ -770,6 +995,7 @@ static inline uint8_t lut_lookup_rgb(int r, int g, int b) {
 }
 
 static void quantize_rect(int x1, int y1, int x2, int y2, bool allow_dither) {
+    if (s_use_truecolor32) return;
     if (!s_fb32 || !s_fb8_base) return;
     int gw = s_gui_w;
     int gh = s_gui_h;
@@ -1313,9 +1539,9 @@ static void video_start_audio(void) {
 /* =========================================================================
  * Non-Blocking HTTP / HTTPS File Downloader Engine
  * ========================================================================= */
-static int parse_http_url(const char *url, bool *out_https, char *out_host, size_t hcap,
-                          int *out_port, char *out_path, size_t pcap) {
-    if (!url || !*url) return -1;
+static int parse_http_url_alloc(const char *url, bool *out_https, char **out_host,
+                                int *out_port, char **out_path) {
+    if (!url || !*url || !out_https || !out_host || !out_port || !out_path) return -1;
     const char *p = url;
     if (strncmp(p, "https://", 8) == 0) {
         *out_https = true;
@@ -1337,15 +1563,22 @@ static int parse_http_url(const char *url, bool *out_https, char *out_host, size
         const int max_tcp_port = (int)((1u << (sizeof(uint16_t) * 8u)) - 1u);
         if (parsed_port > 0 && parsed_port <= max_tcp_port) *out_port = parsed_port;
     }
-    if (host_len == 0 || host_len >= hcap) return -1;
-    memcpy(out_host, p, host_len);
-    out_host[host_len] = '\0';
-    if (slash && *slash) {
-        snprintf(out_path, pcap, "%s", slash);
-    } else {
-        snprintf(out_path, pcap, "/");
-    }
+    if (host_len == 0) return -1;
+    if (!gui_set_strn(out_host, p, host_len)) return -1;
+    if (!gui_set_str(out_path, (slash && *slash) ? slash : "/")) return -1;
     return 0;
+}
+
+static bool dl_append_hdr_bytes(dl_slot_t *dl, const uint8_t *data, size_t len) {
+    if (!dl) return false;
+    if (len == 0) return true;
+    if (dl->hdr_len > SIZE_MAX - len - 1u) return false;
+    size_t need = dl->hdr_len + len + 1u;
+    if (!gui_dyn_ensure(&dl->hdr_buf, &dl->hdr_cap, need)) return false;
+    memcpy(dl->hdr_buf + dl->hdr_len, data, len);
+    dl->hdr_len += len;
+    dl->hdr_buf[dl->hdr_len] = '\0';
+    return true;
 }
 
 static int dl_hex_val(char c) {
@@ -1353,17 +1586,6 @@ static int dl_hex_val(char c) {
     if (c >= 'a' && c <= 'f') return c - 'a' + 10;
     if (c >= 'A' && c <= 'F') return c - 'A' + 10;
     return -1;
-}
-
-static void dl_slot_free_paths(dl_slot_t *dl) {
-    if (dl->filename) {
-        free(dl->filename);
-        dl->filename = NULL;
-    }
-    if (dl->dest) {
-        free(dl->dest);
-        dl->dest = NULL;
-    }
 }
 
 static char *derive_download_filename_alloc(const char *url) {
@@ -1473,19 +1695,21 @@ static void dl_slot_feed(dl_slot_t *dl, const uint8_t *data, size_t len) {
             case 0:
                 if (c == '\r') dl->chunk_state = 1;
                 else if (c == '\n') {
-                    dl->chunk_line[dl->chunk_line_len] = '\0';
-                    dl->chunk_rem = (size_t)strtoul(dl->chunk_line, NULL, 16);
+                    if (dl->chunk_line) dl->chunk_line[dl->chunk_line_len] = '\0';
+                    dl->chunk_rem = dl->chunk_line ? (size_t)strtoul(dl->chunk_line, NULL, 16) : 0u;
                     dl->chunk_line_len = 0;
                     dl->chunk_state = (dl->chunk_rem == 0) ? 5 : 2;
-                } else if (c != ';' && dl->chunk_line_len + 1 < sizeof(dl->chunk_line)) {
-                    dl->chunk_line[dl->chunk_line_len++] = (char)c;
+                } else if (c != ';') {
+                    if (gui_dyn_ensure(&dl->chunk_line, &dl->chunk_line_cap, dl->chunk_line_len + 2u)) {
+                        dl->chunk_line[dl->chunk_line_len++] = (char)c;
+                    }
                 }
                 i++;
                 break;
             case 1:
                 if (c == '\n') {
-                    dl->chunk_line[dl->chunk_line_len] = '\0';
-                    dl->chunk_rem = (size_t)strtoul(dl->chunk_line, NULL, 16);
+                    if (dl->chunk_line) dl->chunk_line[dl->chunk_line_len] = '\0';
+                    dl->chunk_rem = dl->chunk_line ? (size_t)strtoul(dl->chunk_line, NULL, 16) : 0u;
                     dl->chunk_line_len = 0;
                     dl->chunk_state = (dl->chunk_rem == 0) ? 5 : 2;
                 }
@@ -1521,24 +1745,33 @@ static void dl_slot_feed(dl_slot_t *dl, const uint8_t *data, size_t len) {
 
 static bool dl_begin_request(dl_slot_t *dl, const char *target_url) {
     dl_slot_close_conn(dl);
-    snprintf(dl->cur_url, sizeof(dl->cur_url), "%s", target_url);
-    if (parse_http_url(dl->cur_url, &dl->is_https, dl->host, sizeof(dl->host),
-                       &dl->port, dl->path, sizeof(dl->path)) != 0) {
-        snprintf(dl->err_msg, sizeof(dl->err_msg), "Invalid URL");
+    if (!gui_set_str(&dl->cur_url, target_url)) {
+        gui_set_str(&dl->err_msg, "Out of memory");
+        dl->state = DL_ERROR;
+        return false;
+    }
+    if (!dl_slot_record_url(dl, gui_str(dl->cur_url))) {
+        gui_set_str(&dl->err_msg, "Out of memory");
+        dl->state = DL_ERROR;
+        return false;
+    }
+    if (parse_http_url_alloc(gui_str(dl->cur_url), &dl->is_https, &dl->host,
+                             &dl->port, &dl->path) != 0) {
+        gui_set_str(&dl->err_msg, "Invalid URL");
         dl->state = DL_ERROR;
         return false;
     }
 
-    struct hostent *he = gethostbyname(dl->host);
+    struct hostent *he = gethostbyname(gui_str(dl->host));
     if (!he || !he->h_addr_list || !he->h_addr_list[0]) {
-        snprintf(dl->err_msg, sizeof(dl->err_msg), "DNS failed");
+        gui_set_str(&dl->err_msg, "DNS failed");
         dl->state = DL_ERROR;
         return false;
     }
 
     dl->sock = socket(AF_INET, SOCK_STREAM, 0);
     if (dl->sock < 0) {
-        snprintf(dl->err_msg, sizeof(dl->err_msg), "Socket error");
+        gui_set_str(&dl->err_msg, "Socket error");
         dl->state = DL_ERROR;
         return false;
     }
@@ -1551,7 +1784,7 @@ static bool dl_begin_request(dl_slot_t *dl, const char *target_url) {
 
     if (connect(dl->sock, (struct sockaddr *)&sin, sizeof(sin)) < 0) {
         dl_slot_close_conn(dl);
-        snprintf(dl->err_msg, sizeof(dl->err_msg), "Connect failed");
+        gui_set_str(&dl->err_msg, "Connect failed");
         dl->state = DL_ERROR;
         return false;
     }
@@ -1560,6 +1793,7 @@ static bool dl_begin_request(dl_slot_t *dl, const char *target_url) {
     if (fl >= 0) fcntl(dl->sock, F_SETFL, fl | O_NONBLOCK);
 
     dl->hdr_len = 0;
+    if (dl->hdr_buf) dl->hdr_buf[0] = '\0';
     dl->headers_done = false;
     dl->status_code = 0;
     dl->chunked = false;
@@ -1572,29 +1806,34 @@ static bool dl_begin_request(dl_slot_t *dl, const char *target_url) {
         dl->ctx = SSL_CTX_new(TLS_client_method());
         if (!dl->ctx) {
             dl_slot_close_conn(dl);
-            snprintf(dl->err_msg, sizeof(dl->err_msg), "SSL ctx failed");
+            gui_set_str(&dl->err_msg, "SSL ctx failed");
             dl->state = DL_ERROR;
             return false;
         }
         dl->ssl = SSL_new(dl->ctx);
         if (!dl->ssl) {
             dl_slot_close_conn(dl);
-            snprintf(dl->err_msg, sizeof(dl->err_msg), "SSL new failed");
+            gui_set_str(&dl->err_msg, "SSL new failed");
             dl->state = DL_ERROR;
             return false;
         }
         SSL_set_fd(dl->ssl, dl->sock);
-        SSL_set_tlsext_host_name(dl->ssl, dl->host);
+        SSL_set_tlsext_host_name(dl->ssl, gui_str(dl->host));
         dl->state = DL_TLS_HANDSHAKE;
     } else {
-        char req[1024];
-        int req_len = snprintf(req, sizeof(req),
-                               "GET %s HTTP/1.1\r\nHost: %s\r\n"
-                               "User-Agent: Mozilla/5.0 (IPO_OS; Links/2.22)\r\n"
-                               "Accept: */*\r\nAccept-Encoding: identity\r\n"
-                               "Connection: close\r\n\r\n",
-                               dl->path, dl->host);
-        send(dl->sock, req, (size_t)req_len, 0);
+        char *req = gui_fmt_alloc("GET %s HTTP/1.1\r\nHost: %s\r\n"
+                                  "User-Agent: Mozilla/5.0 (IPO_OS; Links/2.22)\r\n"
+                                  "Accept: */*\r\nAccept-Encoding: identity\r\n"
+                                  "Connection: close\r\n\r\n",
+                                  gui_str(dl->path), gui_str(dl->host));
+        if (!req) {
+            dl_slot_close_conn(dl);
+            gui_set_str(&dl->err_msg, "Out of memory");
+            dl->state = DL_ERROR;
+            return false;
+        }
+        send(dl->sock, req, strlen(req), 0);
+        free(req);
         dl->state = DL_READING;
     }
     return true;
@@ -1602,40 +1841,49 @@ static bool dl_begin_request(dl_slot_t *dl, const char *target_url) {
 
 static void gui_start_download(const char *raw_url) {
     if (!raw_url || !*raw_url) return;
-    char norm_url[2048];
-    if (strncmp(raw_url, "http://", 7) != 0 && strncmp(raw_url, "https://", 8) != 0) {
-        snprintf(norm_url, sizeof(norm_url), "https://%s", raw_url);
-    } else {
-        snprintf(norm_url, sizeof(norm_url), "%s", raw_url);
-    }
+    char *norm_url = (strncmp(raw_url, "http://", 7) != 0 && strncmp(raw_url, "https://", 8) != 0)
+                     ? gui_fmt_alloc("https://%s", raw_url)
+                     : gui_fmt_alloc("%s", raw_url);
+    if (!norm_url) return;
 
     int slot = -1;
-    for (int i = 0; i < MAX_DL_SLOTS; i++) {
+    for (int i = 0; i < s_dls_cap; i++) {
         if (!s_dls[i].used) { slot = i; break; }
     }
     if (slot < 0) {
-        /* Reuse oldest finished slot */
-        for (int i = 0; i < MAX_DL_SLOTS; i++) {
-            if (s_dls[i].state == DL_DONE || s_dls[i].state == DL_ERROR) {
-                dl_slot_close_conn(&s_dls[i]);
-                slot = i;
-                break;
-            }
+        int new_cap = s_dls_cap ? (s_dls_cap * 2) : 8;
+        if (new_cap <= s_dls_cap || (size_t)new_cap > SIZE_MAX / sizeof(dl_slot_t)) {
+            free(norm_url);
+            return;
         }
+        dl_slot_t *nd = (dl_slot_t *)realloc(s_dls, (size_t)new_cap * sizeof(dl_slot_t));
+        if (!nd) {
+            free(norm_url);
+            return;
+        }
+        memset(nd + s_dls_cap, 0, (size_t)(new_cap - s_dls_cap) * sizeof(dl_slot_t));
+        slot = s_dls_cap;
+        s_dls = nd;
+        s_dls_cap = new_cap;
     }
-    if (slot < 0) slot = 0;
 
     dl_slot_t *dl = &s_dls[slot];
     dl_slot_close_conn(dl);
-    dl_slot_free_paths(dl);
+    dl_slot_free_strings(dl);
     memset(dl, 0, sizeof(*dl));
     dl->used = true;
     dl->sock = -1;
     dl->fd = -1;
     dl->start_ms = gui_millis();
-    snprintf(dl->url, sizeof(dl->url), "%s", norm_url);
+    if (!gui_set_str(&dl->url, norm_url)) {
+        free(norm_url);
+        dl->used = false;
+        return;
+    }
     dl->filename = derive_download_filename_alloc(norm_url);
+    free(norm_url);
     if (!dl->filename) {
+        dl_slot_free_strings(dl);
         dl->used = false;
         return;
     }
@@ -1643,7 +1891,7 @@ static void gui_start_download(const char *raw_url) {
     size_t flen = strlen(dl->filename);
     dl->dest = (char *)malloc(6u + flen + 1u);
     if (!dl->dest) {
-        dl_slot_free_paths(dl);
+        dl_slot_free_strings(dl);
         dl->used = false;
         return;
     }
@@ -1654,37 +1902,42 @@ static void gui_start_download(const char *raw_url) {
     s_overlay = OVL_DOWNLOADS;
     s_dirty_chrome = true;
     s_dirty_overlay = true;
-    snprintf(s_status_msg, sizeof(s_status_msg), "Downloading -> %s", dl->dest);
+    gui_set_fmt(&s_status_msg, "Downloading -> %s", dl->dest);
 }
 
 static void dl_tick_all(void) {
     bool changed = false;
-    for (int i = 0; i < MAX_DL_SLOTS; i++) {
+    for (int i = 0; i < s_dls_cap; i++) {
         dl_slot_t *dl = &s_dls[i];
         if (!dl->used) continue;
         if (dl->state == DL_CONNECTING) {
-            dl_begin_request(dl, dl->url);
+            dl_begin_request(dl, gui_str(dl->url));
             changed = true;
             continue;
         }
         if (dl->state == DL_TLS_HANDSHAKE) {
             int hs = SSL_connect(dl->ssl);
             if (hs == 1) {
-                char req[1024];
-                int req_len = snprintf(req, sizeof(req),
-                                       "GET %s HTTP/1.1\r\nHost: %s\r\n"
-                                       "User-Agent: Mozilla/5.0 (IPO_OS; Links/2.22)\r\n"
-                                       "Accept: */*\r\nAccept-Encoding: identity\r\n"
-                                       "Connection: close\r\n\r\n",
-                                       dl->path, dl->host);
-                SSL_write(dl->ssl, req, req_len);
-                dl->state = DL_READING;
+                char *req = gui_fmt_alloc("GET %s HTTP/1.1\r\nHost: %s\r\n"
+                                          "User-Agent: Mozilla/5.0 (IPO_OS; Links/2.22)\r\n"
+                                          "Accept: */*\r\nAccept-Encoding: identity\r\n"
+                                          "Connection: close\r\n\r\n",
+                                          gui_str(dl->path), gui_str(dl->host));
+                if (!req) {
+                    dl_slot_close_conn(dl);
+                    gui_set_str(&dl->err_msg, "Out of memory");
+                    dl->state = DL_ERROR;
+                } else {
+                    SSL_write(dl->ssl, req, (int)strlen(req));
+                    free(req);
+                    dl->state = DL_READING;
+                }
                 changed = true;
             } else {
                 int err = SSL_get_error(dl->ssl, hs);
                 if (err != SSL_ERROR_WANT_READ && err != SSL_ERROR_WANT_WRITE) {
                     dl_slot_close_conn(dl);
-                    snprintf(dl->err_msg, sizeof(dl->err_msg), "TLS error");
+                    gui_set_str(&dl->err_msg, "TLS error");
                     dl->state = DL_ERROR;
                     changed = true;
                 }
@@ -1705,7 +1958,7 @@ static void dl_tick_all(void) {
                         if (dl->headers_done && dl->downloaded_bytes > 0) {
                             dl->state = DL_DONE;
                         } else {
-                            snprintf(dl->err_msg, sizeof(dl->err_msg), "Read error");
+                            gui_set_str(&dl->err_msg, "Read error");
                             dl->state = DL_ERROR;
                         }
                         changed = true;
@@ -1720,7 +1973,7 @@ static void dl_tick_all(void) {
                         if (dl->headers_done && dl->downloaded_bytes > 0) {
                             dl->state = DL_DONE;
                         } else {
-                            snprintf(dl->err_msg, sizeof(dl->err_msg), "Recv error");
+                            gui_set_str(&dl->err_msg, "Recv error");
                             dl->state = DL_ERROR;
                         }
                         changed = true;
@@ -1733,11 +1986,11 @@ static void dl_tick_all(void) {
                     dl->end_ms = gui_millis();
                     if (dl->headers_done) {
                         dl->state = DL_DONE;
-                        snprintf(s_status_msg, sizeof(s_status_msg),
-                                 "Saved %s (%lu bytes)",
-                                 dl->dest ? dl->dest : "", (unsigned long)dl->downloaded_bytes);
+                        gui_set_fmt(&s_status_msg,
+                                    "Saved %s (%lu bytes)",
+                                    gui_str(dl->dest), (unsigned long)dl->downloaded_bytes);
                     } else {
-                        snprintf(dl->err_msg, sizeof(dl->err_msg), "Empty response");
+                        gui_set_str(&dl->err_msg, "Empty response");
                         dl->state = DL_ERROR;
                     }
                     changed = true;
@@ -1745,48 +1998,45 @@ static void dl_tick_all(void) {
                 }
                 changed = true;
                 if (!dl->headers_done) {
-                    size_t avail = sizeof(dl->hdr_buf) - 1 - dl->hdr_len;
-                    size_t cpy = (size_t)r < avail ? (size_t)r : avail;
-                    if (cpy > 0) {
-                        memcpy(dl->hdr_buf + dl->hdr_len, buf, cpy);
-                        dl->hdr_len += cpy;
-                        dl->hdr_buf[dl->hdr_len] = '\0';
+                    if (!dl_append_hdr_bytes(dl, buf, (size_t)r)) {
+                        dl_slot_close_conn(dl);
+                        gui_set_str(&dl->err_msg, "Out of memory");
+                        dl->state = DL_ERROR;
+                        break;
                     }
-                    char *sep = strstr(dl->hdr_buf, "\r\n\r\n");
+                    char *sep = dl->hdr_buf ? strstr(dl->hdr_buf, "\r\n\r\n") : NULL;
                     if (sep) {
                         *sep = '\0';
                         dl->headers_done = true;
                         const char *sp = strchr(dl->hdr_buf, ' ');
                         dl->status_code = sp ? atoi(sp + 1) : 200;
-                        if ((dl->status_code == 301 || dl->status_code == 302 ||
-                             dl->status_code == 303 || dl->status_code == 307 ||
-                             dl->status_code == 308) && dl->redirects < 5) {
+                        if (dl->status_code == 301 || dl->status_code == 302 ||
+                            dl->status_code == 303 || dl->status_code == 307 ||
+                            dl->status_code == 308) {
                             const char *loc = ci_strstr_local(dl->hdr_buf, "\nLocation:");
                             if (loc) {
                                 loc = strchr(loc, ':') + 1;
                                 while (*loc == ' ' || *loc == '\t') loc++;
                                 const char *eol = strpbrk(loc, "\r\n");
                                 size_t ll = eol ? (size_t)(eol - loc) : strlen(loc);
-                                char next_url[2048];
-                                next_url[0] = '\0';
-                                if (ll > 0 && ll < sizeof(next_url)) {
-                                    if (strncmp(loc, "http://", 7) == 0 || strncmp(loc, "https://", 8) == 0) {
-                                        memcpy(next_url, loc, ll);
-                                        next_url[ll] = '\0';
+                                char *next_url = NULL;
+                                if (ll > 0) {
+                                    if ((ll >= 7 && strncmp(loc, "http://", 7) == 0) ||
+                                        (ll >= 8 && strncmp(loc, "https://", 8) == 0)) {
+                                        gui_set_strn(&next_url, loc, ll);
                                     } else if (loc[0] == '/') {
-                                        char tmp[1536];
-                                        if (ll >= sizeof(tmp)) ll = sizeof(tmp) - 1;
-                                        memcpy(tmp, loc, ll);
-                                        tmp[ll] = '\0';
-                                        snprintf(next_url, sizeof(next_url), "%s://%s%s",
-                                                 dl->is_https ? "https" : "http", dl->host, tmp);
+                                        next_url = gui_fmt_alloc("%s://%s%.*s",
+                                                                 dl->is_https ? "https" : "http",
+                                                                 gui_str(dl->host), (int)ll, loc);
                                     }
                                 }
-                                if (next_url[0]) {
+                                if (next_url && next_url[0] && !dl_slot_seen_url(dl, next_url)) {
                                     dl->redirects++;
                                     dl_begin_request(dl, next_url);
+                                    free(next_url);
                                     break;
                                 }
+                                free(next_url);
                             }
                         }
 
@@ -1801,16 +2051,13 @@ static void dl_tick_all(void) {
                         dl->fd = dl->dest ? open(dl->dest, O_WRONLY | O_CREAT | O_TRUNC, 0644) : -1;
                         if (dl->fd < 0) {
                             dl_slot_close_conn(dl);
-                            snprintf(dl->err_msg, sizeof(dl->err_msg), "File create failed");
+                            gui_set_str(&dl->err_msg, "File create failed");
                             dl->state = DL_ERROR;
                             break;
                         }
                         size_t consumed = (size_t)((sep + 4) - dl->hdr_buf);
                         if (dl->hdr_len > consumed) {
                             dl_slot_feed(dl, (const uint8_t *)(sep + 4), dl->hdr_len - consumed);
-                        }
-                        if ((size_t)r > cpy) {
-                            dl_slot_feed(dl, buf + cpy, (size_t)r - cpy);
                         }
                     }
                 } else {
@@ -1822,9 +2069,9 @@ static void dl_tick_all(void) {
                     dl_slot_close_conn(dl);
                     dl->end_ms = gui_millis();
                     dl->state = DL_DONE;
-                    snprintf(s_status_msg, sizeof(s_status_msg),
-                             "Saved %s (%lu bytes)",
-                             dl->dest ? dl->dest : "", (unsigned long)dl->downloaded_bytes);
+                    gui_set_fmt(&s_status_msg,
+                                "Saved %s (%lu bytes)",
+                                gui_str(dl->dest), (unsigned long)dl->downloaded_bytes);
                     changed = true;
                     break;
                 }
@@ -1843,65 +2090,85 @@ static void dl_tick_all(void) {
 static void record_history_visit(const char *url, const char *title) {
     if (!url || !*url || strcmp(url, "about:home") == 0 || strcmp(url, "links://home") == 0) return;
     /* Update existing entry if already at top of history */
-    if (s_history_count > 0 && strcmp(s_history[s_history_count - 1].url, url) == 0) {
+    if (s_history_count > 0 && s_history[s_history_count - 1].url &&
+        strcmp(s_history[s_history_count - 1].url, url) == 0) {
         if (title && *title) {
-            snprintf(s_history[s_history_count - 1].title, sizeof(s_history[s_history_count - 1].title), "%s", title);
+            gui_set_str(&s_history[s_history_count - 1].title, title);
         }
         s_history[s_history_count - 1].visit_ms = gui_millis();
         return;
     }
     if (s_history_count >= s_history_cap) {
         int new_cap = (s_history_cap > 0) ? (s_history_cap * 2) : 16;
+        if (new_cap <= s_history_cap || (size_t)new_cap > SIZE_MAX / sizeof(ipo_hist_entry_t)) return;
         ipo_hist_entry_t *nh = (ipo_hist_entry_t *)realloc(s_history, (size_t)new_cap * sizeof(ipo_hist_entry_t));
         if (!nh) return;
+        memset(nh + s_history_cap, 0, (size_t)(new_cap - s_history_cap) * sizeof(ipo_hist_entry_t));
         s_history = nh;
         s_history_cap = new_cap;
     }
-    ipo_hist_entry_t *e = &s_history[s_history_count++];
-    snprintf(e->url, sizeof(e->url), "%s", url);
-    snprintf(e->title, sizeof(e->title), "%s", (title && *title) ? title : url);
+    ipo_hist_entry_t *e = &s_history[s_history_count];
+    e->url = NULL;
+    e->title = NULL;
+    if (!gui_set_str(&e->url, url) ||
+        !gui_set_str(&e->title, (title && *title) ? title : url)) {
+        free(e->url);
+        free(e->title);
+        e->url = NULL;
+        e->title = NULL;
+        return;
+    }
     e->visit_ms = gui_millis();
+    s_history_count++;
 }
 
 static void rebuild_omnibox_autocomplete(void) {
-    s_ac_count = 0;
-    const char *q = s_omnibox_text;
+    ac_clear_items();
+    const char *q = gui_str(s_omnibox_text);
     while (*q == ' ') q++;
     if (!*q) {
         s_ac_sel = -1;
         return;
     }
     /* 1. Match bookmarks */
-    for (int i = 0; i < s_bookmark_count && s_ac_count < 4; i++) {
-        if (ci_strstr_local(s_bookmarks[i].label, q) || ci_strstr_local(s_bookmarks[i].url, q)) {
+    for (int i = 0; i < s_bookmark_count; i++) {
+        if (ci_strstr_local(gui_str(s_bookmarks[i].label), q) ||
+            ci_strstr_local(gui_str(s_bookmarks[i].url), q)) {
+            if (!ac_ensure_cap(s_ac_count + 1)) break;
             ipo_ac_item_t *it = &s_ac_items[s_ac_count++];
-            snprintf(it->label, sizeof(it->label), "%s", s_bookmarks[i].label);
-            snprintf(it->url, sizeof(it->url), "%s", s_bookmarks[i].url);
+            gui_set_str(&it->label, gui_str(s_bookmarks[i].label));
+            gui_set_str(&it->url, gui_str(s_bookmarks[i].url));
             it->is_bookmark = true;
             it->is_search = false;
         }
     }
     /* 2. Match recent history */
-    for (int i = s_history_count - 1; i >= 0 && s_ac_count < 4; i--) {
-        if (ci_strstr_local(s_history[i].title, q) || ci_strstr_local(s_history[i].url, q)) {
+    for (int i = s_history_count - 1; i >= 0; i--) {
+        if (ci_strstr_local(gui_str(s_history[i].title), q) ||
+            ci_strstr_local(gui_str(s_history[i].url), q)) {
             bool dup = false;
             for (int k = 0; k < s_ac_count; k++) {
-                if (strcmp(s_ac_items[k].url, s_history[i].url) == 0) { dup = true; break; }
+                if (s_ac_items[k].url && s_history[i].url &&
+                    strcmp(s_ac_items[k].url, s_history[i].url) == 0) {
+                    dup = true;
+                    break;
+                }
             }
             if (!dup) {
+                if (!ac_ensure_cap(s_ac_count + 1)) break;
                 ipo_ac_item_t *it = &s_ac_items[s_ac_count++];
-                snprintf(it->label, sizeof(it->label), "%s", s_history[i].title);
-                snprintf(it->url, sizeof(it->url), "%s", s_history[i].url);
+                gui_set_str(&it->label, gui_str(s_history[i].title));
+                gui_set_str(&it->url, gui_str(s_history[i].url));
                 it->is_bookmark = false;
                 it->is_search = false;
             }
         }
     }
     /* 3. Always offer Google Search or direct URL as final option */
-    if (s_ac_count < 5) {
+    if (ac_ensure_cap(s_ac_count + 1)) {
         ipo_ac_item_t *it = &s_ac_items[s_ac_count++];
-        snprintf(it->label, sizeof(it->label), "Search Google for \"%.42s\"", q);
-        snprintf(it->url, sizeof(it->url), "%s", q);
+        gui_set_fmt(&it->label, "Search Google for \"%s\"", q);
+        gui_set_str(&it->url, q);
         it->is_bookmark = false;
         it->is_search = true;
     }
@@ -1942,7 +2209,7 @@ static void stop_tab_loading(int idx) {
     if (dev->keyboard_handler) {
         dev->keyboard_handler(dev, KBD_CTRL_C, 0);
     }
-    snprintf(s_status_msg, sizeof(s_status_msg), "Stopped loading");
+    gui_set_str(&s_status_msg, "Stopped loading");
     s_dirty_chrome = true;
 }
 
@@ -1977,7 +2244,7 @@ static void apply_zoom_delta(int delta_pct) {
     if (s_zoom_pct > 200) s_zoom_pct = 200;
 
     sync_default_font_size(true);
-    snprintf(s_status_msg, sizeof(s_status_msg), "Page Zoom: %d%% (%dpx)", s_zoom_pct, dds.font_size);
+    gui_set_fmt(&s_status_msg, "Page Zoom: %d%% (%dpx)", s_zoom_pct, dds.font_size);
     s_dirty_vp = true;
     s_dirty_chrome = true;
     if (s_overlay != OVL_NONE) s_dirty_overlay = true;
@@ -1985,8 +2252,7 @@ static void apply_zoom_delta(int delta_pct) {
 
 static void set_omnibox_str(const char *str) {
     if (!str) str = "";
-    snprintf(s_omnibox_text, sizeof(s_omnibox_text), "%s", str);
-    s_omnibox_len = (int)strlen(s_omnibox_text);
+    gui_dyn_set(&s_omnibox_text, &s_omnibox_cap, &s_omnibox_len, str);
     s_omnibox_cursor = 0;
     s_omnibox_scroll = 0;
     s_omnibox_sel_all = false;
@@ -2008,21 +2274,37 @@ static void init_default_bookmarks(void) {
         { "Example",   "https://example.com",              COL_ACCENT_GREEN, 'E' },
         { "YT Player", "https://www.youtube.com/watch?v=YE7VzlLtp-4",         COL_ACCENT_PURP,  '>' }
     };
+    for (int i = 0; i < s_bookmark_count; i++) {
+        free(s_bookmarks[i].label);
+        free(s_bookmarks[i].url);
+        s_bookmarks[i].label = NULL;
+        s_bookmarks[i].url = NULL;
+    }
     s_bookmark_count = 0;
-    for (int i = 0; i < (int)(sizeof(defs) / sizeof(defs[0])) && s_bookmark_count < MAX_BOOKMARKS; i++) {
-        ipo_bookmark_t *bm = &s_bookmarks[s_bookmark_count++];
-        snprintf(bm->label, sizeof(bm->label), "%s", defs[i].label);
-        snprintf(bm->url, sizeof(bm->url), "%s", defs[i].url);
+    for (int i = 0; i < (int)(sizeof(defs) / sizeof(defs[0])); i++) {
+        if (!ensure_bookmark_cap(s_bookmark_count + 1)) break;
+        ipo_bookmark_t *bm = &s_bookmarks[s_bookmark_count];
+        bm->label = NULL;
+        bm->url = NULL;
+        if (!gui_set_str(&bm->label, defs[i].label) ||
+            !gui_set_str(&bm->url, defs[i].url)) {
+            free(bm->label);
+            free(bm->url);
+            bm->label = NULL;
+            bm->url = NULL;
+            break;
+        }
         bm->badge_color = defs[i].col;
         bm->badge_char = defs[i].ch;
         bm->custom = false;
+        s_bookmark_count++;
     }
 }
 
 static bool is_url_bookmarked(const char *url) {
     if (!url || !*url) return false;
     for (int i = 0; i < s_bookmark_count; i++) {
-        if (strcmp(s_bookmarks[i].url, url) == 0) return true;
+        if (s_bookmarks[i].url && strcmp(s_bookmarks[i].url, url) == 0) return true;
     }
     return false;
 }
@@ -2030,35 +2312,48 @@ static bool is_url_bookmarked(const char *url) {
 static void toggle_bookmark_current(void) {
     if (!s_tabs || s_active_tab < 0 || s_active_tab >= s_tabs_cap) return;
     ipo_tab_t *tab = &s_tabs[s_active_tab];
-    const char *url = tab->is_home ? "about:home" : (tab->is_video ? tab->video_url : tab->url);
+    const char *url = tab->is_home ? "about:home" : (tab->is_video ? gui_str(tab->video_url) : gui_str(tab->url));
     if (!url || !*url) return;
     for (int i = 0; i < s_bookmark_count; i++) {
-        if (strcmp(s_bookmarks[i].url, url) == 0) {
+        if (s_bookmarks[i].url && strcmp(s_bookmarks[i].url, url) == 0) {
             if (!s_bookmarks[i].custom) {
-                snprintf(s_status_msg, sizeof(s_status_msg), "Pinned bookmark: %s", s_bookmarks[i].label);
+                gui_set_fmt(&s_status_msg, "Pinned bookmark: %s", gui_str(s_bookmarks[i].label));
                 s_dirty_chrome = true;
                 return;
             }
+            free(s_bookmarks[i].label);
+            free(s_bookmarks[i].url);
             for (int j = i; j + 1 < s_bookmark_count; j++) s_bookmarks[j] = s_bookmarks[j + 1];
             s_bookmark_count--;
-            snprintf(s_status_msg, sizeof(s_status_msg), "Removed bookmark");
+            memset(&s_bookmarks[s_bookmark_count], 0, sizeof(s_bookmarks[s_bookmark_count]));
+            gui_set_str(&s_status_msg, "Removed bookmark");
             s_dirty_chrome = true;
             return;
         }
     }
-    if (s_bookmark_count >= MAX_BOOKMARKS) {
-        snprintf(s_status_msg, sizeof(s_status_msg), "Bookmark bar is full");
+    if (!ensure_bookmark_cap(s_bookmark_count + 1)) {
+        gui_set_str(&s_status_msg, "Out of memory");
         s_dirty_chrome = true;
         return;
     }
-    ipo_bookmark_t *bm = &s_bookmarks[s_bookmark_count++];
-    const char *lbl = tab->title[0] ? tab->title : url;
-    snprintf(bm->label, sizeof(bm->label), "%.14s", lbl);
-    snprintf(bm->url, sizeof(bm->url), "%s", url);
+    ipo_bookmark_t *bm = &s_bookmarks[s_bookmark_count];
+    bm->label = NULL;
+    bm->url = NULL;
+    const char *lbl = (tab->title && tab->title[0]) ? tab->title : url;
+    if (!gui_set_str(&bm->label, lbl) || !gui_set_str(&bm->url, url)) {
+        free(bm->label);
+        free(bm->url);
+        bm->label = NULL;
+        bm->url = NULL;
+        gui_set_str(&s_status_msg, "Out of memory");
+        s_dirty_chrome = true;
+        return;
+    }
     bm->badge_color = COL_ACCENT_GOLD;
-    bm->badge_char = (char)toupper((unsigned char)bm->label[0]);
+    bm->badge_char = (char)toupper((unsigned char)gui_str(bm->label)[0]);
     bm->custom = true;
-    snprintf(s_status_msg, sizeof(s_status_msg), "Bookmarked: %s", bm->label);
+    s_bookmark_count++;
+    gui_set_fmt(&s_status_msg, "Bookmarked: %s", gui_str(bm->label));
     s_dirty_chrome = true;
 }
 
@@ -2068,28 +2363,27 @@ static void sync_active_tab_meta(void) {
     if (!tab->used || !tab->dev || tab->is_home || tab->is_video) return;
     struct session *ses = dev_to_session(tab->dev);
     if (!ses) return;
-    unsigned char ubuf[2048];
-    ubuf[0] = '\0';
-    if (get_current_url(ses, ubuf, sizeof(ubuf)) && ubuf[0]) {
-        if (strcmp(tab->url, (const char *)ubuf) != 0) {
-            snprintf(tab->url, sizeof(tab->url), "%s", (const char *)ubuf);
-            if (s_focus != FOCUS_OMNIBOX) {
-                set_omnibox_str(tab->url);
-            }
-            record_history_visit(tab->url, tab->title);
-            s_dirty_chrome = true;
-        }
-    }
-    struct f_data_c *fd = current_frame(ses);
-    if (fd) {
-        unsigned char tbuf[96];
-        tbuf[0] = '\0';
-        if (get_current_title(fd, tbuf, sizeof(tbuf)) && tbuf[0]) {
-            if (strcmp(tab->title, (const char *)tbuf) != 0) {
-                snprintf(tab->title, sizeof(tab->title), "%s", (const char *)tbuf);
-                record_history_visit(tab->url, tab->title);
+    if (!list_empty(ses->history)) {
+        unsigned char *here = display_url(ses->term, cur_loc(ses)->url, 0);
+        if (here && here[0]) {
+            if (!tab->url || strcmp(tab->url, (const char *)here) != 0) {
+                gui_set_str(&tab->url, (const char *)here);
+                if (s_focus != FOCUS_OMNIBOX) {
+                    set_omnibox_str(gui_str(tab->url));
+                }
+                record_history_visit(gui_str(tab->url), gui_str(tab->title));
                 s_dirty_chrome = true;
             }
+        }
+        if (here) mem_free(here);
+    }
+    struct f_data_c *fd = current_frame(ses);
+    if (fd && fd->f_data && fd->f_data->title && fd->f_data->title[0]) {
+        const char *ctitle = (const char *)fd->f_data->title;
+        if (!tab->title || strcmp(tab->title, ctitle) != 0) {
+            gui_set_str(&tab->title, ctitle);
+            record_history_visit(gui_str(tab->url), gui_str(tab->title));
+            s_dirty_chrome = true;
         }
     }
 }
@@ -2113,15 +2407,16 @@ static void enter_video_in_tab(int idx, const char *url) {
     ipo_tab_t *tab = &s_tabs[idx];
     tab->is_home = false;
     tab->is_video = true;
-    snprintf(tab->video_url, sizeof(tab->video_url), "%s", (url && *url) ? url : "https://www.youtube.com/watch?v=YE7VzlLtp-4");
-    char vid[16];
-    if (yt_extract_video_id(tab->video_url, vid, sizeof(vid)) == 0) {
-        snprintf(tab->video_title, sizeof(tab->video_title), "YouTube [%s]", vid);
+    gui_set_str(&tab->video_url, (url && *url) ? url : "https://www.youtube.com/watch?v=YE7VzlLtp-4");
+    char *vid = yt_extract_video_id_alloc(gui_str(tab->video_url));
+    if (vid) {
+        gui_set_fmt(&tab->video_title, "YouTube [%s]", vid);
+        free(vid);
     } else {
-        snprintf(tab->video_title, sizeof(tab->video_title), "MP4 H.264 Stream Player");
+        gui_set_str(&tab->video_title, "MP4 H.264 Stream Player");
     }
-    snprintf(tab->title, sizeof(tab->title), "YT: Play");
-    record_history_visit(tab->video_url, tab->video_title);
+    gui_set_str(&tab->title, "YT: Play");
+    record_history_visit(gui_str(tab->video_url), gui_str(tab->video_title));
     s_vid_paused = false;
     s_vid_pos_ms = 0;
     s_vid_last_tick_ms = gui_millis();
@@ -2129,28 +2424,29 @@ static void enter_video_in_tab(int idx, const char *url) {
         video_start_audio();
         s_focus = FOCUS_VIEWPORT;
         s_overlay = OVL_NONE;
-        set_omnibox_str(tab->video_url);
-        snprintf(s_status_msg, sizeof(s_status_msg), "Opening %s (Space Play/Pause, Left/Right Seek)", tab->video_title);
+        set_omnibox_str(gui_str(tab->video_url));
+        gui_set_fmt(&s_status_msg, "Opening %s (Space Play/Pause, Left/Right Seek)", gui_str(tab->video_title));
     }
     s_dirty_vp = true;
     s_dirty_chrome = true;
 }
 
-static void normalize_omnibox_query(const char *raw, char *out, size_t cap) {
-    if (!raw) { out[0] = '\0'; return; }
+static char *normalize_omnibox_query_alloc(const char *raw) {
+    if (!raw) return gui_fmt_alloc("%s", "");
     while (*raw == ' ') raw++;
     size_t len = strlen(raw);
     while (len > 0 && raw[len - 1] == ' ') len--;
     if (len == 0) {
-        snprintf(out, cap, "about:home");
-        return;
+        return gui_fmt_alloc("about:home");
     }
-    if (strncmp(raw, "http://", 7) == 0 || strncmp(raw, "https://", 8) == 0 ||
-        strncmp(raw, "file://", 7) == 0 || strncmp(raw, "about:", 6) == 0 ||
-        strncmp(raw, "data:", 5) == 0 || strncasecmp(raw, "javascript:", 11) == 0 ||
-        strncmp(raw, "links://", 8) == 0) {
-        snprintf(out, cap, "%.*s", (int)len, raw);
-        return;
+    if ((len >= 7 && strncmp(raw, "http://", 7) == 0) ||
+        (len >= 8 && strncmp(raw, "https://", 8) == 0) ||
+        (len >= 7 && strncmp(raw, "file://", 7) == 0) ||
+        (len >= 6 && strncmp(raw, "about:", 6) == 0) ||
+        (len >= 5 && strncmp(raw, "data:", 5) == 0) ||
+        (len >= 11 && strncasecmp(raw, "javascript:", 11) == 0) ||
+        (len >= 8 && strncmp(raw, "links://", 8) == 0)) {
+        return gui_fmt_alloc("%.*s", (int)len, raw);
     }
     bool has_space = false, has_dot = false;
     for (size_t i = 0; i < len; i++) {
@@ -2158,13 +2454,14 @@ static void normalize_omnibox_query(const char *raw, char *out, size_t cap) {
         if (raw[i] == '.') has_dot = true;
     }
     if (!has_space && has_dot) {
-        snprintf(out, cap, "https://%.*s", (int)len, raw);
-        return;
+        return gui_fmt_alloc("https://%.*s", (int)len, raw);
     }
     /* URL-encode query for Google Search */
-    char enc[1536];
+    if (len > (SIZE_MAX - 1u) / 3u) return NULL;
+    char *enc = (char *)malloc(len * 3u + 1u);
+    if (!enc) return NULL;
     size_t ei = 0;
-    for (size_t i = 0; i < len && ei + 4 < sizeof(enc); i++) {
+    for (size_t i = 0; i < len; i++) {
         unsigned char c = (unsigned char)raw[i];
         if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
             enc[ei++] = (char)c;
@@ -2176,11 +2473,14 @@ static void normalize_omnibox_query(const char *raw, char *out, size_t cap) {
         }
     }
     enc[ei] = '\0';
-    snprintf(out, cap, "https://www.google.com/search?q=%s", enc);
+    char *res = gui_fmt_alloc("https://www.google.com/search?q=%s", enc);
+    free(enc);
+    return res;
 }
 
 static void navigate_tab_to(int idx, const char *raw_input) {
     if (!s_tabs || idx < 0 || idx >= s_tabs_cap || !s_tabs[idx].used) return;
+    if (!raw_input) raw_input = "";
     ipo_tab_t *tab = &s_tabs[idx];
     while (*raw_input == ' ') raw_input++;
 
@@ -2189,19 +2489,24 @@ static void navigate_tab_to(int idx, const char *raw_input) {
         return;
     }
 
-    char url[2048];
-    normalize_omnibox_query(raw_input, url, sizeof(url));
+    char *url = normalize_omnibox_query_alloc(raw_input);
+    if (!url) {
+        gui_set_str(&s_status_msg, "Out of memory");
+        s_dirty_chrome = true;
+        return;
+    }
 
     if (strcmp(url, "about:home") == 0 || strcmp(url, "links://home") == 0) {
+        free(url);
         if (tab->is_video) video_stop_audio();
         tab->is_home = true;
         tab->is_video = false;
-        tab->url[0] = '\0';
-        snprintf(tab->title, sizeof(tab->title), "New Tab");
+        gui_set_str(&tab->url, "");
+        gui_set_str(&tab->title, "New Tab");
         if (idx == s_active_tab) {
             s_overlay = OVL_NONE;
             set_omnibox_str("");
-            snprintf(s_status_msg, sizeof(s_status_msg), "Start Page");
+            gui_set_str(&s_status_msg, "Start Page");
         }
         s_dirty_vp = true;
         s_dirty_chrome = true;
@@ -2212,26 +2517,28 @@ static void navigate_tab_to(int idx, const char *raw_input) {
         if (idx == s_active_tab) {
             s_focus = FOCUS_VIEWPORT;
             s_overlay = OVL_NONE;
-            set_omnibox_str(tab->is_home ? "" : tab->url);
-            snprintf(s_status_msg, sizeof(s_status_msg), "Executing JavaScript...");
+            set_omnibox_str(tab->is_home ? "" : gui_str(tab->url));
+            gui_set_str(&s_status_msg, "Executing JavaScript...");
             s_dirty_chrome = true;
         }
         struct session *ses = dev_to_session(tab->dev);
         if (ses) {
             goto_url_utf8(ses, (unsigned char *)url);
         }
+        free(url);
         return;
     }
 
     if (yt_classify_url(url) == YT_URL_VIDEO) {
         enter_video_in_tab(idx, url);
+        free(url);
         return;
     }
 
     if (tab->is_video) video_stop_audio();
     tab->is_home = false;
     tab->is_video = false;
-    snprintf(tab->url, sizeof(tab->url), "%s", url);
+    gui_set_str(&tab->url, url);
 
     /* Extract short host title while loading */
     const char *hp = strstr(url, "://");
@@ -2239,18 +2546,16 @@ static void navigate_tab_to(int idx, const char *raw_input) {
     if (strncmp(hp, "www.", 4) == 0) hp += 4;
     const char *sl = strchr(hp, '/');
     size_t hl = sl ? (size_t)(sl - hp) : strlen(hp);
-    if (hl >= sizeof(tab->title)) hl = sizeof(tab->title) - 1;
-    memcpy(tab->title, hp, hl);
-    tab->title[hl] = '\0';
-    if (!tab->title[0]) snprintf(tab->title, sizeof(tab->title), "Loading...");
+    if (hl > 0) gui_set_strn(&tab->title, hp, hl);
+    else gui_set_str(&tab->title, "Loading...");
 
-    record_history_visit(url, tab->title);
+    record_history_visit(url, gui_str(tab->title));
 
     if (idx == s_active_tab) {
         s_focus = FOCUS_VIEWPORT;
         s_overlay = OVL_NONE;
         set_omnibox_str(url);
-        snprintf(s_status_msg, sizeof(s_status_msg), "Connecting to %s...", tab->title);
+        gui_set_fmt(&s_status_msg, "Connecting to %s...", gui_str(tab->title));
     }
 
     /* Clear viewport cleanly before Links paints new page */
@@ -2263,21 +2568,22 @@ static void navigate_tab_to(int idx, const char *raw_input) {
     if (ses) {
         goto_url_utf8(ses, (unsigned char *)url);
     }
+    free(url);
 }
 
 static void open_new_tab(const char *url) {
     if (ensure_tab_slot() < 0) {
-        snprintf(s_status_msg, sizeof(s_status_msg), "Out of memory for new tab");
+        gui_set_str(&s_status_msg, "Out of memory for new tab");
         s_dirty_chrome = true;
         return;
     }
-    snprintf(s_pending_tab_url, sizeof(s_pending_tab_url), "%s", (url && *url) ? url : "");
+    gui_set_str(&s_pending_tab_url, (url && *url) ? url : "");
     int len = 0;
     void *info = create_session_info(-1, (unsigned char *)"", (unsigned char *)"", &len);
     unsigned char *cwd = get_cwd();
     if (!cwd) cwd = stracpy((unsigned char *)"");
     if (attach_g_terminal(cwd, info, len) < 0) {
-        s_pending_tab_url[0] = '\0';
+        gui_set_str(&s_pending_tab_url, "");
     }
     mem_free(cwd);
 }
@@ -2311,13 +2617,13 @@ static void switch_to_tab(int idx) {
     s_overlay = OVL_NONE;
     if (tab->is_home) {
         set_omnibox_str("");
-        snprintf(s_status_msg, sizeof(s_status_msg), "Start Page");
+        gui_set_str(&s_status_msg, "Start Page");
     } else if (tab->is_video) {
-        set_omnibox_str(tab->video_url);
+        set_omnibox_str(gui_str(tab->video_url));
         video_start_audio();
         s_vid_last_tick_ms = gui_millis();
     } else {
-        set_omnibox_str(tab->url);
+        set_omnibox_str(gui_str(tab->url));
     }
     trigger_tab_redraw(idx);
 }
@@ -2338,12 +2644,12 @@ static void toggle_fullscreen(void) {
         if (dev->resize_handler) dev->resize_handler(dev);
     }
     trigger_tab_redraw(s_active_tab);
-    snprintf(s_status_msg, sizeof(s_status_msg), s_fullscreen ? "Fullscreen (Press F11 to exit)" : "Windowed Mode");
+    gui_set_str(&s_status_msg, s_fullscreen ? "Fullscreen (Press F11 to exit)" : "Windowed Mode");
 }
 
 static void execute_find(bool backwards) {
     ipo_tab_t *tab = &s_tabs[s_active_tab];
-    if (!tab->used || tab->is_home || tab->is_video || !s_find_text[0]) return;
+    if (!tab->used || tab->is_home || tab->is_video || !s_find_text || !s_find_text[0]) return;
     struct session *ses = dev_to_session(tab->dev);
     if (!ses) return;
     struct f_data_c *f = current_frame(ses);
@@ -2354,7 +2660,7 @@ static void execute_find(bool backwards) {
     if (backwards) find_next_back(ses, f, 0);
     else find_next(ses, f, 0);
     s_dirty_vp = true;
-    snprintf(s_status_msg, sizeof(s_status_msg), "Search: \"%s\"", s_find_text);
+    gui_set_fmt(&s_status_msg, "Search: \"%s\"", s_find_text);
 }
 
 /* =========================================================================
@@ -2748,7 +3054,6 @@ static void compute_overlay_rect(overlay_kind_t kind, int *rx, int *ry, int *rw,
         *rw = (w >= 428) ? 412 : (w - 8);
         *rx = w - *rw - 4;
         int max_items = (avail - hdr) / row_h;
-        if (max_items > 7) max_items = 7;
         if (max_items < 1) max_items = 1;
         *ry = top_start;
         *rh = hdr + max_items * row_h;
@@ -2761,7 +3066,6 @@ static void compute_overlay_rect(overlay_kind_t kind, int *rx, int *ry, int *rw,
         int btn_area = ui_is_compact_font() ? 20 : ((avail < 140) ? 30 : 42);
         int row_h = ui_is_compact_font() ? 26 : 48;
         int max_slots = (avail - hdr_h - btn_area - 4) / row_h;
-        if (max_slots > 4) max_slots = 4;
         if (max_slots < 0) max_slots = 0;
         *ry = top_start;
         *rh = hdr_h + 4 + (max_slots > 0 ? max_slots : 1) * row_h + btn_area;
@@ -3108,7 +3412,7 @@ static void draw_video_player_viewport(ipo_tab_t *tab) {
     compute_video_layout(vx, vy, vw, vh, &V);
 
     mp4_player_t *mp = s_mp4_player;
-    const char *vtitle = (mp && mp4_player_title(mp)[0]) ? mp4_player_title(mp) : tab->video_title;
+    const char *vtitle = (mp && mp4_player_title(mp)[0]) ? mp4_player_title(mp) : gui_str(tab->video_title);
     uint32_t dur_ms = mp ? mp4_player_duration_ms(mp) : 60000u;
     if (dur_ms == 0) dur_ms = 60000u;
     uint32_t cur_ms = (!s_vid_dragging_seek && mp) ? mp4_player_pos_ms(mp) : s_vid_pos_ms;
@@ -3158,9 +3462,7 @@ static void draw_video_player_viewport(ipo_tab_t *tab) {
             for (int y = 0; y < vid_h; y++) {
                 const uint32_t *srow = fpix + y * fw;
                 uint32_t *drow = s_fb32 + (vid_y + y) * IPO_GUI_W + vid_x;
-                for (int x = 0; x < vid_w; x++) {
-                    drow[x] = (srow[x] & 0x00FFFFFFu) | IPO_PX_DITHER;
-                }
+                memcpy(drow, srow, (size_t)vid_w * sizeof(uint32_t));
             }
         } else {
             for (int y = 0; y < vid_h; y++) {
@@ -3184,22 +3486,24 @@ static void draw_video_player_viewport(ipo_tab_t *tab) {
     }
 
     if (!V.compact) {
-        char codec_lbl[40];
-        if (sw > 0 && sh > 0) snprintf(codec_lbl, sizeof(codec_lbl), "%dp H.264", sh);
-        else snprintf(codec_lbl, sizeof(codec_lbl), "H.264 MP4");
+        char *codec_lbl = (sw > 0 && sh > 0)
+                          ? gui_fmt_alloc("%dp H.264", sh)
+                          : gui_fmt_alloc("H.264 MP4");
 
         int badge_ty = vid_y + 8 + (20 - ui_char_h()) / 2;
         fill_rrect32(vid_x + 10, vid_y + 8, 128, 20, 5, 0x111827u);
         fill_circle32(vid_x + 21, vid_y + 18, 4, s_vid_paused ? COL_ACCENT_GOLD : COL_ACCENT_RED);
-        draw_text_clip32(vid_x + 30, badge_ty, s_vid_paused ? "PAUSED" : codec_lbl, COL_TEXT_MAIN, 102, 1);
+        draw_text_clip32(vid_x + 30, badge_ty, s_vid_paused ? "PAUSED" : gui_str(codec_lbl), COL_TEXT_MAIN, 102, 1);
+        free(codec_lbl);
 
-        char aud_lbl[40];
-        if (s_vid_muted) snprintf(aud_lbl, sizeof(aud_lbl), "Audio: MUTE");
-        else if (mp && mp4_player_has_audio(mp)) snprintf(aud_lbl, sizeof(aud_lbl), "AAC %dHz SB16", mp4_player_audio_rate(mp));
-        else snprintf(aud_lbl, sizeof(aud_lbl), "SB16 Audio");
+        char *aud_lbl = s_vid_muted ? gui_fmt_alloc("Audio: MUTE")
+                      : ((mp && mp4_player_has_audio(mp))
+                         ? gui_fmt_alloc("AAC %dHz SB16", mp4_player_audio_rate(mp))
+                         : gui_fmt_alloc("SB16 Audio"));
         fill_rrect32(vid_x + vid_w - 154, vid_y + 8, 144, 20, 5, 0x111827u);
-        draw_text_clip32(vid_x + vid_w - 146, badge_ty, aud_lbl,
+        draw_text_clip32(vid_x + vid_w - 146, badge_ty, gui_str(aud_lbl),
                          s_vid_muted ? COL_ACCENT_GOLD : COL_ACCENT_GREEN, 132, 1);
+        free(aud_lbl);
     }
 
     if (s_vid_paused) {
@@ -3263,15 +3567,17 @@ static void draw_video_player_viewport(ipo_tab_t *tab) {
     }
 
     /* Time display */
-    char tstr[40];
     unsigned cur_s = cur_ms / 1000u;
     unsigned tot_s = dur_ms / 1000u;
-    snprintf(tstr, sizeof(tstr), V.compact ? "%02u:%02u" : "%02u:%02u / %02u:%02u",
-             cur_s / 60u, cur_s % 60u, tot_s / 60u, tot_s % 60u);
+    char *tstr = V.compact
+                 ? gui_fmt_alloc("%02u:%02u", cur_s / 60u, cur_s % 60u)
+                 : gui_fmt_alloc("%02u:%02u / %02u:%02u",
+                                 cur_s / 60u, cur_s % 60u, tot_s / 60u, tot_s % 60u);
     int time_x = V.compact ? (V.mute_x + V.mute_w + 6) : (V.vid_x + 320);
-    if (time_x + 40 < V.full_x) {
+    if (tstr && time_x + 40 < V.full_x) {
         draw_text_clip32(time_x, ty, tstr, COL_TEXT_SUB, V.full_x - time_x - 4, 1);
     }
+    free(tstr);
 
     /* Fullscreen button on right */
     fill_rrect32(V.full_x, by, V.full_w, V.btn_h, 4, (s_hover_id == 815) ? COL_BTN_HOVER : COL_OMNIBOX_BG);
@@ -3400,7 +3706,7 @@ static void draw_chrome(void) {
         int txt_x = tx + (TL.compact ? 11 : 20);
         int txt_y = TL.tab_y + (TL.tab_h - ui_ch) / 2;
         if (txt_y < 0) txt_y = 0;
-        draw_text_ellipsis32(txt_x, txt_y, s_tabs[i].title[0] ? s_tabs[i].title : "Tab",
+        draw_text_ellipsis32(txt_x, txt_y, (s_tabs[i].title && s_tabs[i].title[0]) ? s_tabs[i].title : "Tab",
                              act ? COL_TEXT_MAIN : COL_TEXT_SUB, TL.tw - (TL.compact ? 22 : 42));
 
         if (s_hover_id == 2000 + i) {
@@ -3475,7 +3781,7 @@ static void draw_chrome(void) {
                    (s_focus == FOCUS_OMNIBOX) ? COL_ACCENT_BLUE : COL_OMNIBOX_BD);
 
     ipo_tab_t *tab = &s_tabs[s_active_tab];
-    bool is_https = (!tab->is_home && strncmp(s_omnibox_text, "https://", 8) == 0);
+    bool is_https = (!tab->is_home && strncmp(gui_str(s_omnibox_text), "https://", 8) == 0);
     bool is_vid = tab->is_video;
 
     /* Clickable Security / Site Info Badge (hit = 208) */
@@ -3500,7 +3806,7 @@ static void draw_chrome(void) {
 
     int otxt_x, otxt_w, otxt_y;
     compute_omnibox_text_rect(&BL, &otxt_x, &otxt_w, &otxt_y);
-    draw_text_scrolled32(otxt_x, otxt_y, s_omnibox_text, s_omnibox_len,
+    draw_text_scrolled32(otxt_x, otxt_y, gui_str(s_omnibox_text), s_omnibox_len,
                          s_omnibox_cursor, &s_omnibox_scroll,
                          s_focus == FOCUS_OMNIBOX, s_omnibox_sel_all,
                          COL_TEXT_MAIN, COL_TEXT_DIM,
@@ -3508,7 +3814,7 @@ static void draw_chrome(void) {
                          otxt_w, oy + 1, oh - 2);
 
     /* Bookmark Star inside Omnibox */
-    const char *cur_u = tab->is_home ? "about:home" : (tab->is_video ? tab->video_url : tab->url);
+    const char *cur_u = tab->is_home ? "about:home" : (tab->is_video ? gui_str(tab->video_url) : gui_str(tab->url));
     bool starred = is_url_bookmarked(cur_u);
     int star_x = ox + ow - BL.star_w - (BL.compact ? 2 : 3);
     fill_rrect32(star_x, badge_y, BL.star_w, badge_h, 3,
@@ -3518,7 +3824,7 @@ static void draw_chrome(void) {
     /* Right Toolbar Action Buttons */
     int btn_ty = oy + (oh - ui_ch) / 2;
     int dl_active = 0, dl_any = 0;
-    for (int i = 0; i < MAX_DL_SLOTS; i++) {
+    for (int i = 0; i < s_dls_cap; i++) {
         if (s_dls[i].used) {
             dl_any++;
             if (s_dls[i].state != DL_DONE && s_dls[i].state != DL_ERROR) dl_active++;
@@ -3584,11 +3890,12 @@ static void draw_chrome(void) {
 
         int bmx = 8;
         for (int i = 0; i < s_bookmark_count; i++) {
-            int lw = ui_text_w(s_bookmarks[i].label) + 24;
+            const char *blbl = gui_str(s_bookmarks[i].label);
+            int lw = ui_text_w(blbl) + 24;
             if (bmx + lw > IPO_GUI_W - 8) break;
             fill_rrect32(bmx, bmy + 2, lw, bm_h - 4, 4, (s_hover_id == 300 + i) ? COL_BTN_HOVER : COL_BOOKMARK_BG);
             fill_circle32(bmx + 9, bmy + bm_h / 2, 4, s_bookmarks[i].badge_color);
-            draw_text_clip32(bmx + 18, bmy + (bm_h - ui_ch) / 2, s_bookmarks[i].label, COL_TEXT_SUB, lw - 20, 1);
+            draw_text_clip32(bmx + 18, bmy + (bm_h - ui_ch) / 2, blbl, COL_TEXT_SUB, lw - 20, 1);
             bmx += lw + 4;
         }
     }
@@ -3613,9 +3920,9 @@ static void draw_chrome(void) {
     fill_rect32(0, sby, IPO_GUI_W, SL.sbh, COL_STATUSBAR_BG);
     fill_rect32(0, sby, IPO_GUI_W, 1, COL_BORDER);
 
-    const char *stat_txt = s_status_msg;
+    const char *stat_txt = (s_status_msg && s_status_msg[0]) ? s_status_msg : "Ready";
     uint32_t stat_col = COL_TEXT_SUB;
-    char link_preview[256];
+    char *link_preview = NULL;
     if (!tab->is_home && !tab->is_video && tab->dev) {
         struct session *ses = dev_to_session(tab->dev);
         struct f_data_c *fd = ses ? current_frame(ses) : NULL;
@@ -3623,9 +3930,11 @@ static void draw_chrome(void) {
             fd->vs->current_link >= 0 && fd->vs->current_link < fd->f_data->nlinks) {
             struct link *lnk = &fd->f_data->links[fd->vs->current_link];
             if (lnk->where && lnk->where[0]) {
-                snprintf(link_preview, sizeof(link_preview), "Link: %s", (const char *)lnk->where);
-                stat_txt = link_preview;
-                stat_col = COL_ACCENT_CYAN;
+                link_preview = gui_fmt_alloc("Link: %s", (const char *)lnk->where);
+                if (link_preview) {
+                    stat_txt = link_preview;
+                    stat_col = COL_ACCENT_CYAN;
+                }
             }
         }
     }
@@ -3633,6 +3942,7 @@ static void draw_chrome(void) {
     int st_x = SL.compact ? 4 : 8;
     int st_y = sby + (SL.sbh - ui_ch) / 2;
     draw_text_ellipsis32(st_x, st_y, stat_txt, stat_col, SL.zx - st_x - 6);
+    free(link_preview);
 
     int zby = sby + (SL.compact ? 1 : 2);
     int zbh = SL.sbh - (SL.compact ? 2 : 4);
@@ -3640,22 +3950,24 @@ static void draw_chrome(void) {
     fill_rrect32(SL.zx, zby, SL.btn_w, zbh, 3, (s_hover_id == 410) ? COL_BTN_HOVER : COL_CARD_BG);
     draw_glyph32(SL.zx + (SL.btn_w - ui_glyph_adv('-')) / 2, zty, '-', COL_TEXT_MAIN, 1);
 
-    char zbuf[16];
-    snprintf(zbuf, sizeof(zbuf), "%d%%", s_zoom_pct);
+    char *zbuf = gui_fmt_alloc("%d%%", s_zoom_pct);
     fill_rrect32(SL.pct_x, zby, SL.pct_w, zbh, 3, (s_hover_id == 411) ? COL_BTN_HOVER : COL_OMNIBOX_BG);
-    {
+    if (zbuf) {
         int ztw = ui_text_w(zbuf);
         draw_text_clip32(SL.pct_x + (SL.pct_w - ztw) / 2, zty, zbuf, s_zoom_pct == 100 ? COL_TEXT_SUB : COL_ACCENT_CYAN, SL.pct_w - 4, 1);
+        free(zbuf);
     }
 
     fill_rrect32(SL.plus_x, zby, SL.btn_w, zbh, 3, (s_hover_id == 412) ? COL_BTN_HOVER : COL_CARD_BG);
     draw_glyph32(SL.plus_x + (SL.btn_w - ui_glyph_adv('+')) / 2, zty, '+', COL_TEXT_MAIN, 1);
 
     if (SL.show_hint) {
-        char right_stat[64];
-        snprintf(right_stat, sizeof(right_stat), "Tabs:%d | Ctrl+H Hist | F11", n_tabs);
-        int rsw = ui_text_w(right_stat);
-        draw_text_clip32(IPO_GUI_W - rsw - 8, zty, right_stat, COL_TEXT_DIM, rsw, 1);
+        char *right_stat = gui_fmt_alloc("Tabs:%d | Ctrl+H Hist | F11", n_tabs);
+        if (right_stat) {
+            int rsw = ui_text_w(right_stat);
+            draw_text_clip32(IPO_GUI_W - rsw - 8, zty, right_stat, COL_TEXT_DIM, rsw, 1);
+            free(right_stat);
+        }
     }
 }
 
@@ -3675,18 +3987,20 @@ static void draw_overlay(void) {
             if (ty_off < 1) ty_off = 1;
             for (int i = 0; i < vis_count; i++) {
                 int iy = ay + 3 + i * row_h;
-                bool sel = (i == s_ac_sel) || (s_hover_id == 450 + i);
+                bool sel = (i == s_ac_sel) || (s_hover_id == 0x100000 + i);
                 if (sel) fill_rrect32(ax + 4, iy, aw - 8, row_h - 2, 4, COL_CARD_HOVER);
                 uint32_t bcol = s_ac_items[i].is_bookmark ? COL_ACCENT_GOLD :
                                 (s_ac_items[i].is_search ? COL_ACCENT_BLUE : COL_ACCENT_CYAN);
                 fill_circle32(ax + (compact_ui ? 10 : 15), iy + row_h / 2, compact_ui ? 2 : 4, bcol);
                 int tx0 = ax + (compact_ui ? 18 : 26);
+                const char *albl = gui_str(s_ac_items[i].label);
+                const char *aurl = gui_str(s_ac_items[i].url);
                 if (!s_ac_items[i].is_search && aw >= 340) {
                     int lw = (aw >= 460) ? 210 : (aw / 2 - 24);
-                    draw_text_ellipsis32(tx0, iy + ty_off, s_ac_items[i].label, COL_TEXT_MAIN, lw);
-                    draw_text_ellipsis32(tx0 + lw + 8, iy + ty_off, s_ac_items[i].url, COL_TEXT_DIM, aw - (tx0 - ax) - lw - 14);
+                    draw_text_ellipsis32(tx0, iy + ty_off, albl, COL_TEXT_MAIN, lw);
+                    draw_text_ellipsis32(tx0 + lw + 8, iy + ty_off, aurl, COL_TEXT_DIM, aw - (tx0 - ax) - lw - 14);
                 } else {
-                    draw_text_ellipsis32(tx0, iy + ty_off, s_ac_items[i].label, COL_TEXT_MAIN, aw - (tx0 - ax) - 6);
+                    draw_text_ellipsis32(tx0, iy + ty_off, albl, COL_TEXT_MAIN, aw - (tx0 - ax) - 6);
                 }
             }
         }
@@ -3706,7 +4020,7 @@ static void draw_overlay(void) {
         stroke_rrect32(fx, fy, fw, fh, compact_ui ? 5 : 8, COL_ACCENT_BLUE);
         fill_rrect32(in_x, btn_y, in_w, btn_h, 4, COL_OMNIBOX_BG);
         stroke_rrect32(in_x, btn_y, in_w, btn_h, 4, COL_OMNIBOX_BD);
-        draw_text_scrolled32(in_x + 5, ty, s_find_text, s_find_len,
+        draw_text_scrolled32(in_x + 5, ty, gui_str(s_find_text), s_find_len,
                              s_find_cursor, &s_find_scroll,
                              s_focus == FOCUS_FIND, s_find_sel_all,
                              COL_TEXT_MAIN, COL_TEXT_DIM, "Find in page...",
@@ -3727,11 +4041,13 @@ static void draw_overlay(void) {
         draw_text_clip32(M.mx + (M.compact ? 8 : 14), M.z_y + (M.z_h - ui_ch) / 2, "Zoom", COL_TEXT_SUB, 48, 1);
         fill_rrect32(M.minus_x, M.z_y, M.minus_w, M.z_h, 4, (s_hover_id == 720) ? COL_BTN_HOVER : COL_CARD_BG);
         draw_glyph32(M.minus_x + (M.minus_w - ui_glyph_adv('-')) / 2, M.z_y + (M.z_h - ui_ch) / 2, '-', COL_TEXT_MAIN, 1);
-        char zstr[16];
-        snprintf(zstr, sizeof(zstr), "%d%%", s_zoom_pct);
+        char *zstr = gui_fmt_alloc("%d%%", s_zoom_pct);
         fill_rrect32(M.pct_x, M.z_y, M.pct_w, M.z_h, 4, (s_hover_id == 721) ? COL_BTN_HOVER : COL_OMNIBOX_BG);
-        draw_text_clip32(M.pct_x + (M.pct_w - ui_text_w(zstr)) / 2, M.z_y + (M.z_h - ui_ch) / 2,
-                         zstr, COL_ACCENT_CYAN, M.pct_w - 4, 1);
+        if (zstr) {
+            draw_text_clip32(M.pct_x + (M.pct_w - ui_text_w(zstr)) / 2, M.z_y + (M.z_h - ui_ch) / 2,
+                             zstr, COL_ACCENT_CYAN, M.pct_w - 4, 1);
+            free(zstr);
+        }
         fill_rrect32(M.plus_x, M.z_y, M.plus_w, M.z_h, 4, (s_hover_id == 722) ? COL_BTN_HOVER : COL_CARD_BG);
         draw_glyph32(M.plus_x + (M.plus_w - ui_glyph_adv('+')) / 2, M.z_y + (M.z_h - ui_ch) / 2, '+', COL_TEXT_MAIN, 1);
         fill_rect32(M.mx + 8, M.sep_y, M.mw - 16, 1, COL_BORDER);
@@ -3784,7 +4100,7 @@ static void draw_overlay(void) {
         stroke_rrect32(sx, sy, sw, sh, compact_ui ? 6 : 10, COL_ACCENT_BLUE);
 
         ipo_tab_t *tab = &s_tabs[s_active_tab];
-        const char *u = tab->is_home ? "about:home" : (tab->is_video ? tab->video_url : tab->url);
+        const char *u = tab->is_home ? "about:home" : (tab->is_video ? gui_str(tab->video_url) : gui_str(tab->url));
         bool https = (!tab->is_home && strncmp(u, "https://", 8) == 0);
         uint32_t badge_c = https ? COL_ACCENT_GREEN : (tab->is_home ? COL_ACCENT_CYAN : COL_ACCENT_GOLD);
         const char *sec_title = https ? "Connection is Secure (HTTPS / TLS)" :
@@ -3803,7 +4119,7 @@ static void draw_overlay(void) {
         int y0 = sy + hdr_h + (compact_ui ? 4 : 6);
         int line_h = compact_ui ? 12 : ((sh >= 168) ? 22 : 16);
         if (y0 + ui_ch <= sy + sh - 4) {
-            draw_text_ellipsis32(sx + 10, y0, tab->title[0] ? tab->title : "Untitled", COL_TEXT_MAIN, sw - 20);
+            draw_text_ellipsis32(sx + 10, y0, (tab->title && tab->title[0]) ? tab->title : "Untitled", COL_TEXT_MAIN, sw - 20);
         }
         if (y0 + line_h + ui_ch <= sy + sh - 4) {
             draw_text_ellipsis32(sx + 10, y0 + line_h, u[0] ? u : "about:home", COL_ACCENT_CYAN, sw - 20);
@@ -3817,16 +4133,17 @@ static void draw_overlay(void) {
             n_imgs  = fd->f_data->n_images;
             doc_y   = fd->f_data->y;
         }
-        char meta1[80], meta2[80];
-        snprintf(meta1, sizeof(meta1), "Links: %d  |  Images: %d  |  Height: %dpx", n_links, n_imgs, doc_y);
-        snprintf(meta2, sizeof(meta2), "Encoding: UTF-8  |  Page Zoom: %d%%", s_zoom_pct);
+        char *meta1 = gui_fmt_alloc("Links: %d  |  Images: %d  |  Height: %dpx", n_links, n_imgs, doc_y);
+        char *meta2 = gui_fmt_alloc("Encoding: UTF-8  |  Page Zoom: %d%%", s_zoom_pct);
         int m_off = compact_ui ? (line_h * 2 + 2) : ((sh >= 168) ? 56 : (line_h * 2));
-        if (y0 + m_off + ui_ch <= sy + sh - 4) {
+        if (meta1 && y0 + m_off + ui_ch <= sy + sh - 4) {
             draw_text_clip32(sx + 10, y0 + m_off, meta1, COL_TEXT_SUB, sw - 20, 1);
         }
-        if (y0 + m_off + line_h + ui_ch <= sy + sh - 4) {
+        if (meta2 && y0 + m_off + line_h + ui_ch <= sy + sh - 4) {
             draw_text_clip32(sx + 10, y0 + m_off + line_h, meta2, COL_TEXT_SUB, sw - 20, 1);
         }
+        free(meta1);
+        free(meta2);
         if (!compact_ui && sh >= 168) {
             draw_text_clip32(sx + 14, sy + 152, "Verified by Links OpenSSL 1.1 TLS Stack", COL_TEXT_DIM, sw - 28, 1);
         } else if (y0 + m_off + line_h * 2 + ui_ch <= sy + sh - 4) {
@@ -3865,11 +4182,11 @@ static void draw_overlay(void) {
             int card_h = row_step - (compact_ui ? 2 : 3);
             for (int i = s_history_count - 1; i >= 0 && shown < max_items; i--, shown++) {
                 int iy = list_y + shown * row_step;
-                bool hov = (s_hover_id == 550 + shown);
+                bool hov = (s_hover_id == 0x200000 + shown);
                 fill_rrect32(hx + 8, iy, hw - 16, card_h, 4, hov ? COL_CARD_HOVER : COL_CARD_BG);
                 stroke_rrect32(hx + 8, iy, hw - 16, card_h, 4, hov ? COL_ACCENT_BLUE : COL_CARD_BD);
-                draw_text_ellipsis32(hx + 14, iy + (compact_ui ? 2 : 2), s_history[i].title, COL_TEXT_MAIN, hw - 28);
-                draw_text_ellipsis32(hx + 14, iy + (compact_ui ? 11 : 16), s_history[i].url, COL_ACCENT_CYAN, hw - 28);
+                draw_text_ellipsis32(hx + 14, iy + (compact_ui ? 2 : 2), gui_str(s_history[i].title), COL_TEXT_MAIN, hw - 28);
+                draw_text_ellipsis32(hx + 14, iy + (compact_ui ? 11 : 16), gui_str(s_history[i].url), COL_ACCENT_CYAN, hw - 28);
             }
         }
     } else if (s_overlay == OVL_CONTEXT) {
@@ -3938,28 +4255,30 @@ static void draw_overlay(void) {
         int card_h = compact_ui ? 24 : 46;
         int prog_h = compact_ui ? 5 : 8;
         int prog_off = compact_ui ? 16 : 30;
-        for (int i = MAX_DL_SLOTS - 1; i >= 0 && shown < max_slots; i--) {
+        for (int i = s_dls_cap - 1; i >= 0 && shown < max_slots; i--) {
             dl_slot_t *dl = &s_dls[i];
             if (!dl->used) continue;
             shown++;
             fill_rrect32(dx + 8, iy, dw - 16, card_h, 5, COL_CARD_BG);
             stroke_rrect32(dx + 8, iy, dw - 16, card_h, 5, COL_CARD_BD);
 
-            char st[32];
+            char *st = NULL;
             uint32_t st_col = COL_ACCENT_CYAN;
             if (dl->state == DL_DONE) {
-                snprintf(st, sizeof(st), "%lu B OK", (unsigned long)dl->downloaded_bytes);
+                st = gui_fmt_alloc("%lu B OK", (unsigned long)dl->downloaded_bytes);
                 st_col = COL_ACCENT_GREEN;
             } else if (dl->state == DL_ERROR) {
-                snprintf(st, sizeof(st), "%s", dl->err_msg[0] ? dl->err_msg : "Error");
+                st = gui_fmt_alloc("%s", (dl->err_msg && dl->err_msg[0]) ? dl->err_msg : "Error");
                 st_col = COL_ACCENT_RED;
             } else {
-                snprintf(st, sizeof(st), "%lu B", (unsigned long)dl->downloaded_bytes);
+                st = gui_fmt_alloc("%lu B", (unsigned long)dl->downloaded_bytes);
             }
-            int stw = ui_text_w(st);
+            const char *st_s = gui_str(st);
+            int stw = ui_text_w(st_s);
             draw_text_ellipsis32(dx + 14, iy + (compact_ui ? 3 : 6),
                                  dl->dest ? dl->dest : "", COL_TEXT_MAIN, dw - 36 - stw);
-            draw_text_clip32(dx + dw - 14 - stw, iy + (compact_ui ? 3 : 6), st, st_col, stw + 2, 1);
+            draw_text_clip32(dx + dw - 14 - stw, iy + (compact_ui ? 3 : 6), st_s, st_col, stw + 2, 1);
+            free(st);
 
             /* Progress track */
             int px = dx + 14, py = iy + prog_off, pw = dw - 28;
@@ -3987,13 +4306,14 @@ static void draw_overlay(void) {
             shown++;
             fill_rrect32(dx + 8, iy, dw - 16, card_h, 5, COL_CARD_BG);
             stroke_rrect32(dx + 8, iy, dw - 16, card_h, 5, COL_CARD_BD);
-            char lb[24];
-            snprintf(lb, sizeof(lb), "%ld B", (long)ld_entry->last_pos);
-            int lbw = ui_text_w(lb);
+            char *lb = gui_fmt_alloc("%ld B", (long)ld_entry->last_pos);
+            const char *lb_s = gui_str(lb);
+            int lbw = ui_text_w(lb_s);
             draw_text_ellipsis32(dx + 14, iy + (compact_ui ? 3 : 6),
                                  ld_entry->file ? (const char *)ld_entry->file : "Links download",
                                  COL_TEXT_MAIN, dw - 36 - lbw);
-            draw_text_clip32(dx + dw - 14 - lbw, iy + (compact_ui ? 3 : 6), lb, COL_ACCENT_GREEN, lbw + 2, 1);
+            draw_text_clip32(dx + dw - 14 - lbw, iy + (compact_ui ? 3 : 6), lb_s, COL_ACCENT_GREEN, lbw + 2, 1);
+            free(lb);
             fill_rrect32(dx + 14, iy + prog_off, dw - 28, prog_h, 3,
                          (ld_entry->stat.state < 0) ? COL_ACCENT_GREEN : COL_ACCENT_BLUE);
             iy += row_step;
@@ -4084,11 +4404,60 @@ static const char *const s_cur_ibeam[16] = {
 };
 
 static uint8_t s_sw_cur_save[24 * 24];
+static uint32_t s_sw_cur_save32[24 * 24];
 static int s_last_flip_mx = -1;
 static int s_last_flip_my = -1;
 static cursor_kind_t s_last_flip_cur = CURSOR_ARROW;
 
 static int s_wm_cur_x0 = 0, s_wm_cur_y0 = 0, s_wm_cur_w = 0, s_wm_cur_h = 0;
+
+static void draw_sw_cursor_on_buf32(uint32_t *buf, int bw, int bh,
+                                    int *out_x0, int *out_y0, int *out_w, int *out_h) {
+    *out_w = 0;
+    *out_h = 0;
+    if (!buf || bw <= 0 || bh <= 0) return;
+
+    const char *const *shape = s_cur_arrow;
+    int sw = 12, sh = 16, hx = 0, hy = 0;
+    if (s_cursor == CURSOR_HAND) {
+        shape = s_cur_hand; sw = 14; sh = 16; hx = 4; hy = 0;
+    } else if (s_cursor == CURSOR_IBEAM) {
+        shape = s_cur_ibeam; sw = 7; sh = 16; hx = 3; hy = 7;
+    }
+
+    int x0 = s_mx - hx;
+    int y0 = s_my - hy;
+    int cx1 = (x0 < 0) ? 0 : x0;
+    int cy1 = (y0 < 0) ? 0 : y0;
+    int cx2 = (x0 + sw > bw) ? bw : (x0 + sw);
+    int cy2 = (y0 + sh > bh) ? bh : (y0 + sh);
+    if (cx1 >= cx2 || cy1 >= cy2) return;
+
+    int rw = cx2 - cx1;
+    int rh = cy2 - cy1;
+    *out_x0 = cx1; *out_y0 = cy1; *out_w = rw; *out_h = rh;
+
+    for (int py = 0; py < rh; py++) {
+        uint32_t *row = buf + (size_t)(cy1 + py) * (size_t)bw + cx1;
+        uint32_t *sav = s_sw_cur_save32 + (size_t)py * (size_t)rw;
+        const char *pat = shape[(cy1 + py) - y0];
+        for (int px = 0; px < rw; px++) {
+            sav[px] = row[px];
+            char ch = pat[(cx1 + px) - x0];
+            if (ch == '#') row[px] = 0xFF000000u;
+            else if (ch == '@') row[px] = 0xFFFFFFFFu;
+        }
+    }
+}
+
+static void restore_sw_cursor32(int x0, int y0, int rw, int rh) {
+    if (!s_fb32 || rw <= 0 || rh <= 0) return;
+    for (int py = 0; py < rh; py++) {
+        uint32_t *row = s_fb32 + (size_t)(y0 + py) * (size_t)s_gui_w + x0;
+        const uint32_t *sav = s_sw_cur_save32 + (size_t)py * (size_t)rw;
+        memcpy(row, sav, (size_t)rw * sizeof(uint32_t));
+    }
+}
 
 static void draw_sw_cursor_on_buf(uint8_t *buf, int bw, int bh,
                                   int *out_x0, int *out_y0, int *out_w, int *out_h,
@@ -4260,7 +4629,55 @@ static void blit_window_frame(wm_window_t *win) {
 }
 
 static void flip_output(bool cursor_only) {
-    if (!s_inited || s_shutting_down || !s_fb8_base) return;
+    if (!s_inited || s_shutting_down) return;
+    if (s_use_truecolor32 && s_fb32) {
+        if (s_wm_win && wm_is_window_valid(s_wm_win)) {
+            if (cursor_only) {
+                wm_compositor_tick();
+                s_last_flip_mx = s_mx;
+                s_last_flip_my = s_my;
+                s_last_flip_cur = s_cursor;
+                return;
+            }
+            ipo_gfx_surface_desc_t surf;
+            memset(&surf, 0, sizeof(surf));
+            surf.struct_size = (uint32_t)sizeof(surf);
+            surf.width = (uint32_t)s_gui_w;
+            surf.height = (uint32_t)s_gui_h;
+            surf.stride_bytes = (uint32_t)s_gui_w * (uint32_t)sizeof(uint32_t);
+            surf.format_id = IPO_COLOR_FMT_XRGB8888;
+            surf.tonemap_op = IPO_TONEMAP_NONE;
+            surf.exposure = 1.0;
+            surf.pixels = s_fb32;
+            ipo_gfx_present_window(s_wm_win, &surf);
+            s_force_hw_reflip = false;
+            s_last_flip_mx = s_mx;
+            s_last_flip_my = s_my;
+            s_last_flip_cur = s_cursor;
+            return;
+        }
+        if (s_direct_gfx) {
+            int cx0 = 0, cy0 = 0, cw = 0, ch = 0;
+            draw_sw_cursor_on_buf32(s_fb32, s_gui_w, s_gui_h, &cx0, &cy0, &cw, &ch);
+            ipo_gfx_surface_desc_t surf;
+            memset(&surf, 0, sizeof(surf));
+            surf.struct_size = (uint32_t)sizeof(surf);
+            surf.width = (uint32_t)s_gui_w;
+            surf.height = (uint32_t)s_gui_h;
+            surf.stride_bytes = (uint32_t)s_gui_w * (uint32_t)sizeof(uint32_t);
+            surf.format_id = IPO_COLOR_FMT_XRGB8888;
+            surf.tonemap_op = IPO_TONEMAP_NONE;
+            surf.exposure = 1.0;
+            surf.pixels = s_fb32;
+            ipo_gfx_present_screen(&surf);
+            restore_sw_cursor32(cx0, cy0, cw, ch);
+            s_last_flip_mx = s_mx;
+            s_last_flip_my = s_my;
+            s_last_flip_cur = s_cursor;
+            return;
+        }
+    }
+    if (!s_fb8_base) return;
     if (s_wm_win && wm_is_window_valid(s_wm_win)) {
         if (s_hw_direct_fb && wm_get_focused() == s_wm_win) {
             /* Present crisp 1:1 native resolution directly to BGA LFB while WM is
@@ -4308,6 +4725,9 @@ static void flip_output(bool cursor_only) {
     s_last_flip_cur = s_cursor;
 }
 
+static uint32_t *s_ovl_save32 = NULL;
+static size_t s_ovl_save_cap = 0;
+
 static void render_and_present(void) {
     if (!s_inited || s_shutting_down || !s_fb32 || !s_fb8_base || !s_tabs) return;
     ipo_tab_t *tab = &s_tabs[s_active_tab];
@@ -4318,8 +4738,6 @@ static void render_and_present(void) {
      * stale ghosts or strips Bayer dithering from adjacent images. */
     static int s_drawn_ovl_kind = -1; /* -1=none, 0=autocomplete, >0=overlay_kind_t */
     static int s_drawn_ovl_x = 0, s_drawn_ovl_y = 0, s_drawn_ovl_w = 0, s_drawn_ovl_h = 0;
-    static uint32_t *s_ovl_save32 = NULL;
-    static size_t s_ovl_save_cap = 0;
 
     bool want_popup = (s_overlay != OVL_NONE);
     bool want_ac    = (!want_popup && s_focus == FOCUS_OMNIBOX && s_ac_count > 0 && !s_fullscreen);
@@ -4565,7 +4983,7 @@ static int hit_test_ui(int mx, int my, cursor_kind_t *out_cur) {
                 int row = (my - list_y) / row_step;
                 if (row >= 0 && row < max_items && row < s_history_count) {
                     *out_cur = CURSOR_HAND;
-                    return 550 + row;
+                    return 0x200000 + row;
                 }
             }
             return 599;
@@ -4592,7 +5010,7 @@ static int hit_test_ui(int mx, int my, cursor_kind_t *out_cur) {
             int row = (my - (ay + 3)) / row_h;
             if (row >= 0 && row < vis_count) {
                 *out_cur = CURSOR_HAND;
-                return 450 + row;
+                return 0x100000 + row;
             }
         }
     }
@@ -4811,7 +5229,7 @@ static void textbox_handle_click(int drag_id, const char *buf, int len,
 static void textbox_handle_drag(int mx) {
     if (!s_dragging_textbox || !s_tabs) return;
     int tx = 0, tw = 16;
-    char *buf = NULL;
+    const char *buf = "";
     int len = 0, *cursor = NULL, *scroll_col = NULL;
     bool *sel_all = NULL;
 
@@ -4820,7 +5238,7 @@ static void textbox_handle_drag(int mx) {
         int ty = 0;
         compute_toolbar_layout_ex(&BL);
         compute_omnibox_text_rect(&BL, &tx, &tw, &ty);
-        buf = s_omnibox_text; len = s_omnibox_len;
+        buf = gui_str(s_omnibox_text); len = s_omnibox_len;
         cursor = &s_omnibox_cursor; scroll_col = &s_omnibox_scroll;
         sel_all = &s_omnibox_sel_all;
     } else if (s_dragging_textbox == 2 && s_focus == FOCUS_HERO && s_tabs[s_active_tab].is_home) {
@@ -4828,7 +5246,7 @@ static void textbox_handle_drag(int mx) {
         int hy = 0;
         compute_start_layout(ipo_gui_vp_x(), ipo_gui_vp_y(), ipo_gui_vp_w(), ipo_gui_vp_h(), &L);
         compute_hero_text_rect(&L, &tx, &tw, &hy);
-        buf = s_hero_text; len = s_hero_len;
+        buf = gui_str(s_hero_text); len = s_hero_len;
         cursor = &s_hero_cursor; scroll_col = &s_hero_scroll;
         sel_all = &s_hero_sel_all;
     } else if (s_dragging_textbox == 3 && s_focus == FOCUS_FIND && s_overlay == OVL_FIND) {
@@ -4837,7 +5255,7 @@ static void textbox_handle_drag(int mx) {
         compute_find_layout(fx, fy, fw, fh, &in_x, &in_w, &prv_x, &nxt_x, &cls_x,
                             &nav_w, &cls_w, &btn_y, &btn_h);
         tx = in_x + 5; tw = in_w - 10;
-        buf = s_find_text; len = s_find_len;
+        buf = gui_str(s_find_text); len = s_find_len;
         cursor = &s_find_cursor; scroll_col = &s_find_scroll;
         sel_all = &s_find_sel_all;
     } else {
@@ -4883,12 +5301,14 @@ static void handle_ui_click(int hit, int mx, int my) {
     ipo_tab_t *tab = &s_tabs[s_active_tab];
 
     /* Autocomplete item click */
-    if (hit >= 450 && hit < 450 + s_ac_count) {
-        int idx = hit - 450;
-        char target[2048];
-        snprintf(target, sizeof(target), "%s", s_ac_items[idx].url);
+    if (hit >= 0x100000 && hit < 0x100000 + s_ac_count) {
+        int idx = hit - 0x100000;
+        char *target = gui_fmt_alloc("%s", gui_str(s_ac_items[idx].url));
         s_focus = FOCUS_VIEWPORT;
-        navigate_tab_to(s_active_tab, target);
+        if (target) {
+            navigate_tab_to(s_active_tab, target);
+            free(target);
+        }
         return;
     }
 
@@ -4933,7 +5353,7 @@ static void handle_ui_click(int hit, int mx, int my) {
         if (tab->is_video) {
             video_stop_audio();
             tab->is_video = false;
-            if (!tab->url[0] || yt_classify_url(tab->url) == YT_URL_VIDEO) {
+            if (!tab->url || !tab->url[0] || yt_classify_url(tab->url) == YT_URL_VIDEO) {
                 navigate_tab_to(s_active_tab, "about:home");
             } else {
                 set_omnibox_str(tab->url);
@@ -4991,7 +5411,7 @@ static void handle_ui_click(int hit, int mx, int my) {
         compute_omnibox_text_rect(&BL, &otxt_x, &otxt_w, &otxt_y);
         s_focus = FOCUS_OMNIBOX;
         s_overlay = OVL_NONE;
-        textbox_handle_click(1, s_omnibox_text, s_omnibox_len, otxt_x, otxt_w, mx,
+        textbox_handle_click(1, gui_str(s_omnibox_text), s_omnibox_len, otxt_x, otxt_w, mx,
                              was_focused, &s_omnibox_cursor, &s_omnibox_scroll,
                              &s_omnibox_sel_all, &s_omnibox_last_click_ms);
         rebuild_omnibox_autocomplete();
@@ -5041,7 +5461,7 @@ static void handle_ui_click(int hit, int mx, int my) {
     }
 
     if (hit >= 300 && hit < 300 + s_bookmark_count) {
-        navigate_tab_to(s_active_tab, s_bookmarks[hit - 300].url);
+        navigate_tab_to(s_active_tab, gui_str(s_bookmarks[hit - 300].url));
         return;
     }
 
@@ -5057,26 +5477,32 @@ static void handle_ui_click(int hit, int mx, int my) {
         return;
     }
     if (hit == 501) {
-        const char *u = (tab->url[0] && !tab->is_home) ? tab->url : "https://example.com";
+        const char *u = (tab->url && tab->url[0] && !tab->is_home) ? tab->url : "https://example.com";
         gui_start_download(u);
         return;
     }
     if (hit == 502) { gui_start_download("https://example.com"); return; }
     if (hit == 503) { gui_start_download("https://www.google.com"); return; }
 
-    if (hit >= 550 && hit < 557) {
-        int h_idx = s_history_count - 1 - (hit - 550);
+    if (hit >= 0x200000 && hit < 0x200000 + s_history_count) {
+        int h_idx = s_history_count - 1 - (hit - 0x200000);
         if (h_idx >= 0 && h_idx < s_history_count) {
-            char target[2048];
-            snprintf(target, sizeof(target), "%s", s_history[h_idx].url);
+            char *target = gui_fmt_alloc("%s", gui_str(s_history[h_idx].url));
             s_overlay = OVL_NONE;
-            navigate_tab_to(s_active_tab, target);
+            if (target) {
+                navigate_tab_to(s_active_tab, target);
+                free(target);
+            }
         }
         return;
     }
     if (hit == 560) {
+        for (int i = 0; i < s_history_count; i++) {
+            free(s_history[i].title);
+            free(s_history[i].url);
+        }
         s_history_count = 0;
-        snprintf(s_status_msg, sizeof(s_status_msg), "Browsing history cleared");
+        gui_set_str(&s_status_msg, "Browsing history cleared");
         s_dirty_chrome = true;
         s_dirty_overlay = true;
         return;
@@ -5090,7 +5516,7 @@ static void handle_ui_click(int hit, int mx, int my) {
         compute_find_layout(fx, fy, fw, fh, &in_x, &in_w, &prv_x, &nxt_x, &cls_x,
                             &nav_w, &cls_w, &btn_y, &btn_h);
         s_focus = FOCUS_FIND;
-        textbox_handle_click(3, s_find_text, s_find_len, in_x + 5, in_w - 10, mx,
+        textbox_handle_click(3, gui_str(s_find_text), s_find_len, in_x + 5, in_w - 10, mx,
                              was_focused, &s_find_cursor, &s_find_scroll,
                              &s_find_sel_all, &s_find_last_click_ms);
         s_dirty_overlay = true;
@@ -5121,21 +5547,21 @@ static void handle_ui_click(int hit, int mx, int my) {
     /* Right-Click Context Menu items */
     if (hit == 750) { /* Open Link in New Tab */
         s_overlay = OVL_NONE;
-        if (s_ctx_link_url[0]) open_new_tab(s_ctx_link_url);
+        if (s_ctx_link_url && s_ctx_link_url[0]) open_new_tab(s_ctx_link_url);
         return;
     }
     if (hit == 751) { /* Copy Link Address */
         s_overlay = OVL_NONE;
-        if (s_ctx_link_url[0]) {
+        if (s_ctx_link_url && s_ctx_link_url[0]) {
             set_clipboard_text(NULL, (unsigned char *)s_ctx_link_url);
-            snprintf(s_status_msg, sizeof(s_status_msg), "Copied link: %s", s_ctx_link_url);
+            gui_set_fmt(&s_status_msg, "Copied link: %s", s_ctx_link_url);
         }
         trigger_tab_redraw(s_active_tab);
         return;
     }
     if (hit == 752) { /* Download Link Target */
         s_overlay = OVL_NONE;
-        if (s_ctx_link_url[0]) gui_start_download(s_ctx_link_url);
+        if (s_ctx_link_url && s_ctx_link_url[0]) gui_start_download(s_ctx_link_url);
         return;
     }
     if (hit == 753) { s_overlay = OVL_NONE; trigger_tab_redraw(s_active_tab); handle_ui_click(200, mx, my); return; }
@@ -5144,7 +5570,7 @@ static void handle_ui_click(int hit, int mx, int my) {
     if (hit == 756) { s_overlay = OVL_NONE; toggle_bookmark_current(); trigger_tab_redraw(s_active_tab); return; }
     if (hit == 757) {
         s_overlay = OVL_NONE;
-        const char *u = (tab->url[0] && !tab->is_home) ? tab->url : "https://example.com";
+        const char *u = (tab->url && tab->url[0] && !tab->is_home) ? tab->url : "https://example.com";
         gui_start_download(u);
         return;
     }
@@ -5203,7 +5629,7 @@ static void handle_ui_click(int hit, int mx, int my) {
 
     /* Start Page */
     if (hit == 900) {
-        if (s_hero_len > 0) navigate_tab_to(s_active_tab, s_hero_text);
+        if (s_hero_len > 0) navigate_tab_to(s_active_tab, gui_str(s_hero_text));
         else { s_focus = FOCUS_HERO; s_dirty_vp = true; }
         return;
     }
@@ -5214,7 +5640,7 @@ static void handle_ui_click(int hit, int mx, int my) {
         compute_start_layout(ipo_gui_vp_x(), ipo_gui_vp_y(), ipo_gui_vp_w(), ipo_gui_vp_h(), &L);
         compute_hero_text_rect(&L, &hx, &hw, &hy);
         s_focus = FOCUS_HERO;
-        textbox_handle_click(2, s_hero_text, s_hero_len, hx, hw, mx,
+        textbox_handle_click(2, gui_str(s_hero_text), s_hero_len, hx, hw, mx,
                              was_focused, &s_hero_cursor, &s_hero_scroll,
                              &s_hero_sel_all, &s_hero_last_click_ms);
         s_dirty_vp = true;
@@ -5254,17 +5680,22 @@ static void utf8_pop_prev_char(char *buf, int *len, int *cursor) {
     *cursor = start;
 }
 
-static void text_edit_insert(char *buf, int cap, int *len, int *cursor, bool *sel_all, const char *utf8) {
+static void text_edit_insert(char **pbuf, size_t *pcap, int *len, int *cursor, bool *sel_all, const char *utf8) {
+    if (!pbuf || !pcap || !len || !cursor || !utf8) return;
+    if (!gui_dyn_ensure(pbuf, pcap, 1u)) return;
     if (sel_all && *sel_all) {
-        buf[0] = '\0';
+        (*pbuf)[0] = '\0';
         *len = 0;
         *cursor = 0;
         *sel_all = false;
     }
-    int ins = (int)strlen(utf8);
-    if (*len + ins >= cap) return;
+    size_t ins_sz = strlen(utf8);
+    if (ins_sz > (size_t)0x7fffffff || (size_t)*len > (size_t)0x7ffffffe - ins_sz) return;
+    int ins = (int)ins_sz;
+    if (!gui_dyn_ensure(pbuf, pcap, (size_t)*len + ins_sz + 1u)) return;
+    char *buf = *pbuf;
     memmove(buf + *cursor + ins, buf + *cursor, (size_t)(*len - *cursor + 1));
-    memcpy(buf + *cursor, utf8, (size_t)ins);
+    memcpy(buf + *cursor, utf8, ins_sz);
     *len += ins;
     *cursor += ins;
 }
@@ -5302,10 +5733,12 @@ static void scancode_to_utf8(uint8_t sc, bool shift, char out[8]) {
     }
 }
 
-static bool handle_textbox_key(char *buf, int cap, int *len, int *cursor, bool *sel_all,
+static bool handle_textbox_key(char **pbuf, size_t *pcap, int *len, int *cursor, bool *sel_all,
                                uint8_t sc, bool ext, bool ctrl, bool shift, bool *out_enter) {
     *out_enter = false;
     if (sc == 0x1C) { *out_enter = true; return true; }
+    if (!pbuf || !pcap || !gui_dyn_ensure(pbuf, pcap, 1u)) return false;
+    char *buf = *pbuf;
     if (sc == 0x0E) { /* Backspace / Ctrl+Backspace */
         if (sel_all && *sel_all) {
             buf[0] = '\0'; *len = 0; *cursor = 0; *sel_all = false;
@@ -5376,7 +5809,7 @@ static bool handle_textbox_key(char *buf, int cap, int *len, int *cursor, bool *
     if (ctrl && sc == 0x2F) { /* Ctrl+V */
         unsigned char *clip = get_clipboard_text(NULL);
         if (clip) {
-            text_edit_insert(buf, cap, len, cursor, sel_all, (const char *)clip);
+            text_edit_insert(pbuf, pcap, len, cursor, sel_all, (const char *)clip);
             mem_free(clip);
         }
         return true;
@@ -5385,7 +5818,7 @@ static bool handle_textbox_key(char *buf, int cap, int *len, int *cursor, bool *
         char ks[8];
         scancode_to_utf8(sc, shift, ks);
         if (ks[0]) {
-            text_edit_insert(buf, cap, len, cursor, sel_all, ks);
+            text_edit_insert(pbuf, pcap, len, cursor, sel_all, ks);
             return true;
         }
     }
@@ -5459,7 +5892,7 @@ static void dispatch_scancode(uint8_t raw_sc) {
         if (s_focus != FOCUS_VIEWPORT) {
             s_focus = FOCUS_VIEWPORT;
             s_omnibox_sel_all = false;
-            s_ac_count = 0;
+            ac_clear_items();
             s_ac_sel = -1;
             s_dirty_chrome = true;
             if (tab->is_home) s_dirty_vp = true;
@@ -5476,7 +5909,7 @@ static void dispatch_scancode(uint8_t raw_sc) {
     if (s_focus == FOCUS_OMNIBOX) {
         if (ext && sc == 0x50 && s_ac_count > 0) { /* Down arrow in autocomplete */
             s_ac_sel = (s_ac_sel + 1) % s_ac_count;
-            set_omnibox_str(s_ac_items[s_ac_sel].url);
+            set_omnibox_str(gui_str(s_ac_items[s_ac_sel].url));
             s_omnibox_sel_all = false;
             s_dirty_chrome = true;
             s_dirty_vp = true;
@@ -5484,21 +5917,25 @@ static void dispatch_scancode(uint8_t raw_sc) {
         }
         if (ext && sc == 0x48 && s_ac_count > 0) { /* Up arrow in autocomplete */
             s_ac_sel = (s_ac_sel <= 0) ? (s_ac_count - 1) : (s_ac_sel - 1);
-            set_omnibox_str(s_ac_items[s_ac_sel].url);
+            set_omnibox_str(gui_str(s_ac_items[s_ac_sel].url));
             s_omnibox_sel_all = false;
             s_dirty_chrome = true;
             s_dirty_vp = true;
             return;
         }
         bool hit_enter = false;
-        if (handle_textbox_key(s_omnibox_text, (int)sizeof(s_omnibox_text),
+        if (handle_textbox_key(&s_omnibox_text, &s_omnibox_cap,
                                &s_omnibox_len, &s_omnibox_cursor, &s_omnibox_sel_all,
                                sc, ext, ctrl, shift, &hit_enter)) {
             if (hit_enter) {
-                const char *target = (s_ac_sel >= 0 && s_ac_sel < s_ac_count)
-                                     ? s_ac_items[s_ac_sel].url : s_omnibox_text;
+                const char *target = (s_ac_sel >= 0 && s_ac_sel < s_ac_count && s_ac_items[s_ac_sel].url)
+                                     ? s_ac_items[s_ac_sel].url : gui_str(s_omnibox_text);
+                char *target_copy = gui_fmt_alloc("%s", target);
                 s_ac_sel = -1;
-                navigate_tab_to(s_active_tab, target);
+                if (target_copy) {
+                    navigate_tab_to(s_active_tab, target_copy);
+                    free(target_copy);
+                }
             } else {
                 rebuild_omnibox_autocomplete();
                 s_dirty_chrome = true;
@@ -5508,16 +5945,16 @@ static void dispatch_scancode(uint8_t raw_sc) {
         }
     } else if (s_focus == FOCUS_HERO && tab->is_home) {
         bool hit_enter = false;
-        if (handle_textbox_key(s_hero_text, (int)sizeof(s_hero_text),
+        if (handle_textbox_key(&s_hero_text, &s_hero_cap,
                                &s_hero_len, &s_hero_cursor, &s_hero_sel_all,
                                sc, ext, ctrl, shift, &hit_enter)) {
-            if (hit_enter) navigate_tab_to(s_active_tab, s_hero_text);
+            if (hit_enter) navigate_tab_to(s_active_tab, gui_str(s_hero_text));
             else s_dirty_vp = true;
             return;
         }
     } else if (s_focus == FOCUS_FIND && s_overlay == OVL_FIND) {
         bool hit_enter = false;
-        if (handle_textbox_key(s_find_text, (int)sizeof(s_find_text),
+        if (handle_textbox_key(&s_find_text, &s_find_cap,
                                &s_find_len, &s_find_cursor, &s_find_sel_all,
                                sc, ext, ctrl, shift, &hit_enter)) {
             if (hit_enter) execute_find(shift);
@@ -5623,15 +6060,23 @@ void ipo_gui_init(void) {
 
     s_hw_direct_fb = false;
     s_force_hw_reflip = false;
+    {
+        ipo_gfx_caps_t gcaps;
+        s_use_truecolor32 = (ipo_gfx_get_caps(&gcaps) == 0 && gcaps.active_hw_bpp >= 15u);
+    }
     s_wm_win = wm_create_window(&opt);
     if (s_wm_win) {
         wm_set_fullscreen(s_wm_win, true);
-        wm_set_cursor_visible(s_wm_win, false);
+        wm_set_cursor_visible(s_wm_win, s_use_truecolor32 ? true : false);
         vga_gfx_probe_screen_size();
         vga_gfx_get_screen_bounds(&sw, &sh);
         if (sw < 320 || sw > 4096) sw = 320;
         if (sh < 200 || sh > 4096) sh = 200;
-        if (sw > (int)s_wm_win->w || sh > (int)s_wm_win->h) {
+        if (s_use_truecolor32) {
+            s_hw_direct_fb = false;
+            s_gui_w = sw;
+            s_gui_h = sh;
+        } else if (sw > (int)s_wm_win->w || sh > (int)s_wm_win->h) {
             s_hw_direct_fb = true;
             s_gui_w = sw;
             s_gui_h = sh;
@@ -5649,6 +6094,10 @@ void ipo_gui_init(void) {
         vga_gfx_get_screen_bounds(&sw, &sh);
         s_gui_w = sw;
         s_gui_h = sh;
+        {
+            ipo_gfx_caps_t gcaps;
+            s_use_truecolor32 = (ipo_gfx_get_caps(&gcaps) == 0 && gcaps.active_hw_bpp >= 15u);
+        }
     }
     if (s_gui_w < 320 || s_gui_w > 4096) s_gui_w = 320;
     if (s_gui_h < 200 || s_gui_h > 4096) s_gui_h = 200;
@@ -5664,7 +6113,7 @@ void ipo_gui_init(void) {
     s_tabs_cap = 0;
     s_tab_scroll = 0;
     ensure_tab_slot();
-    memset(s_dls, 0, sizeof(s_dls));
+    if (s_dls && s_dls_cap > 0) memset(s_dls, 0, (size_t)s_dls_cap * sizeof(dl_slot_t));
     s_active_tab = 0;
     s_overlay = OVL_NONE;
     s_focus = FOCUS_VIEWPORT;
@@ -5731,10 +6180,16 @@ void ipo_gui_shutdown(void) {
     s_links_wakeup = false;
     video_stop_audio();
     if (s_mp4_player) { mp4_player_destroy(s_mp4_player); s_mp4_player = NULL; }
-    for (int i = 0; i < MAX_DL_SLOTS; i++) {
+    for (int i = 0; i < s_dls_cap; i++) {
         dl_slot_close_conn(&s_dls[i]);
-        dl_slot_free_paths(&s_dls[i]);
+        dl_slot_free_strings(&s_dls[i]);
     }
+    free(s_dls); s_dls = NULL; s_dls_cap = 0;
+    for (int i = 0; i < s_bookmark_count; i++) {
+        free(s_bookmarks[i].label);
+        free(s_bookmarks[i].url);
+    }
+    free(s_bookmarks); s_bookmarks = NULL; s_bookmark_cap = 0; s_bookmark_count = 0;
 
     if (s_wm_win) {
         if (wm_is_window_valid(s_wm_win)) wm_destroy_window(s_wm_win);
@@ -5750,8 +6205,25 @@ void ipo_gui_shutdown(void) {
     free(s_fb32);     s_fb32 = NULL;
     free(s_fb8_base); s_fb8_base = NULL;
     free(s_lut_near); s_lut_near = NULL;
+    free(s_ovl_save32); s_ovl_save32 = NULL; s_ovl_save_cap = 0;
+    for (int i = 0; i < s_tabs_cap; i++) {
+        tab_free_fields(&s_tabs[i]);
+    }
     free(s_tabs);     s_tabs = NULL; s_tabs_cap = 0;
+    for (int i = 0; i < s_history_count; i++) {
+        free(s_history[i].title);
+        free(s_history[i].url);
+    }
     free(s_history);  s_history = NULL; s_history_cap = 0; s_history_count = 0;
+    ac_clear_items();
+    free(s_ac_items); s_ac_items = NULL; s_ac_cap = 0; s_ac_sel = -1;
+    free(s_ctx_link_url); s_ctx_link_url = NULL;
+    free(s_omnibox_text); s_omnibox_text = NULL; s_omnibox_cap = 0; s_omnibox_len = 0;
+    free(s_hero_text);    s_hero_text = NULL;    s_hero_cap = 0;    s_hero_len = 0;
+    free(s_find_text);    s_find_text = NULL;    s_find_cap = 0;    s_find_len = 0;
+    free(s_status_msg);   s_status_msg = NULL;
+    free(s_pending_initial_video); s_pending_initial_video = NULL;
+    free(s_pending_tab_url);       s_pending_tab_url = NULL;
     s_inited = false;
 }
 
@@ -5760,24 +6232,25 @@ void ipo_gui_on_device_created(struct graphics_device *dev) {
     if (slot < 0) return;
 
     ipo_tab_t *tab = &s_tabs[slot];
+    tab_free_fields(tab);
     memset(tab, 0, sizeof(*tab));
     tab->used = true;
     tab->dev = dev;
     tab->is_home = true;
-    snprintf(tab->title, sizeof(tab->title), "New Tab");
+    gui_set_str(&tab->title, "New Tab");
     s_active_tab = slot;
     set_omnibox_str("");
 
-    if (s_pending_initial_video[0]) {
-        char vu[2048];
-        snprintf(vu, sizeof(vu), "%s", s_pending_initial_video);
-        s_pending_initial_video[0] = '\0';
+    if (s_pending_initial_video && s_pending_initial_video[0]) {
+        char *vu = s_pending_initial_video;
+        s_pending_initial_video = NULL;
         enter_video_in_tab(slot, vu);
-    } else if (s_pending_tab_url[0]) {
-        char tu[2048];
-        snprintf(tu, sizeof(tu), "%s", s_pending_tab_url);
-        s_pending_tab_url[0] = '\0';
+        free(vu);
+    } else if (s_pending_tab_url && s_pending_tab_url[0]) {
+        char *tu = s_pending_tab_url;
+        s_pending_tab_url = NULL;
         if (strcmp(tu, "about:home") != 0) navigate_tab_to(slot, tu);
+        free(tu);
     }
     s_dirty_chrome = true;
     s_dirty_vp = true;
@@ -5791,6 +6264,7 @@ void ipo_gui_on_device_destroyed(struct graphics_device *dev) {
     }
     if (idx < 0) return;
     if (s_tabs[idx].is_video && idx == s_active_tab) video_stop_audio();
+    tab_free_fields(&s_tabs[idx]);
     memset(&s_tabs[idx], 0, sizeof(s_tabs[idx]));
 
     if (idx == s_active_tab) {
@@ -5819,11 +6293,13 @@ void ipo_gui_set_title(struct graphics_device *dev, const char *title) {
         if (!s_tabs[i].used || s_tabs[i].dev != dev) continue;
         if (s_tabs[i].is_home || s_tabs[i].is_video) return;
         if (title && title[0]) {
-            snprintf(s_tabs[i].title, sizeof(s_tabs[i].title), "%s", title);
+            gui_set_str(&s_tabs[i].title, title);
             if (i == s_active_tab && s_wm_win && !s_hw_direct_fb) {
-                char wtitle[96];
-                snprintf(wtitle, sizeof(wtitle), "%.72s - Links", s_tabs[i].title);
-                wm_set_title(s_wm_win, wtitle);
+                char *wtitle = gui_fmt_alloc("%s - Links", gui_str(s_tabs[i].title));
+                if (wtitle) {
+                    wm_set_title(s_wm_win, wtitle);
+                    free(wtitle);
+                }
             }
             s_dirty_chrome = true;
         }
@@ -5915,7 +6391,7 @@ void ipo_gui_notify_status(void *ses_ptr) {
     struct session *ses = (struct session *)ses_ptr;
     if (!ses) return;
     if (ses->st && ses->st[0]) {
-        snprintf(s_status_msg, sizeof(s_status_msg), "%s", (const char *)ses->st);
+        gui_set_str(&s_status_msg, (const char *)ses->st);
         s_dirty_chrome = true;
     }
     sync_active_tab_meta();
@@ -5925,7 +6401,7 @@ void ipo_gui_notify_js_console(const char *msg) {
     if (!msg || !*msg) return;
     fprintf(stderr, "[JS console] %s\n", msg);
     if (s_inited && !s_shutting_down) {
-        snprintf(s_status_msg, sizeof(s_status_msg), "JS: %.140s", msg);
+        gui_set_fmt(&s_status_msg, "JS: %s", msg);
         s_dirty_chrome = true;
     }
 }
@@ -5935,7 +6411,7 @@ int ipo_gui_dom_dirty_hint(void) {
 }
 
 static int modal_process_raw_scancode(uint8_t raw, int kind,
-                                      char *input_buf, size_t input_cap,
+                                      char **input_buf, size_t *input_cap,
                                       int *input_len, int *input_cur, bool *input_sel_all,
                                       bool *e0, bool *shift_held, bool *ctrl_held,
                                       bool *need_draw) {
@@ -5965,14 +6441,15 @@ static int modal_process_raw_scancode(uint8_t raw, int kind,
 }
 
 int ipo_gui_run_js_dialog(int kind, const char *title, const char *message,
-                          const char *default_text, char *out_buf, size_t out_cap) {
-    if (kind == 2 && out_buf && out_cap > 0) {
-        snprintf(out_buf, out_cap, "%s", default_text ? default_text : "");
-    }
+                          const char *default_text, char **out_alloc) {
+    if (out_alloc) *out_alloc = NULL;
     fprintf(stderr, "[JS %s] %s\n",
             kind == 0 ? "alert" : (kind == 1 ? "confirm" : "prompt"),
             message ? message : "");
     if (!s_inited || s_shutting_down || !s_fb32 || !s_fb8_base) {
+        if (kind == 2 && out_alloc) {
+            *out_alloc = gui_fmt_alloc("%s", default_text ? default_text : "");
+        }
         return 1;
     }
 
@@ -5986,14 +6463,20 @@ int ipo_gui_run_js_dialog(int kind, const char *title, const char *message,
     if (dw > s_gui_w - 20) dw = s_gui_w - 20;
     if (dw < 200) dw = s_gui_w;
 
-    /* Word-wrap message into up to 6 lines */
-    char lines[6][96];
-    int nlines = 0;
+    int hdr_h = compact ? 22 : 30;
+    int foot_h = compact ? 28 : 36;
+    int prompt_h = (kind == 2) ? (ch + 16) : 0;
     int max_cols = (dw - 28) / (cw > 0 ? cw : 6);
     if (max_cols < 16) max_cols = 16;
-    if (max_cols > 92) max_cols = 92;
+
+    /* Word-wrap message dynamically to fit available dialog height without fixed line caps */
+    int line_step = ch + 4;
+    int avail_body = (s_gui_h - 16) - hdr_h - foot_h - 18 - prompt_h;
+    int max_vis_lines = (line_step > 0 && avail_body > line_step) ? (avail_body / line_step) : 1;
+    char **lines = NULL;
+    int nlines = 0, lines_cap = 0;
     const char *mp = message ? message : "";
-    while (*mp && nlines < 6) {
+    while (*mp) {
         while (*mp == ' ') mp++;
         if (!*mp) break;
         int take = 0, last_sp = -1;
@@ -6002,18 +6485,32 @@ int ipo_gui_run_js_dialog(int kind, const char *title, const char *message,
             take++;
         }
         if (mp[take] && mp[take] != '\n' && last_sp > 0) take = last_sp;
-        int copy_n = take < 95 ? take : 95;
-        memcpy(lines[nlines], mp, (size_t)copy_n);
-        lines[nlines][copy_n] = '\0';
-        nlines++;
+        if (nlines >= lines_cap) {
+            int ncap = lines_cap ? lines_cap * 2 : 8;
+            if (ncap <= lines_cap) break;
+            char **nl = (char **)realloc(lines, (size_t)ncap * sizeof(char *));
+            if (!nl) break;
+            lines = nl;
+            lines_cap = ncap;
+        }
+        char *ln = NULL;
+        if (!gui_set_strn(&ln, mp, (size_t)take)) break;
+        lines[nlines++] = ln;
         mp += take;
         if (*mp == '\n') mp++;
     }
-    if (nlines == 0) { snprintf(lines[0], sizeof(lines[0]), " "); nlines = 1; }
+    if (nlines == 0) {
+        char *blank = gui_fmt_alloc(" ");
+        if (blank) {
+            char **nl = (char **)realloc(lines, sizeof(char *));
+            if (nl) { lines = nl; lines_cap = 1; lines[nlines++] = blank; }
+            else free(blank);
+        }
+    }
+    int draw_lines = (nlines < max_vis_lines) ? nlines : max_vis_lines;
+    if (draw_lines < 1 && nlines > 0) draw_lines = 1;
 
-    int hdr_h = compact ? 22 : 30;
-    int body_h = nlines * (ch + 4) + (kind == 2 ? (ch + 16) : 0);
-    int foot_h = compact ? 28 : 36;
+    int body_h = draw_lines * line_step + prompt_h;
     int dh = hdr_h + body_h + foot_h + 18;
     if (dh > s_gui_h - 16) dh = s_gui_h - 16;
     int dx = (s_gui_w - dw) / 2;
@@ -6026,9 +6523,10 @@ int ipo_gui_run_js_dialog(int kind, const char *title, const char *message,
         }
     }
 
-    char input_buf[512];
-    snprintf(input_buf, sizeof(input_buf), "%s", default_text ? default_text : "");
-    int input_len = (int)strlen(input_buf);
+    char *input_buf = NULL;
+    size_t input_cap = 0;
+    int input_len = 0;
+    gui_dyn_set(&input_buf, &input_cap, &input_len, default_text ? default_text : "");
     int input_cur = input_len;
     bool input_sel_all = (input_len > 0);
     bool e0 = false, shift_held = false, ctrl_held = false;
@@ -6038,7 +6536,7 @@ int ipo_gui_run_js_dialog(int kind, const char *title, const char *message,
     int ok_x = (kind == 0) ? (dx + dw - btn_w - 14) : (dx + dw - btn_w * 2 - 22);
     int can_x = dx + dw - btn_w - 12;
     int inp_x = dx + 14;
-    int inp_y = dy + hdr_h + 8 + nlines * (ch + 4) + 2;
+    int inp_y = dy + hdr_h + 8 + draw_lines * line_step + 2;
     int inp_w = dw - 28;
     int inp_h = ch + 10;
     int hov_btn = 0; /* 1=OK, 2=Cancel, 3=Close */
@@ -6059,8 +6557,8 @@ int ipo_gui_run_js_dialog(int kind, const char *title, const char *message,
             draw_icon_close(dx + dw - 6 - cls_s / 2, dy + hdr_h / 2, compact ? 2 : 3, COL_TEXT_MAIN);
             fill_rect32(dx + 8, dy + hdr_h, dw - 16, 1, COL_BORDER);
 
-            for (int i = 0; i < nlines; i++) {
-                draw_text_clip32(dx + 14, dy + hdr_h + 8 + i * (ch + 4),
+            for (int i = 0; i < draw_lines; i++) {
+                draw_text_clip32(dx + 14, dy + hdr_h + 8 + i * line_step,
                                  lines[i], COL_TEXT_MAIN, dw - 28, 1);
             }
 
@@ -6068,14 +6566,14 @@ int ipo_gui_run_js_dialog(int kind, const char *title, const char *message,
                 fill_rrect32(inp_x, inp_y, inp_w, inp_h, 4, COL_OMNIBOX_BG);
                 stroke_rrect32(inp_x, inp_y, inp_w, inp_h, 4, COL_ACCENT_BLUE);
                 if (input_sel_all && input_len > 0) {
-                    int total_cols = utf8_total_cols(input_buf, input_len);
-                    int sw = ui_substr_w(input_buf, input_len, 0, total_cols);
+                    int total_cols = utf8_total_cols(gui_str(input_buf), input_len);
+                    int sw = ui_substr_w(gui_str(input_buf), input_len, 0, total_cols);
                     if (sw > inp_w - 12) sw = inp_w - 12;
                     fill_rect32(inp_x + 6, inp_y + 3, sw, ch + 4, 0x1D4ED8u);
                 }
-                draw_text_clip32(inp_x + 6, inp_y + 5, input_buf, COL_TEXT_MAIN, inp_w - 12, 1);
-                int cur_cols = utf8_byte_to_col(input_buf, input_cur);
-                int cxp = inp_x + 6 + ui_substr_w(input_buf, input_len, 0, cur_cols);
+                draw_text_clip32(inp_x + 6, inp_y + 5, gui_str(input_buf), COL_TEXT_MAIN, inp_w - 12, 1);
+                int cur_cols = utf8_byte_to_col(gui_str(input_buf), input_cur);
+                int cxp = inp_x + 6 + ui_substr_w(gui_str(input_buf), input_len, 0, cur_cols);
                 if (cxp < inp_x + inp_w - 6) {
                     fill_rect32(cxp, inp_y + 4, 1, ch + 2, COL_WHITE);
                 }
@@ -6109,7 +6607,7 @@ int ipo_gui_run_js_dialog(int kind, const char *title, const char *message,
                 keyboard_poll();
                 uint8_t raw;
                 while (result < 0 && (raw = keyboard_get_scancode()) != 0) {
-                    int r = modal_process_raw_scancode(raw, kind, input_buf, sizeof(input_buf),
+                    int r = modal_process_raw_scancode(raw, kind, &input_buf, &input_cap,
                                                        &input_len, &input_cur, &input_sel_all,
                                                        &e0, &shift_held, &ctrl_held, &need_draw);
                     if (r >= 0) { result = r; break; }
@@ -6125,7 +6623,7 @@ int ipo_gui_run_js_dialog(int kind, const char *title, const char *message,
                 }
                 if (ev.type == WM_EVENT_KEY_DOWN || ev.type == WM_EVENT_KEY_UP) {
                     int r = modal_process_raw_scancode((uint8_t)(ev.data & 0xFFu), kind,
-                                                       input_buf, sizeof(input_buf),
+                                                       &input_buf, &input_cap,
                                                        &input_len, &input_cur, &input_sel_all,
                                                        &e0, &shift_held, &ctrl_held, &need_draw);
                     if (r >= 0) { result = r; break; }
@@ -6194,6 +6692,8 @@ int ipo_gui_run_js_dialog(int kind, const char *title, const char *message,
         if (result < 0) usleep(12000);
     }
 
+    for (int i = 0; i < nlines; i++) free(lines[i]);
+    free(lines);
     s_btn_l = prev_l;
     if (saved_bg) {
         for (int r = 0; r < dh; r++) {
@@ -6206,8 +6706,10 @@ int ipo_gui_run_js_dialog(int kind, const char *title, const char *message,
     s_dirty_chrome = true;
     s_dirty_vp = true;
 
-    if (kind == 2 && result == 1 && out_buf && out_cap > 0) {
-        snprintf(out_buf, out_cap, "%s", input_buf);
+    if (kind == 2 && result == 1 && out_alloc) {
+        *out_alloc = input_buf;
+    } else {
+        free(input_buf);
     }
     return result == 1 ? 1 : 0;
 }
@@ -6246,7 +6748,7 @@ int ipo_gui_maybe_intercept_url(void *ses_ptr, const char *url) {
             fill_rect32(ipo_gui_vp_x(), ipo_gui_vp_y(), ipo_gui_vp_w(), ipo_gui_vp_h(), COL_WHITE);
             s_dirty_vp = true;
         }
-        snprintf(s_tabs[target_tab].url, sizeof(s_tabs[target_tab].url), "%s", url);
+        gui_set_str(&s_tabs[target_tab].url, url);
         record_history_visit(url, s_tabs[target_tab].title);
         if (target_tab == s_active_tab && s_focus != FOCUS_OMNIBOX) {
             set_omnibox_str(url);
@@ -6261,7 +6763,9 @@ static void sync_window_size(void) {
     int nh = s_gui_h;
     if (s_wm_win) {
         if (!wm_is_window_valid(s_wm_win)) return;
-        if (s_hw_direct_fb && s_wm_win->fullscreen) {
+        if (s_use_truecolor32 && s_wm_win->fullscreen) {
+            vga_gfx_get_screen_bounds(&nw, &nh);
+        } else if (s_hw_direct_fb && s_wm_win->fullscreen) {
             vga_gfx_probe_screen_size();
             vga_gfx_get_screen_bounds(&nw, &nh);
             if (nw <= (int)s_wm_win->w && nh <= (int)s_wm_win->h) {
@@ -6270,8 +6774,15 @@ static void sync_window_size(void) {
                 nh = (int)s_wm_win->h;
             }
         } else {
-            nw = (int)s_wm_win->w;
-            nh = (int)s_wm_win->h;
+            int px = 0, py = 0, pw = 0, ph = 0;
+            if (s_use_truecolor32) ipo_gfx_wm_window_phys_rect(s_wm_win, &px, &py, &pw, &ph);
+            if (s_use_truecolor32 && pw > 32 && ph > 32) {
+                nw = pw;
+                nh = ph;
+            } else {
+                nw = (int)s_wm_win->w;
+                nh = (int)s_wm_win->h;
+            }
         }
     } else if (s_direct_gfx) {
         vga_gfx_get_screen_bounds(&nw, &nh);
@@ -6516,7 +7027,8 @@ void ipo_gui_tick(void) {
         s_btn_r = ms.right_button;
         if (s_btn_r && in_vp) {
             s_ctx_has_link = false;
-            s_ctx_link_url[0] = '\0';
+            free(s_ctx_link_url);
+            s_ctx_link_url = NULL;
             if (tab->used && !tab->is_home && !tab->is_video && tab->dev) {
                 if (tab->dev->mouse_handler) {
                     tab->dev->mouse_handler(tab->dev, mx - ipo_gui_vp_x(), my - ipo_gui_vp_y(), B_MOVE | B_LEFT);
@@ -6528,7 +7040,7 @@ void ipo_gui_tick(void) {
                     struct link *lnk = &fd->f_data->links[fd->vs->current_link];
                     if (lnk->where && lnk->where[0]) {
                         s_ctx_has_link = true;
-                        snprintf(s_ctx_link_url, sizeof(s_ctx_link_url), "%s", (const char *)lnk->where);
+                        gui_set_str(&s_ctx_link_url, (const char *)lnk->where);
                     }
                 }
             }
@@ -6566,7 +7078,7 @@ void ipo_gui_tick(void) {
         if (!s_vid_dragging_seek) {
             s_vid_pos_ms = mp4_player_pos_ms(s_mp4_player);
         }
-        if (mp4_player_take_dirty(s_mp4_player) || !s_vid_paused) {
+        if (mp4_player_take_dirty(s_mp4_player)) {
             s_dirty_vp = true;
         }
         s_vid_last_tick_ms = now;
@@ -6607,8 +7119,8 @@ void ipo_gui_tick(void) {
 }
 
 void ipo_gui_request_initial_video(const char *url) {
-    snprintf(s_pending_initial_video, sizeof(s_pending_initial_video),
-             "%s", (url && *url) ? url : "https://www.youtube.com/watch?v=YE7VzlLtp-4");
+    gui_set_str(&s_pending_initial_video,
+                (url && *url) ? url : "https://www.youtube.com/watch?v=YE7VzlLtp-4");
 }
 
 int ipo_gui_standalone_video_player(const char *url) {

@@ -547,6 +547,14 @@ void kill_html_stack_item(struct html_element *e)
 	if (e->attr.target_base) mem_free(e->attr.target_base);
 	if (e->attr.select) mem_free(e->attr.select);
 	free_js_event_spec(e->attr.js_event);
+#ifdef IPO_OS
+	free(e->css_tag);
+	free(e->css_id);
+	free(e->css_classes);
+	e->css_tag = NULL;
+	e->css_id = NULL;
+	e->css_classes = NULL;
+#endif
 	del_from_list(e);
 	mem_free(e);
 }
@@ -599,9 +607,9 @@ void html_stack_dup(void)
 #ifdef IPO_OS
 	e->css_box_pushed = 0;
 	e->css_flex_row = 0;
-	e->css_tag[0] = 0;
-	e->css_id[0] = 0;
-	e->css_classes[0] = 0;
+	e->css_tag = NULL;
+	e->css_id = NULL;
+	e->css_classes = NULL;
 #endif
 	add_to_list(html_stack, e);
 }
@@ -3323,47 +3331,59 @@ do {					\
 #ifdef IPO_OS
 				ipo_css_props_t css_p;
 				int has_css = 0;
-				char low_tag[20];
+				char *low_tag = NULL;
 				unsigned char *c_id = NULL, *c_cls = NULL, *c_sty = NULL;
 				int eff_disp = IPO_CSS_DISP_UNSET;
 				int eff_lb = ei->linebreak;
 				int parent_flex_row = html_top.css_flex_row;
 
 				memset(&css_p, 0, sizeof(css_p));
-				low_tag[0] = 0;
 				if (!html_top.invisible && current_f_data && current_f_data->css_sheet && !d_opt->plain) {
-					int tl = namelen < 19 ? namelen : 19;
-					int k, n_anc = 1;
-					ipo_css_node_t anc[32];
+					int k, n_anc = 1, anc_cap = 16;
+					ipo_css_node_t *anc = (ipo_css_node_t *)malloc((size_t)anc_cap * sizeof(ipo_css_node_t));
 					struct list_head *al_h;
 					struct html_element *ae;
-					for (k = 0; k < tl; k++) {
-						unsigned char ch = name[k];
-						low_tag[k] = (char)((ch >= 'A' && ch <= 'Z') ? (ch + 32) : ch);
+					if (namelen >= 0) {
+						low_tag = (char *)malloc((size_t)namelen + 1u);
+						if (low_tag) {
+							for (k = 0; k < namelen; k++) {
+								unsigned char ch = name[k];
+								low_tag[k] = (char)((ch >= 'A' && ch <= 'Z') ? (ch + 32) : ch);
+							}
+							low_tag[namelen] = 0;
+						}
 					}
-					low_tag[tl] = 0;
 					c_id = get_attr_val(attr, cast_uchar "id");
 					c_cls = get_attr_val(attr, cast_uchar "class");
 					c_sty = get_attr_val(attr, cast_uchar "style");
-					anc[0].tag = low_tag;
-					anc[0].id = (const char *)c_id;
-					anc[0].classes = (const char *)c_cls;
-					anc[0].raw_attr = attr;
-					foreach(struct html_element, ae, al_h, html_stack) {
-						if (n_anc >= 32) break;
-						if (ae->css_tag[0]) {
-							anc[n_anc].tag = ae->css_tag;
-							anc[n_anc].id = ae->css_id[0] ? ae->css_id : NULL;
-							anc[n_anc].classes = ae->css_classes[0] ? ae->css_classes : NULL;
-							anc[n_anc].raw_attr = ae->options;
-							n_anc++;
+					if (anc) {
+						anc[0].tag = low_tag ? low_tag : "";
+						anc[0].id = (const char *)c_id;
+						anc[0].classes = (const char *)c_cls;
+						anc[0].raw_attr = attr;
+						foreach(struct html_element, ae, al_h, html_stack) {
+							if (ae->css_tag && ae->css_tag[0]) {
+								if (n_anc >= anc_cap) {
+									int new_cap = anc_cap * 2;
+									ipo_css_node_t *na = (ipo_css_node_t *)realloc(anc, (size_t)new_cap * sizeof(ipo_css_node_t));
+									if (!na) break;
+									anc = na;
+									anc_cap = new_cap;
+								}
+								anc[n_anc].tag = ae->css_tag;
+								anc[n_anc].id = (ae->css_id && ae->css_id[0]) ? ae->css_id : NULL;
+								anc[n_anc].classes = (ae->css_classes && ae->css_classes[0]) ? ae->css_classes : NULL;
+								anc[n_anc].raw_attr = ae->options;
+								n_anc++;
+							}
 						}
-					}
-					{
-						int p_font = html_top.css_font_px > 0 ? html_top.css_font_px : 16;
-						uint32_t p_bg = html_top.css_has_bg ? html_top.css_bg_rgb :
-							(((uint32_t)(format_.bg.r & 0xff) << 16) | ((uint32_t)(format_.bg.g & 0xff) << 8) | (format_.bg.b & 0xff));
-						ipo_css_compute(current_f_data->css_sheet, anc, n_anc, (const char *)c_sty, p_font, p_bg, &css_p);
+						{
+							int p_font = html_top.css_font_px > 0 ? html_top.css_font_px : 16;
+							uint32_t p_bg = html_top.css_has_bg ? html_top.css_bg_rgb :
+								(((uint32_t)(format_.bg.r & 0xff) << 16) | ((uint32_t)(format_.bg.g & 0xff) << 8) | (format_.bg.b & 0xff));
+							ipo_css_compute(current_f_data->css_sheet, anc, n_anc, (const char *)c_sty, p_font, p_bg, &css_p);
+						}
+						free(anc);
 					}
 					has_css = 1;
 					eff_disp = css_p.display;
@@ -3389,6 +3409,7 @@ do {					\
 					if (c_id) mem_free(c_id);
 					if (c_cls) mem_free(c_cls);
 					if (c_sty) mem_free(c_sty);
+					free(low_tag);
 					if (ei->nopair == 1) goto set_lt;
 					html_stack_dup();
 					html_top.name = name;
@@ -3427,6 +3448,7 @@ do {					\
 						if (c_id) mem_free(c_id);
 						if (c_cls) mem_free(c_cls);
 						if (c_sty) mem_free(c_sty);
+						free(low_tag);
 						format_table(attr, html, eof, &html, f);
 						set_globals;
 						ln_break(2);
@@ -3437,6 +3459,7 @@ do {					\
 							if (c_id) mem_free(c_id);
 							if (c_cls) mem_free(c_cls);
 							if (c_sty) mem_free(c_sty);
+							free(low_tag);
 							goto set_lt;
 						}
 					}
@@ -3444,6 +3467,7 @@ do {					\
 						if (c_id) mem_free(c_id);
 						if (c_cls) mem_free(c_cls);
 						if (c_sty) mem_free(c_sty);
+						free(low_tag);
 						do_html_textarea(attr, html, eof, &html);
 						goto set_lt;
 					}
@@ -3476,9 +3500,9 @@ do {					\
 						html_top.namelen = namelen;
 						html_top.options = attr;
 						html_top.linebreak = eff_lb;
-						snprintf(html_top.css_tag, sizeof(html_top.css_tag), "%s", low_tag);
-						snprintf(html_top.css_id, sizeof(html_top.css_id), "%s", c_id ? (const char *)c_id : "");
-						snprintf(html_top.css_classes, sizeof(html_top.css_classes), "%s", c_cls ? (const char *)c_cls : "");
+						html_top.css_tag = (low_tag && low_tag[0]) ? strdup(low_tag) : NULL;
+						html_top.css_id = (c_id && c_id[0]) ? strdup((const char *)c_id) : NULL;
+						html_top.css_classes = (c_cls && c_cls[0]) ? strdup((const char *)c_cls) : NULL;
 						html_top.css_box_pushed = 0;
 						html_top.css_flex_row = (unsigned char)(eff_disp == IPO_CSS_DISP_FLEX_ROW);
 						if (has_css && css_p.list_style_none != -1)
@@ -3490,8 +3514,8 @@ do {					\
 					if (html_top.invisible == INVISIBLE_STYLE) style_start = html;
 					if (a_nb) par_format = pa;
 					if (self_elem && list_struct(html_stack.next, struct html_element) == self_elem && has_css && !html_top.invisible) {
-						int is_body_card = !strcmp(low_tag, "body") && (css_p.has_width || css_p.has_max_width || css_p.has_border || css_p.has_padding);
-						int is_root_only = !strcmp(low_tag, "html") || (!strcmp(low_tag, "body") && !is_body_card);
+						int is_body_card = low_tag && !strcmp(low_tag, "body") && (css_p.has_width || css_p.has_max_width || css_p.has_border || css_p.has_padding);
+						int is_root_only = low_tag && (!strcmp(low_tag, "html") || (!strcmp(low_tag, "body") && !is_body_card));
 						if (css_p.has_color) {
 							format_.fg.r = (css_p.color >> 16) & 0xff;
 							format_.fg.g = (css_p.color >> 8) & 0xff;
@@ -3578,6 +3602,7 @@ do {					\
 				if (c_id) mem_free(c_id);
 				if (c_cls) mem_free(c_cls);
 				if (c_sty) mem_free(c_sty);
+				free(low_tag);
 #else
 	/* treat <br> literally in <pre> (fixes source code viewer on github) */
 				if ((par_format.align == AL_NO || par_format.align == AL_NO_BREAKABLE) && !casestrcmp(cast_uchar ei->name, cast_uchar "BR"))

@@ -2,8 +2,10 @@
 #define _CPP_VECTOR_H
 
 #include <stddef.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <new>
+#include <utility>
 
 namespace std {
 
@@ -14,42 +16,198 @@ private:
     size_t m_size;
     size_t m_capacity;
 
+    static void oom_fail() {
+#ifdef __EXCEPTIONS
+        throw bad_alloc();
+#else
+        abort();
+#endif
+    }
+
     void reallocate(size_t new_cap) {
+        if (new_cap == 0u) return;
+        if (new_cap > ((size_t)-1) / sizeof(T)) {
+            oom_fail();
+        }
         T *new_data = (T *)malloc(new_cap * sizeof(T));
-        for (size_t i = 0; i < m_size; i++) {
-            new (&new_data[i]) T(m_data[i]);
+        if (!new_data) {
+            oom_fail();
+        }
+        size_t constructed = 0u;
+#ifdef __EXCEPTIONS
+        try {
+            for (size_t i = 0u; i < m_size; i++) {
+                new (&new_data[i]) T(move(m_data[i]));
+                constructed++;
+            }
+        } catch (...) {
+            for (size_t j = 0u; j < constructed; j++) {
+                new_data[j].~T();
+            }
+            free(new_data);
+            throw;
+        }
+#else
+        for (size_t i = 0u; i < m_size; i++) {
+            new (&new_data[i]) T(move(m_data[i]));
+            (void)constructed;
+        }
+#endif
+        for (size_t i = 0u; i < m_size; i++) {
             m_data[i].~T();
         }
-        if (m_data) free(m_data);
+        free(m_data);
         m_data = new_data;
         m_capacity = new_cap;
     }
+
 public:
-    vector() : m_data(nullptr), m_size(0), m_capacity(0) {}
+    vector() noexcept : m_data(nullptr), m_size(0u), m_capacity(0u) {}
+
+    explicit vector(size_t count) : m_data(nullptr), m_size(0u), m_capacity(0u) {
+        resize(count);
+    }
+
+    vector(size_t count, const T &val) : m_data(nullptr), m_size(0u), m_capacity(0u) {
+        reserve(count);
+        for (size_t i = 0u; i < count; i++) {
+            new (&m_data[i]) T(val);
+            m_size++;
+        }
+    }
+
+    vector(const vector &other) : m_data(nullptr), m_size(0u), m_capacity(0u) {
+        reserve(other.m_size);
+        for (size_t i = 0u; i < other.m_size; i++) {
+            new (&m_data[i]) T(other.m_data[i]);
+            m_size++;
+        }
+    }
+
+    vector(vector &&other) noexcept
+        : m_data(other.m_data), m_size(other.m_size), m_capacity(other.m_capacity) {
+        other.m_data = nullptr;
+        other.m_size = 0u;
+        other.m_capacity = 0u;
+    }
+
     ~vector() {
         clear();
-        if (m_data) free(m_data);
+        free(m_data);
+    }
+
+    vector& operator=(const vector &other) {
+        if (this != &other) {
+            vector tmp(other);
+            swap(m_data, tmp.m_data);
+            swap(m_size, tmp.m_size);
+            swap(m_capacity, tmp.m_capacity);
+        }
+        return *this;
+    }
+
+    vector& operator=(vector &&other) noexcept {
+        if (this != &other) {
+            clear();
+            free(m_data);
+            m_data = other.m_data;
+            m_size = other.m_size;
+            m_capacity = other.m_capacity;
+            other.m_data = nullptr;
+            other.m_size = 0u;
+            other.m_capacity = 0u;
+        }
+        return *this;
+    }
+
+    void reserve(size_t new_cap) {
+        if (new_cap > m_capacity) {
+            reallocate(new_cap);
+        }
+    }
+
+    void resize(size_t new_size) {
+        while (m_size > new_size) {
+            m_data[--m_size].~T();
+        }
+        if (new_size > m_capacity) {
+            reserve(new_size);
+        }
+        while (m_size < new_size) {
+            new (&m_data[m_size]) T();
+            m_size++;
+        }
+    }
+
+    void resize(size_t new_size, const T &val) {
+        while (m_size > new_size) {
+            m_data[--m_size].~T();
+        }
+        if (new_size > m_capacity) {
+            reserve(new_size);
+        }
+        while (m_size < new_size) {
+            new (&m_data[m_size]) T(val);
+            m_size++;
+        }
     }
 
     void push_back(const T &val) {
         if (m_size >= m_capacity) {
-            size_t new_cap = m_capacity == 0 ? 4 : m_capacity * 2;
+            size_t new_cap = (m_capacity == 0u) ? 4u : m_capacity * 2u;
             reallocate(new_cap);
         }
         new (&m_data[m_size]) T(val);
         m_size++;
     }
 
-    void clear() {
-        for (size_t i = 0; i < m_size; i++) {
-            m_data[i].~T();
+    void push_back(T &&val) {
+        if (m_size >= m_capacity) {
+            size_t new_cap = (m_capacity == 0u) ? 4u : m_capacity * 2u;
+            reallocate(new_cap);
         }
-        m_size = 0;
+        new (&m_data[m_size]) T(move(val));
+        m_size++;
     }
 
-    size_t size() const { return m_size; }
-    size_t capacity() const { return m_capacity; }
-    bool empty() const { return m_size == 0; }
+    template <typename... Args>
+    T& emplace_back(Args&&... args) {
+        if (m_size >= m_capacity) {
+            size_t new_cap = (m_capacity == 0u) ? 4u : m_capacity * 2u;
+            reallocate(new_cap);
+        }
+        new (&m_data[m_size]) T(forward<Args>(args)...);
+        return m_data[m_size++];
+    }
+
+    void pop_back() {
+        if (m_size > 0u) {
+            m_data[--m_size].~T();
+        }
+    }
+
+    void clear() noexcept {
+        for (size_t i = 0u; i < m_size; i++) {
+            m_data[i].~T();
+        }
+        m_size = 0u;
+    }
+
+    size_t size() const noexcept { return m_size; }
+    size_t capacity() const noexcept { return m_capacity; }
+    bool empty() const noexcept { return m_size == 0u; }
+
+    T* data() noexcept { return m_data; }
+    const T* data() const noexcept { return m_data; }
+    T* begin() noexcept { return m_data; }
+    T* end() noexcept { return m_data ? (m_data + m_size) : nullptr; }
+    const T* begin() const noexcept { return m_data; }
+    const T* end() const noexcept { return m_data ? (m_data + m_size) : nullptr; }
+
+    T& front() { return m_data[0]; }
+    const T& front() const { return m_data[0]; }
+    T& back() { return m_data[m_size - 1u]; }
+    const T& back() const { return m_data[m_size - 1u]; }
 
     T& operator[](size_t idx) { return m_data[idx]; }
     const T& operator[](size_t idx) const { return m_data[idx]; }
@@ -58,4 +216,3 @@ public:
 } // namespace std
 
 #endif
-

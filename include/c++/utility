@@ -1,0 +1,62 @@
+#ifndef _CPP_UTILITY_H
+#define _CPP_UTILITY_H
+
+#include <stddef.h>
+
+namespace std {
+
+template <typename T>
+struct remove_reference {
+    typedef T type;
+};
+
+template <typename T>
+struct remove_reference<T&> {
+    typedef T type;
+};
+
+template <typename T>
+struct remove_reference<T&&> {
+    typedef T type;
+};
+
+template <typename T>
+constexpr typename remove_reference<T>::type&& move(T&& t) noexcept {
+    return static_cast<typename remove_reference<T>::type&&>(t);
+}
+
+template <typename T>
+constexpr T&& forward(typename remove_reference<T>::type& t) noexcept {
+    return static_cast<T&&>(t);
+}
+
+template <typename T>
+constexpr T&& forward(typename remove_reference<T>::type&& t) noexcept {
+    return static_cast<T&&>(t);
+}
+
+template <typename T>
+inline void swap(T& a, T& b) {
+    T tmp(move(a));
+    a = move(b);
+    b = move(tmp);
+}
+
+template <typename T1, typename T2>
+struct pair {
+    T1 first;
+    T2 second;
+
+    pair() : first(), second() {}
+    pair(const T1& a, const T2& b) : first(a), second(b) {}
+    pair(T1&& a, T2&& b) : first(move(a)), second(move(b)) {}
+};
+
+template <typename T1, typename T2>
+inline pair<T1, T2> make_pair(T1 a, T2 b) {
+    return pair<T1, T2>(move(a), move(b));
+}
+
+} // namespace std
+
+#endif

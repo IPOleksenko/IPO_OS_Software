@@ -202,31 +202,52 @@ static void convert_i420_to_xrgb32(ipo_h264_dec_t *d,
     const int gv_c  = (sh >= 720) ? 136 : 208;
     const int bu_c  = (sh >= 720) ? 541 : 516;
 
+    int prev_sy = -1;
+    uint32_t *prev_out = NULL;
     for (int y = 0; y < dh; y++) {
         int sy = (y * sh) / dh;
+        uint32_t *out = dst_xrgb32 + (size_t)(oy + y) * (size_t)dst_w + ox;
+        if (sy == prev_sy && prev_out) {
+            memcpy(out, prev_out, (size_t)dw * sizeof(uint32_t));
+            continue;
+        }
         const uint8_t *y_row = py + (size_t)sy * (size_t)stride_y;
         const uint8_t *u_row = has_uv ? (pu + (size_t)(sy >> 1) * (size_t)stride_uv) : NULL;
         const uint8_t *v_row = has_uv ? (pv + (size_t)(sy >> 1) * (size_t)stride_uv) : NULL;
-        uint32_t *out = dst_xrgb32 + (size_t)(oy + y) * (size_t)dst_w + ox;
 
-        for (int x = 0; x < dw; x++) {
-            int sx = d->x_map ? d->x_map[x] : ((x * sw) / dw);
-            int yy = (int)y_row[sx] - 16;
-            if (yy < 0) yy = 0;
-            int y298 = yy * y_mul + 128;
-            if (u_row && v_row) {
+        if (u_row && v_row) {
+            int last_cx = -1;
+            int r_off = 0, g_off = 0, b_off = 0;
+            for (int x = 0; x < dw; x++) {
+                int sx = d->x_map ? d->x_map[x] : ((x * sw) / dw);
                 int cx = sx >> 1;
-                int u = (int)u_row[cx] - 128;
-                int v = (int)v_row[cx] - 128;
-                uint8_t r = clamp_u8((y298 + rv_c * v) >> 8);
-                uint8_t g = clamp_u8((y298 - gu_c * u - gv_c * v) >> 8);
-                uint8_t b = clamp_u8((y298 + bu_c * u) >> 8);
-                out[x] = 0xFF000000u | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
-            } else {
-                uint8_t l = clamp_u8(y298 >> 8);
-                out[x] = 0xFF000000u | ((uint32_t)l << 16) | ((uint32_t)l << 8) | (uint32_t)l;
+                if (cx != last_cx) {
+                    last_cx = cx;
+                    int u = (int)u_row[cx] - 128;
+                    int v = (int)v_row[cx] - 128;
+                    r_off = rv_c * v;
+                    g_off = -(gu_c * u + gv_c * v);
+                    b_off = bu_c * u;
+                }
+                int yy = (int)y_row[sx] - 16;
+                if (yy < 0) yy = 0;
+                int y298 = yy * y_mul + 128;
+                uint8_t r = clamp_u8((y298 + r_off) >> 8);
+                uint8_t g = clamp_u8((y298 + g_off) >> 8);
+                uint8_t b = clamp_u8((y298 + b_off) >> 8);
+                out[x] = 0x80000000u | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
+            }
+        } else {
+            for (int x = 0; x < dw; x++) {
+                int sx = d->x_map ? d->x_map[x] : ((x * sw) / dw);
+                int yy = (int)y_row[sx] - 16;
+                if (yy < 0) yy = 0;
+                uint8_t l = clamp_u8((yy * y_mul + 128) >> 8);
+                out[x] = 0x80000000u | ((uint32_t)l << 16) | ((uint32_t)l << 8) | (uint32_t)l;
             }
         }
+        prev_sy = sy;
+        prev_out = out;
     }
 }
 

@@ -12,7 +12,8 @@
 #define CONFIG_TCC_LIBPATHS "/lib"
 #define CONFIG_TCC_CRTPREFIX "/lib"
 #define CONFIG_TCC_PREDEFS 1
-#define CONFIG_TCC_STATIC 1
+/* Use libc's dynamic dlopen/dlsym/dlclose/dlerror instead of static stubs */
+/* #undef CONFIG_TCC_STATIC */
 #define CONFIG_TCC_SEMLOCK 0
 
 #endif

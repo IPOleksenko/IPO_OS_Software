@@ -1,0 +1,29 @@
+#pragma once
+#include <exception>
+#include <string>
+
+namespace std {
+
+class logic_error : public exception {
+    string m_msg;
+public:
+    explicit logic_error(const string& msg) : m_msg(msg) {}
+    explicit logic_error(const char* msg) : m_msg(msg ? msg : "logic_error") {}
+    const char* what() const noexcept override { return m_msg.c_str(); }
+};
+
+class invalid_argument : public logic_error {
+public:
+    explicit invalid_argument(const string& msg) : logic_error(msg) {}
+    explicit invalid_argument(const char* msg) : logic_error(msg) {}
+};
+
+class runtime_error : public exception {
+    string m_msg;
+public:
+    explicit runtime_error(const string& msg) : m_msg(msg) {}
+    explicit runtime_error(const char* msg) : m_msg(msg ? msg : "runtime_error") {}
+    const char* what() const noexcept override { return m_msg.c_str(); }
+};
+
+} // namespace std

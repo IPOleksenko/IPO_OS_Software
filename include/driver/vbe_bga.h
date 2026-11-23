@@ -39,7 +39,7 @@
 
 typedef struct {
     bool     available;
-    uint32_t lfb_addr;
+    uint64_t lfb_addr;
     int      width;
     int      height;
     int      bpp;
@@ -48,7 +48,7 @@ typedef struct {
 bool     vbe_bga_probe(vbe_bga_info_t *out_info);
 bool     vbe_bga_is_available(void);
 bool     vbe_bga_is_enabled(void);
-uint32_t vbe_bga_get_lfb_address(void);
+uint64_t vbe_bga_get_lfb_address(void);
 bool     vbe_bga_set_mode(int width, int height, int bpp);
 void     vbe_bga_restore_text_mode(void);
 void    *vbe_bga_get_framebuffer(void);

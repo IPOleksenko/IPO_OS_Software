@@ -1,6 +1,7 @@
 #include "ipo_css.h"
 
 #include <ctype.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -12,13 +13,6 @@
 /* Links' raw attr accessor declared in upstream/html.c */
 extern unsigned char *get_attr_val(unsigned char *e, unsigned char *name);
 
-#define CSS_MAX_SEGS        8
-#define CSS_MAX_CLASSES     4
-#define CSS_MAX_VARS        256
-#define CSS_MAX_DECLS_RULE  32
-#define CSS_MAX_RULES       1536
-#define CSS_MAX_MATCHES     192
-
 typedef enum {
     COMB_NONE = 0,
     COMB_DESC,
@@ -26,12 +20,12 @@ typedef enum {
 } css_comb_t;
 
 typedef struct {
-    char tag[20];
-    char id[48];
-    char classes[CSS_MAX_CLASSES][40];
-    uint8_t n_classes;
-    char attr_name[24];
-    char attr_val[32];
+    char *tag;
+    char *id;
+    char **classes;
+    size_t n_classes;
+    char *attr_name;
+    char *attr_val;
     uint8_t attr_op;   /* 0=none, 1=exists, 2=exact, 3=word(~=), 4=contains(*=) */
     css_comb_t comb_to_prev; /* relationship with previous (left) ancestor segment */
 } css_seg_t;
@@ -43,13 +37,46 @@ typedef struct {
 } css_decl_t;
 
 typedef struct {
-    css_seg_t segs[CSS_MAX_SEGS];
-    uint8_t n_segs;
+    css_seg_t *segs;
+    size_t n_segs;
     uint32_t specificity;
     uint32_t order;
     css_decl_t *decls;
     uint16_t n_decls;
 } css_rule_t;
+
+static char *css_dup_n(const char *s, size_t len) {
+    if (!s) return NULL;
+    char *out = (char *)malloc(len + 1u);
+    if (!out) return NULL;
+    if (len > 0u) memcpy(out, s, len);
+    out[len] = '\0';
+    return out;
+}
+
+static char *css_dup_lower_n(const char *s, size_t len) {
+    char *out = css_dup_n(s, len);
+    if (!out) return NULL;
+    for (size_t i = 0; i < len; i++) {
+        out[i] = (char)tolower((unsigned char)out[i]);
+    }
+    return out;
+}
+
+static void css_free_segs(css_seg_t *segs, size_t n_segs) {
+    if (!segs) return;
+    for (size_t i = 0; i < n_segs; i++) {
+        free(segs[i].tag);
+        free(segs[i].id);
+        for (size_t c = 0; c < segs[i].n_classes; c++) {
+            free(segs[i].classes[c]);
+        }
+        free(segs[i].classes);
+        free(segs[i].attr_name);
+        free(segs[i].attr_val);
+    }
+    free(segs);
+}
 
 typedef struct {
     char *name;
@@ -61,8 +88,9 @@ struct ipo_css_sheet {
     css_rule_t *rules;
     size_t n_rules;
     size_t cap_rules;
-    css_var_t vars[CSS_MAX_VARS];
+    css_var_t *vars;
     size_t n_vars;
+    size_t cap_vars;
     uint32_t next_order;
 };
 
@@ -161,7 +189,13 @@ static void css_set_var(ipo_css_sheet_t *sheet, const char *name, const char *va
             return;
         }
     }
-    if (sheet->n_vars >= CSS_MAX_VARS) return;
+    if (sheet->n_vars >= sheet->cap_vars) {
+        size_t nc = sheet->cap_vars ? (sheet->cap_vars * 2u) : 32u;
+        css_var_t *nvars = (css_var_t *)realloc(sheet->vars, nc * sizeof(css_var_t));
+        if (!nvars) return;
+        sheet->vars = nvars;
+        sheet->cap_vars = nc;
+    }
     char *nn = strdup(name);
     char *nv = strdup(val);
     if (!nn || !nv) { free(nn); free(nv); return; }
@@ -178,16 +212,51 @@ static const char *css_find_var(const ipo_css_sheet_t *sheet, const char *name) 
     return NULL;
 }
 
-static void css_resolve_vars(const ipo_css_sheet_t *sheet, const char *in, char *out, size_t cap, int depth) {
-    if (!in || cap == 0) { if (cap) out[0] = 0; return; }
-    if (depth > 4 || !strstr(in, "var(")) {
-        snprintf(out, cap, "%s", in);
-        return;
+typedef struct {
+    char *data;
+    size_t len;
+    size_t cap;
+} css_sb_t;
+
+static bool css_sb_append_n(css_sb_t *sb, const char *s, size_t n) {
+    if (!sb) return false;
+    if (!s || n == 0u) {
+        if (!sb->data) {
+            sb->cap = 32u;
+            sb->data = (char *)malloc(sb->cap);
+            if (!sb->data) { sb->cap = 0; return false; }
+            sb->data[0] = '\0';
+        }
+        return true;
     }
-    char tmp[512];
-    size_t pos = 0;
+    if (n > SIZE_MAX - sb->len - 1u) return false;
+    size_t need = sb->len + n + 1u;
+    if (need > sb->cap) {
+        size_t nc = sb->cap ? sb->cap : 64u;
+        while (nc < need) {
+            if (nc > SIZE_MAX / 2u) { nc = need; break; }
+            nc *= 2u;
+        }
+        char *nb = (char *)realloc(sb->data, nc);
+        if (!nb) return false;
+        sb->data = nb;
+        sb->cap = nc;
+    }
+    memcpy(sb->data + sb->len, s, n);
+    sb->len += n;
+    sb->data[sb->len] = '\0';
+    return true;
+}
+
+static char *css_resolve_vars_alloc(const ipo_css_sheet_t *sheet, const char *in, int depth) {
+    if (!in) return strdup("");
+    if (depth > 32 || !strstr(in, "var(")) {
+        return strdup(in);
+    }
+    css_sb_t sb = { NULL, 0, 0 };
+    css_sb_append_n(&sb, "", 0u);
     const char *p = in;
-    while (*p && pos + 1 < sizeof(tmp)) {
+    while (*p) {
         if (strncasecmp(p, "var(", 4) == 0) {
             const char *q = p + 4;
             int parens = 1;
@@ -200,43 +269,38 @@ static void css_resolve_vars(const ipo_css_sheet_t *sheet, const char *in, char 
             }
             if (parens == 0) {
                 const char *vname_end = comma ? comma : q;
-                char vname[64];
                 const char *ns = p + 4;
                 while (ns < vname_end && isspace((unsigned char)*ns)) ns++;
                 size_t nl = (size_t)(vname_end - ns);
                 while (nl > 0 && isspace((unsigned char)ns[nl - 1])) nl--;
-                if (nl >= sizeof(vname)) nl = sizeof(vname) - 1;
-                memcpy(vname, ns, nl);
-                vname[nl] = 0;
-                const char *resolved = css_find_var(sheet, vname);
-                char fb[256];
-                fb[0] = 0;
+                char *vname = css_dup_n(ns, nl);
+                const char *resolved = vname ? css_find_var(sheet, vname) : NULL;
+                char *fb = NULL;
                 if (!resolved && comma && q > comma + 1) {
                     const char *fs = comma + 1;
                     while (fs < q && isspace((unsigned char)*fs)) fs++;
                     size_t fl = (size_t)(q - fs);
                     while (fl > 0 && isspace((unsigned char)fs[fl - 1])) fl--;
-                    if (fl >= sizeof(fb)) fl = sizeof(fb) - 1;
-                    memcpy(fb, fs, fl);
-                    fb[fl] = 0;
+                    fb = css_dup_n(fs, fl);
                     resolved = fb;
                 }
                 if (resolved) {
-                    char rec[256];
-                    css_resolve_vars(sheet, resolved, rec, sizeof(rec), depth + 1);
-                    size_t rl = strlen(rec);
-                    if (pos + rl >= sizeof(tmp)) rl = sizeof(tmp) - 1 - pos;
-                    memcpy(tmp + pos, rec, rl);
-                    pos += rl;
+                    char *rec = css_resolve_vars_alloc(sheet, resolved, depth + 1);
+                    if (rec) {
+                        css_sb_append_n(&sb, rec, strlen(rec));
+                        free(rec);
+                    }
                 }
+                free(fb);
+                free(vname);
                 p = q + 1;
                 continue;
             }
         }
-        tmp[pos++] = *p++;
+        if (!css_sb_append_n(&sb, p, 1u)) break;
+        p++;
     }
-    tmp[pos] = 0;
-    snprintf(out, cap, "%s", tmp);
+    return sb.data ? sb.data : strdup("");
 }
 
 static uint32_t blend_rgb(uint32_t fg, uint32_t bg, int alpha_255) {
@@ -301,24 +365,26 @@ static uint32_t hsl_to_rgb(double h, double s_pct, double l_pct) {
 }
 
 int ipo_css_parse_color(const ipo_css_sheet_t *sheet, const char *val, uint32_t parent_bg, uint32_t *out_rgb, int *out_transparent) {
-    char buf[256];
     if (out_transparent) *out_transparent = 0;
     if (!val) return 0;
-    css_resolve_vars(sheet, val, buf, sizeof(buf), 0);
+    char *buf = css_resolve_vars_alloc(sheet, val, 0);
+    if (!buf) return 0;
     char *s = buf;
     while (*s && isspace((unsigned char)*s)) s++;
     size_t slen = strlen(s);
     while (slen > 0 && isspace((unsigned char)s[slen - 1])) s[--slen] = 0;
-    if (!slen) return 0;
+    if (!slen) { free(buf); return 0; }
 
     if (strcasecmp(s, "transparent") == 0) {
         if (out_transparent) *out_transparent = 1;
         *out_rgb = parent_bg & 0xFFFFFFu;
+        free(buf);
         return 1;
     }
     if (strcasecmp(s, "none") == 0 || strcasecmp(s, "initial") == 0 ||
         strcasecmp(s, "unset") == 0 || strcasecmp(s, "inherit") == 0 ||
         strcasecmp(s, "currentColor") == 0) {
+        free(buf);
         return 0;
     }
 
@@ -338,12 +404,14 @@ int ipo_css_parse_color(const ipo_css_sheet_t *sheet, const char *val, uint32_t 
             p++;
         }
         size_t fl = (size_t)(p - start);
-        if (fl > 0 && fl < 120) {
-            char first[128];
-            memcpy(first, start, fl);
-            first[fl] = 0;
-            return ipo_css_parse_color(sheet, first, parent_bg, out_rgb, out_transparent);
+        if (fl > 0) {
+            char *first = css_dup_n(start, fl);
+            int ok = first ? ipo_css_parse_color(sheet, first, parent_bg, out_rgb, out_transparent) : 0;
+            free(first);
+            free(buf);
+            return ok;
         }
+        free(buf);
         return 0;
     }
 
@@ -353,27 +421,30 @@ int ipo_css_parse_color(const ipo_css_sheet_t *sheet, const char *val, uint32_t 
         if (hl == 3 || hl == 4) {
             int r = hex_val(h[0]), g = hex_val(h[1]), b = hex_val(h[2]);
             int a = (hl == 4) ? hex_val(h[3]) : 15;
-            if (r < 0 || g < 0 || b < 0 || a < 0) return 0;
+            if (r < 0 || g < 0 || b < 0 || a < 0) { free(buf); return 0; }
             uint32_t col = ((uint32_t)(r * 17) << 16) | ((uint32_t)(g * 17) << 8) | (uint32_t)(b * 17);
             int alpha = a * 17;
-            if (alpha < 20) { if (out_transparent) *out_transparent = 1; *out_rgb = parent_bg; return 1; }
+            if (alpha < 20) { if (out_transparent) *out_transparent = 1; *out_rgb = parent_bg; free(buf); return 1; }
             *out_rgb = blend_rgb(col, parent_bg, alpha);
+            free(buf);
             return 1;
         }
         if (hl == 6 || hl == 8) {
             int digits[8];
             for (size_t i = 0; i < hl; i++) {
                 digits[i] = hex_val(h[i]);
-                if (digits[i] < 0) return 0;
+                if (digits[i] < 0) { free(buf); return 0; }
             }
             uint32_t col = ((uint32_t)((digits[0] << 4) | digits[1]) << 16) |
                            ((uint32_t)((digits[2] << 4) | digits[3]) << 8) |
                            (uint32_t)((digits[4] << 4) | digits[5]);
             int alpha = (hl == 8) ? ((digits[6] << 4) | digits[7]) : 255;
-            if (alpha < 20) { if (out_transparent) *out_transparent = 1; *out_rgb = parent_bg; return 1; }
+            if (alpha < 20) { if (out_transparent) *out_transparent = 1; *out_rgb = parent_bg; free(buf); return 1; }
             *out_rgb = blend_rgb(col, parent_bg, alpha);
+            free(buf);
             return 1;
         }
+        free(buf);
         return 0;
     }
 
@@ -391,11 +462,12 @@ int ipo_css_parse_color(const ipo_css_sheet_t *sheet, const char *val, uint32_t 
             if (av < 0.0) av = 0.0; if (av > 1.0) av = 1.0;
             alpha = (int)(av * 255.0 + 0.5);
         }
-        if (alpha < 20) { if (out_transparent) *out_transparent = 1; *out_rgb = parent_bg; return 1; }
+        if (alpha < 20) { if (out_transparent) *out_transparent = 1; *out_rgb = parent_bg; free(buf); return 1; }
         uint32_t raw = ((uint32_t)clamp_byte((int)(r + 0.5)) << 16) |
                        ((uint32_t)clamp_byte((int)(g + 0.5)) << 8) |
                        (uint32_t)clamp_byte((int)(b + 0.5));
         *out_rgb = blend_rgb(raw, parent_bg, alpha);
+        free(buf);
         return 1;
     }
 
@@ -414,9 +486,10 @@ int ipo_css_parse_color(const ipo_css_sheet_t *sheet, const char *val, uint32_t 
             if (av < 0.0) av = 0.0; if (av > 1.0) av = 1.0;
             alpha = (int)(av * 255.0 + 0.5);
         }
-        if (alpha < 20) { if (out_transparent) *out_transparent = 1; *out_rgb = parent_bg; return 1; }
+        if (alpha < 20) { if (out_transparent) *out_transparent = 1; *out_rgb = parent_bg; free(buf); return 1; }
         uint32_t raw = hsl_to_rgb(h, sat, lig);
         *out_rgb = blend_rgb(raw, parent_bg, alpha);
+        free(buf);
         return 1;
     }
 
@@ -427,41 +500,46 @@ int ipo_css_parse_color(const ipo_css_sheet_t *sheet, const char *val, uint32_t 
         int cmp = strcasecmp(s, k_css_colors[mid].name);
         if (cmp == 0) {
             *out_rgb = k_css_colors[mid].rgb;
+            free(buf);
             return 1;
         }
         if (cmp < 0) hi = mid;
         else lo = mid + 1;
     }
+    free(buf);
     return 0;
 }
 
 /* Parse length in px; returns 1 on success, 0 on auto/unsupported. Negative *out_px represents negative percentage if allow_pct. */
 static int css_parse_length(const ipo_css_sheet_t *sheet, const char *val, int font_px, int allow_pct, int *out_px, int *is_auto) {
-    char buf[128];
     if (is_auto) *is_auto = 0;
     if (!val) return 0;
-    css_resolve_vars(sheet, val, buf, sizeof(buf), 0);
+    char *buf = css_resolve_vars_alloc(sheet, val, 0);
+    if (!buf) return 0;
     const char *s = buf;
     while (*s && isspace((unsigned char)*s)) s++;
-    if (!*s) return 0;
+    if (!*s) { free(buf); return 0; }
     if (strncasecmp(s, "auto", 4) == 0) {
         if (is_auto) *is_auto = 1;
+        free(buf);
         return 0;
     }
     if (strncasecmp(s, "none", 4) == 0 || strncasecmp(s, "fit-content", 11) == 0 ||
         strncasecmp(s, "max-content", 11) == 0 || strncasecmp(s, "min-content", 11) == 0) {
+        free(buf);
         return 0;
     }
     char *e = NULL;
     double v = strtod(s, &e);
-    if (e == s) return 0;
+    if (e == s) { free(buf); return 0; }
     while (*e && isspace((unsigned char)*e)) e++;
     double px = v;
     if (*e == '%') {
-        if (!allow_pct) return 0;
+        if (!allow_pct) { free(buf); return 0; }
         int p = (int)(v + (v >= 0 ? 0.5 : -0.5));
         if (p < 0) p = 0; if (p > 100) p = 100;
         *out_px = -p;
+        free(buf);
         return 1;
     } else if (strncasecmp(e, "rem", 3) == 0) {
         px = v * 16.0;
@@ -483,18 +561,29 @@ static int css_parse_length(const ipo_css_sheet_t *sheet, const char *val, int f
     } else if (strncasecmp(e, "thick", 5) == 0) {
         px = 3.0;
     } else {
+        free(buf);
         return 0;
     }
+    free(buf);
     if (px < 0) px = 0;
     if (px > 4000) px = 4000;
     *out_px = (int)(px + 0.5);
     return 1;
 }
 
-/* Split whitespace-delimited CSS shorthand tokens, keeping (...) grouped */
-static int css_split_tokens(const char *s, char tokens[8][96]) {
-    int n = 0;
-    while (*s && n < 8) {
+static void css_free_tokens(char **tokens, int n) {
+    if (!tokens) return;
+    for (int i = 0; i < n; i++) free(tokens[i]);
+    free(tokens);
+}
+
+/* Split whitespace-delimited CSS shorthand tokens dynamically, keeping (...) grouped */
+static char **css_split_tokens_alloc(const char *s, int *out_count) {
+    *out_count = 0;
+    if (!s) return NULL;
+    char **tokens = NULL;
+    int n = 0, cap = 0;
+    while (*s) {
         while (*s && isspace((unsigned char)*s)) s++;
         if (!*s) break;
         const char *st = s;
@@ -505,21 +594,29 @@ static int css_split_tokens(const char *s, char tokens[8][96]) {
             s++;
         }
         size_t l = (size_t)(s - st);
-        if (l >= 96) l = 95;
-        memcpy(tokens[n], st, l);
-        tokens[n][l] = 0;
-        n++;
+        char *tok = css_dup_n(st, l);
+        if (!tok) { css_free_tokens(tokens, n); *out_count = 0; return NULL; }
+        if (n >= cap) {
+            int nc = cap ? cap * 2 : 8;
+            char **nt = (char **)realloc(tokens, (size_t)nc * sizeof(char *));
+            if (!nt) { free(tok); css_free_tokens(tokens, n); *out_count = 0; return NULL; }
+            tokens = nt;
+            cap = nc;
+        }
+        tokens[n++] = tok;
     }
-    return n;
+    *out_count = n;
+    return tokens;
 }
 
 static void parse_box_4_lengths(const ipo_css_sheet_t *sheet, const char *val, int font_px,
                                 int16_t out[4], uint8_t *auto_l, uint8_t *auto_r) {
-    char resolved[256];
-    char tok[8][96];
-    css_resolve_vars(sheet, val, resolved, sizeof(resolved), 0);
-    int n = css_split_tokens(resolved, tok);
-    if (n <= 0) return;
+    char *resolved = css_resolve_vars_alloc(sheet, val, 0);
+    if (!resolved) return;
+    int n = 0;
+    char **tok = css_split_tokens_alloc(resolved, &n);
+    free(resolved);
+    if (!tok || n <= 0) { css_free_tokens(tok, n); return; }
     int px[4] = {0, 0, 0, 0};
     int aut[4] = {0, 0, 0, 0};
     int valid[4] = {0, 0, 0, 0};
@@ -527,6 +624,7 @@ static void parse_box_4_lengths(const ipo_css_sheet_t *sheet, const char *val, i
     for (int i = 0; i < cnt; i++) {
         valid[i] = css_parse_length(sheet, tok[i], font_px, 0, &px[i], &aut[i]);
     }
+    css_free_tokens(tok, n);
     int map[4];
     if (cnt == 1) { map[0] = map[1] = map[2] = map[3] = 0; }
     else if (cnt == 2) { map[0] = map[2] = 0; map[1] = map[3] = 1; }
@@ -542,13 +640,13 @@ static void parse_box_4_lengths(const ipo_css_sheet_t *sheet, const char *val, i
 
 static void apply_decl(const ipo_css_sheet_t *sheet, const char *prop, const char *val,
                        int parent_font_px, uint32_t parent_bg_rgb, ipo_css_props_t *st) {
-    char vbuf[256];
-    css_resolve_vars(sheet, val, vbuf, sizeof(vbuf), 0);
+    char *vbuf = css_resolve_vars_alloc(sheet, val, 0);
+    if (!vbuf) return;
     char *v = vbuf;
     while (*v && isspace((unsigned char)*v)) v++;
     size_t vl = strlen(v);
     while (vl > 0 && isspace((unsigned char)v[vl - 1])) v[--vl] = 0;
-    if (!vl) return;
+    if (!vl) { free(vbuf); return; }
 
     if (strcmp(prop, "color") == 0) {
         uint32_t col = 0;
@@ -567,6 +665,7 @@ static void apply_decl(const ipo_css_sheet_t *sheet, const char *prop, const cha
     } else if (strcmp(prop, "background") == 0) {
         if (strcasecmp(v, "none") == 0 || strcasecmp(v, "transparent") == 0) {
             st->has_bg = 0;
+            free(vbuf);
             return;
         }
         /* Extract first color token or linear-gradient stop color */
@@ -574,37 +673,41 @@ static void apply_decl(const ipo_css_sheet_t *sheet, const char *prop, const cha
         if (lg) {
             const char *p = lg + 16;
             while (*p) {
-                char seg[64];
-                size_t si = 0;
+                const char *seg_st = p;
                 int par = 0;
                 while (*p && (par > 0 || (*p != ',' && *p != ')'))) {
                     if (*p == '(') par++;
                     else if (*p == ')' && par > 0) par--;
-                    if (si + 1 < sizeof(seg)) seg[si++] = *p;
                     p++;
                 }
-                seg[si] = 0;
-                uint32_t col = 0;
-                int transp = 0;
-                /* Trim optional stop percentage like "#1a73e8 0%" */
-                char *sp = seg;
-                while (*sp && isspace((unsigned char)*sp)) sp++;
-                if (strncasecmp(sp, "rgb", 3) != 0 && strncasecmp(sp, "hsl", 3) != 0) {
-                    char *w = strpbrk(sp, " \t");
-                    if (w) *w = 0;
-                }
-                if (ipo_css_parse_color(sheet, sp, parent_bg_rgb, &col, &transp) && !transp) {
-                    st->has_bg = 1;
-                    st->bg = col;
-                    return;
+                char *seg = css_dup_n(seg_st, (size_t)(p - seg_st));
+                if (seg) {
+                    uint32_t col = 0;
+                    int transp = 0;
+                    /* Trim optional stop percentage like "#1a73e8 0%" */
+                    char *sp = seg;
+                    while (*sp && isspace((unsigned char)*sp)) sp++;
+                    if (strncasecmp(sp, "rgb", 3) != 0 && strncasecmp(sp, "hsl", 3) != 0) {
+                        char *w = strpbrk(sp, " \t");
+                        if (w) *w = 0;
+                    }
+                    if (ipo_css_parse_color(sheet, sp, parent_bg_rgb, &col, &transp) && !transp) {
+                        st->has_bg = 1;
+                        st->bg = col;
+                        free(seg);
+                        free(vbuf);
+                        return;
+                    }
+                    free(seg);
                 }
                 if (!*p || *p == ')') break;
                 p++;
             }
+            free(vbuf);
             return;
         }
-        char tok[8][96];
-        int nt = css_split_tokens(v, tok);
+        int nt = 0;
+        char **tok = css_split_tokens_alloc(v, &nt);
         for (int i = 0; i < nt; i++) {
             uint32_t col = 0;
             int transp = 0;
@@ -614,6 +717,7 @@ static void apply_decl(const ipo_css_sheet_t *sheet, const char *prop, const cha
                 break;
             }
         }
+        css_free_tokens(tok, nt);
     } else if (strcmp(prop, "display") == 0) {
         if (strcasecmp(v, "none") == 0) st->display = IPO_CSS_DISP_NONE;
         else if (strcasecmp(v, "block") == 0 || strcasecmp(v, "table") == 0 || strcasecmp(v, "grid") == 0) st->display = IPO_CSS_DISP_BLOCK;
@@ -735,10 +839,11 @@ static void apply_decl(const ipo_css_sheet_t *sheet, const char *prop, const cha
         if (strcasecmp(v, "none") == 0 || strcasecmp(v, "0") == 0) {
             if (side < 0) memset(st->border_w, 0, sizeof(st->border_w));
             else st->border_w[side] = 0;
+            free(vbuf);
             return;
         }
-        char tok[8][96];
-        int nt = css_split_tokens(v, tok);
+        int nt = 0;
+        char **tok = css_split_tokens_alloc(v, &nt);
         int bw = 1;
         int got_w = 0;
         uint32_t bcol = st->has_border ? st->border_color : 0xCCCCCCu;
@@ -760,6 +865,7 @@ static void apply_decl(const ipo_css_sheet_t *sheet, const char *prop, const cha
                 }
             }
         }
+        css_free_tokens(tok, nt);
         if (got_style_none) bw = 0;
         else if (!got_w) bw = 1;
         if (bw > 0) { st->has_border = 1; st->border_color = bcol; }
@@ -783,9 +889,13 @@ static void apply_decl(const ipo_css_sheet_t *sheet, const char *prop, const cha
             if (w > 0) st->has_border = 1;
         }
     }
+    free(vbuf);
 }
 
-static size_t parse_decls_into(const char *blk, size_t len, css_decl_t *out, size_t max_out, ipo_css_sheet_t *var_sink) {
+static size_t parse_decls_into(const char *blk, size_t len, css_decl_t **out_decls, ipo_css_sheet_t *var_sink) {
+    if (out_decls) *out_decls = NULL;
+    css_decl_t *out = NULL;
+    size_t cap = 0;
     size_t n = 0;
     size_t i = 0;
     while (i < len) {
@@ -848,7 +958,18 @@ static size_t parse_decls_into(const char *blk, size_t len, css_decl_t *out, siz
             }
         }
 
-        if (n < max_out && *prop && *val) {
+        if (*prop && *val) {
+            if (n >= cap) {
+                size_t next_cap = cap ? (cap * 2u) : 8u;
+                css_decl_t *nd = (css_decl_t *)realloc(out, next_cap * sizeof(css_decl_t));
+                if (!nd) {
+                    free(prop);
+                    free(val);
+                    break;
+                }
+                out = nd;
+                cap = next_cap;
+            }
             out[n].prop = prop;
             out[n].val = val;
             out[n].important = important;
@@ -858,14 +979,23 @@ static size_t parse_decls_into(const char *blk, size_t len, css_decl_t *out, siz
             free(val);
         }
     }
+    if (n == 0) {
+        free(out);
+        out = NULL;
+    }
+    if (out_decls) *out_decls = out;
     return n;
 }
 
-static int parse_selector_branch(const char *sel, size_t len, css_seg_t segs[CSS_MAX_SEGS], int *out_n, uint32_t *out_spec) {
+static int parse_selector_branch(const char *sel, size_t len, css_seg_t **out_segs, size_t *out_n, uint32_t *out_spec) {
+    *out_segs = NULL;
+    *out_n = 0;
     char *buf = css_trim_dup(sel, len);
     if (!buf) return 0;
     const char *p = buf;
-    int n = 0;
+    css_seg_t *segs = NULL;
+    size_t n = 0;
+    size_t cap = 0;
     uint32_t spec = 0;
     css_comb_t pending_comb = COMB_NONE;
 
@@ -873,18 +1003,26 @@ static int parse_selector_branch(const char *sel, size_t len, css_seg_t segs[CSS
         while (*p && isspace((unsigned char)*p)) p++;
         if (!*p) break;
         if (*p == '>') {
-            if (n == 0) { free(buf); return 0; }
+            if (n == 0) { css_free_segs(segs, n); free(buf); return 0; }
             pending_comb = COMB_CHILD;
             p++;
             continue;
         }
-        if (*p == '+' || *p == '~') { free(buf); return 0; }
-        if (n >= CSS_MAX_SEGS) { free(buf); return 0; }
+        if (*p == '+' || *p == '~') { css_free_segs(segs, n); free(buf); return 0; }
+        if (n >= cap) {
+            size_t new_cap = cap ? (cap * 2u) : 8u;
+            if (new_cap <= cap || new_cap > SIZE_MAX / sizeof(css_seg_t)) { css_free_segs(segs, n); free(buf); return 0; }
+            css_seg_t *ns = (css_seg_t *)realloc(segs, new_cap * sizeof(css_seg_t));
+            if (!ns) { css_free_segs(segs, n); free(buf); return 0; }
+            segs = ns;
+            cap = new_cap;
+        }
 
         css_seg_t *sg = &segs[n];
         memset(sg, 0, sizeof(*sg));
         sg->comb_to_prev = (n == 0) ? COMB_NONE : (pending_comb == COMB_CHILD ? COMB_CHILD : COMB_DESC);
         pending_comb = COMB_DESC;
+        n++;
 
         int parsed_any = 0;
         if (isalnum((unsigned char)*p) || *p == '*' || *p == '_' || *p == '-') {
@@ -892,9 +1030,8 @@ static int parse_selector_branch(const char *sel, size_t len, css_seg_t segs[CSS
             while (*p && (isalnum((unsigned char)*p) || *p == '*' || *p == '_' || *p == '-')) p++;
             size_t l = (size_t)(p - st);
             if (!(l == 1 && st[0] == '*')) {
-                if (l >= sizeof(sg->tag)) l = sizeof(sg->tag) - 1;
-                for (size_t k = 0; k < l; k++) sg->tag[k] = (char)tolower((unsigned char)st[k]);
-                sg->tag[l] = 0;
+                sg->tag = css_dup_lower_n(st, l);
+                if (!sg->tag) { css_free_segs(segs, n); free(buf); return 0; }
                 spec += 1;
             }
             parsed_any = 1;
@@ -907,23 +1044,23 @@ static int parse_selector_branch(const char *sel, size_t len, css_seg_t segs[CSS
                 const char *st = p;
                 while (*p && (isalnum((unsigned char)*p) || *p == '-' || *p == '_')) p++;
                 size_t l = (size_t)(p - st);
-                if (l == 0) { free(buf); return 0; }
-                if (l >= sizeof(sg->id)) l = sizeof(sg->id) - 1;
-                memcpy(sg->id, st, l);
-                sg->id[l] = 0;
+                if (l == 0) { css_free_segs(segs, n); free(buf); return 0; }
+                free(sg->id);
+                sg->id = css_dup_n(st, l);
+                if (!sg->id) { css_free_segs(segs, n); free(buf); return 0; }
                 spec += 65536u;
             } else if (*p == '.') {
                 p++;
                 const char *st = p;
                 while (*p && (isalnum((unsigned char)*p) || *p == '-' || *p == '_')) p++;
                 size_t l = (size_t)(p - st);
-                if (l == 0) { free(buf); return 0; }
-                if (sg->n_classes < CSS_MAX_CLASSES) {
-                    if (l >= sizeof(sg->classes[0])) l = sizeof(sg->classes[0]) - 1;
-                    memcpy(sg->classes[sg->n_classes], st, l);
-                    sg->classes[sg->n_classes][l] = 0;
-                    sg->n_classes++;
-                }
+                if (l == 0) { css_free_segs(segs, n); free(buf); return 0; }
+                char *cdup = css_dup_n(st, l);
+                if (!cdup) { css_free_segs(segs, n); free(buf); return 0; }
+                char **ncls = (char **)realloc(sg->classes, (sg->n_classes + 1u) * sizeof(char *));
+                if (!ncls) { free(cdup); css_free_segs(segs, n); free(buf); return 0; }
+                sg->classes = ncls;
+                sg->classes[sg->n_classes++] = cdup;
                 spec += 256u;
             } else if (*p == '[') {
                 p++;
@@ -931,15 +1068,16 @@ static int parse_selector_branch(const char *sel, size_t len, css_seg_t segs[CSS
                 const char *nst = p;
                 while (*p && (isalnum((unsigned char)*p) || *p == '-' || *p == '_' || *p == ':')) p++;
                 size_t nl = (size_t)(p - nst);
-                if (nl >= sizeof(sg->attr_name)) nl = sizeof(sg->attr_name) - 1;
-                for (size_t k = 0; k < nl; k++) sg->attr_name[k] = (char)tolower((unsigned char)nst[k]);
-                sg->attr_name[nl] = 0;
+                free(sg->attr_name);
+                sg->attr_name = css_dup_lower_n(nst, nl);
                 while (*p && isspace((unsigned char)*p)) p++;
                 uint8_t op = 1;
                 if (*p == '=') { op = 2; p++; }
                 else if (*p == '~' && p[1] == '=') { op = 3; p += 2; }
                 else if (*p == '*' && p[1] == '=') { op = 4; p += 2; }
                 else if (*p == '|' && p[1] == '=') { op = 2; p += 2; }
+                free(sg->attr_val);
+                sg->attr_val = NULL;
                 if (op > 1) {
                     while (*p && isspace((unsigned char)*p)) p++;
                     char q = 0;
@@ -947,14 +1085,12 @@ static int parse_selector_branch(const char *sel, size_t len, css_seg_t segs[CSS
                     const char *vst = p;
                     while (*p && ((q && *p != q) || (!q && *p != ']' && !isspace((unsigned char)*p)))) p++;
                     size_t vl = (size_t)(p - vst);
-                    if (vl >= sizeof(sg->attr_val)) vl = sizeof(sg->attr_val) - 1;
-                    memcpy(sg->attr_val, vst, vl);
-                    sg->attr_val[vl] = 0;
+                    sg->attr_val = css_dup_n(vst, vl);
                     if (q && *p == q) p++;
                 }
                 while (*p && *p != ']') p++;
                 if (*p == ']') p++;
-                sg->attr_op = (sg->attr_name[0]) ? op : 0;
+                sg->attr_op = (sg->attr_name && sg->attr_name[0] && (op == 1 || sg->attr_val)) ? op : 0;
                 spec += 256u;
             } else if (*p == ':') {
                 p++;
@@ -971,31 +1107,35 @@ static int parse_selector_branch(const char *sel, size_t len, css_seg_t segs[CSS
                         else if (*p == ')') par--;
                         p++;
                     }
+                    css_free_segs(segs, n);
                     free(buf);
                     return 0;
                 }
-                if (dbl) { free(buf); return 0; }
+                if (dbl) { css_free_segs(segs, n); free(buf); return 0; }
                 if (pl == 4 && strncasecmp(pst, "root", 4) == 0) {
-                    strcpy(sg->tag, "html");
+                    free(sg->tag);
+                    sg->tag = strdup("html");
                     spec += 256u;
                 } else if ((pl == 4 && strncasecmp(pst, "link", 4) == 0) ||
                            (pl == 7 && strncasecmp(pst, "visited", 7) == 0)) {
                     spec += 256u;
                 } else {
                     /* :hover, :focus, :active, :first-child, etc. */
+                    css_free_segs(segs, n);
                     free(buf);
                     return 0;
                 }
             } else {
+                css_free_segs(segs, n);
                 free(buf);
                 return 0;
             }
         }
-        if (!parsed_any) { free(buf); return 0; }
-        n++;
+        if (!parsed_any) { css_free_segs(segs, n); free(buf); return 0; }
     }
     free(buf);
-    if (n <= 0) return 0;
+    if (n == 0) { css_free_segs(segs, n); return 0; }
+    *out_segs = segs;
     *out_n = n;
     *out_spec = spec;
     return 1;
@@ -1042,6 +1182,7 @@ void ipo_css_set_viewport(ipo_css_sheet_t *sheet, int viewport_w) {
 void ipo_css_free(ipo_css_sheet_t *sheet) {
     if (!sheet) return;
     for (size_t i = 0; i < sheet->n_rules; i++) {
+        css_free_segs(sheet->rules[i].segs, sheet->rules[i].n_segs);
         for (uint16_t j = 0; j < sheet->rules[i].n_decls; j++) {
             free(sheet->rules[i].decls[j].prop);
             free(sheet->rules[i].decls[j].val);
@@ -1053,6 +1194,7 @@ void ipo_css_free(ipo_css_sheet_t *sheet) {
         free(sheet->vars[i].name);
         free(sheet->vars[i].val);
     }
+    free(sheet->vars);
     free(sheet);
 }
 
@@ -1106,7 +1248,7 @@ static char *css_strip_comments_dup(const char *s, size_t len, size_t *out_len) 
 static void css_parse_block_list(ipo_css_sheet_t *sheet, const char *s, size_t len, int depth) {
     if (!sheet || !s || depth > 4) return;
     size_t i = 0;
-    while (i < len && sheet->n_rules < CSS_MAX_RULES) {
+    while (i < len) {
         i = css_skip_ws_comments(s, len, i);
         if (i >= len) break;
         const char *hdr_st = s + i;
@@ -1175,11 +1317,12 @@ static void css_parse_block_list(ipo_css_sheet_t *sheet, const char *s, size_t l
         char *clean_body = css_strip_comments_dup(body_st, body_len, &clean_body_len);
         if (!clean_body) { free(clean_hdr); continue; }
 
-        css_decl_t tmp_decls[CSS_MAX_DECLS_RULE];
-        size_t n_decls = parse_decls_into(clean_body, clean_body_len, tmp_decls, CSS_MAX_DECLS_RULE, sheet);
+        css_decl_t *tmp_decls = NULL;
+        size_t n_decls = parse_decls_into(clean_body, clean_body_len, &tmp_decls, sheet);
         free(clean_body);
 
-        if (n_decls == 0) {
+        if (n_decls == 0 || !tmp_decls) {
+            free(tmp_decls);
             free(clean_hdr);
             continue;
         }
@@ -1187,7 +1330,7 @@ static void css_parse_block_list(ipo_css_sheet_t *sheet, const char *s, size_t l
         /* Split comma-separated selector list safely (skipping commas inside [...]) */
         const char *sp = hp;
         int added_rules = 0;
-        while (*sp && sheet->n_rules < CSS_MAX_RULES) {
+        while (*sp) {
             const char *b_st = sp;
             int sq = 0, par = 0;
             while (*sp && (sq > 0 || par > 0 || *sp != ',')) {
@@ -1200,32 +1343,31 @@ static void css_parse_block_list(ipo_css_sheet_t *sheet, const char *s, size_t l
             size_t b_len = (size_t)(sp - b_st);
             if (*sp == ',') sp++;
 
-            css_seg_t segs[CSS_MAX_SEGS];
-            int n_segs = 0;
+            css_seg_t *segs = NULL;
+            size_t n_segs = 0;
             uint32_t spec = 0;
-            if (!parse_selector_branch(b_st, b_len, segs, &n_segs, &spec)) continue;
+            if (!parse_selector_branch(b_st, b_len, &segs, &n_segs, &spec)) continue;
 
             if (sheet->n_rules >= sheet->cap_rules) {
                 size_t nc = sheet->cap_rules ? sheet->cap_rules * 2 : 64;
-                if (nc > CSS_MAX_RULES) nc = CSS_MAX_RULES;
                 css_rule_t *nr = (css_rule_t *)realloc(sheet->rules, nc * sizeof(css_rule_t));
-                if (!nr) break;
+                if (!nr) { css_free_segs(segs, n_segs); break; }
                 sheet->rules = nr;
                 sheet->cap_rules = nc;
             }
             css_rule_t *r = &sheet->rules[sheet->n_rules];
             memset(r, 0, sizeof(*r));
-            memcpy(r->segs, segs, sizeof(css_seg_t) * (size_t)n_segs);
-            r->n_segs = (uint8_t)n_segs;
+            r->segs = segs;
+            r->n_segs = n_segs;
             r->specificity = spec;
             r->order = sheet->next_order++;
             r->n_decls = (uint16_t)n_decls;
-            r->decls = (css_decl_t *)malloc(n_decls * sizeof(css_decl_t));
-            if (!r->decls) break;
-            for (size_t d = 0; d < n_decls; d++) {
-                if (added_rules == 0) {
-                    r->decls[d] = tmp_decls[d];
-                } else {
+            if (added_rules == 0) {
+                r->decls = tmp_decls;
+            } else {
+                r->decls = (css_decl_t *)malloc(n_decls * sizeof(css_decl_t));
+                if (!r->decls) { css_free_segs(segs, n_segs); break; }
+                for (size_t d = 0; d < n_decls; d++) {
                     r->decls[d].prop = strdup(tmp_decls[d].prop);
                     r->decls[d].val = strdup(tmp_decls[d].val);
                     r->decls[d].important = tmp_decls[d].important;
@@ -1239,6 +1381,7 @@ static void css_parse_block_list(ipo_css_sheet_t *sheet, const char *s, size_t l
                 free(tmp_decls[d].prop);
                 free(tmp_decls[d].val);
             }
+            free(tmp_decls);
         }
         free(clean_hdr);
     }
@@ -1265,24 +1408,25 @@ static int class_list_contains(const char *list, const char *cls) {
 
 static int seg_matches_node(const css_seg_t *sg, const ipo_css_node_t *node) {
     if (!node) return 0;
-    if (sg->tag[0]) {
+    if (sg->tag && sg->tag[0]) {
         if (!node->tag || strcmp(sg->tag, node->tag) != 0) return 0;
     }
-    if (sg->id[0]) {
+    if (sg->id && sg->id[0]) {
         if (!node->id || strcmp(sg->id, node->id) != 0) return 0;
     }
-    for (uint8_t c = 0; c < sg->n_classes; c++) {
+    for (size_t c = 0; c < sg->n_classes; c++) {
         if (!class_list_contains(node->classes, sg->classes[c])) return 0;
     }
-    if (sg->attr_op != 0) {
+    if (sg->attr_op != 0 && sg->attr_name) {
         if (!node->raw_attr) return 0;
         unsigned char *av = get_attr_val((unsigned char *)node->raw_attr, (unsigned char *)sg->attr_name);
         if (!av) return 0;
+        const char *aval = sg->attr_val ? sg->attr_val : "";
         int ok = 0;
         if (sg->attr_op == 1) ok = 1;
-        else if (sg->attr_op == 2) ok = (strcasecmp((char *)av, sg->attr_val) == 0);
-        else if (sg->attr_op == 3) ok = class_list_contains((char *)av, sg->attr_val);
-        else if (sg->attr_op == 4) ok = (css_strcasestr((char *)av, sg->attr_val) != NULL);
+        else if (sg->attr_op == 2) ok = (strcasecmp((char *)av, aval) == 0);
+        else if (sg->attr_op == 3) ok = class_list_contains((char *)av, aval);
+        else if (sg->attr_op == 4) ok = (css_strcasestr((char *)av, aval) != NULL);
         /* free using Links' standard allocator? Note Links uses malloc/mem_free; call mem_free */
         extern void mem_free(void *);
         mem_free(av);
@@ -1292,7 +1436,7 @@ static int seg_matches_node(const css_seg_t *sg, const ipo_css_node_t *node) {
 }
 
 static int rule_matches_stack(const css_rule_t *r, const ipo_css_node_t *ancestors, int n_ancestors) {
-    if (n_ancestors <= 0 || r->n_segs <= 0) return 0;
+    if (n_ancestors <= 0 || r->n_segs == 0) return 0;
     int si = (int)r->n_segs - 1;
     if (!seg_matches_node(&r->segs[si], &ancestors[0])) return 0;
     int ai = 0;
@@ -1336,36 +1480,44 @@ void ipo_css_compute(const ipo_css_sheet_t *sheet,
 
     if (parent_font_px <= 0) parent_font_px = 16;
 
-    const css_rule_t *matches[CSS_MAX_MATCHES];
-    int nm = 0;
+    const css_rule_t **matches = NULL;
+    size_t cap_m = 0;
+    size_t nm = 0;
     if (sheet && ancestors && n_ancestors > 0) {
-        for (size_t i = 0; i < sheet->n_rules && nm < CSS_MAX_MATCHES; i++) {
+        for (size_t i = 0; i < sheet->n_rules; i++) {
             if (rule_matches_stack(&sheet->rules[i], ancestors, n_ancestors)) {
+                if (nm >= cap_m) {
+                    size_t next_cap = cap_m ? (cap_m * 2u) : 32u;
+                    const css_rule_t **nm_arr = (const css_rule_t **)realloc(matches, next_cap * sizeof(const css_rule_t *));
+                    if (!nm_arr) break;
+                    matches = nm_arr;
+                    cap_m = next_cap;
+                }
                 matches[nm++] = &sheet->rules[i];
             }
         }
     }
     /* Sort matching rules by (specificity, order) ascending */
-    for (int i = 1; i < nm; i++) {
+    for (size_t i = 1; i < nm; i++) {
         const css_rule_t *key = matches[i];
-        int j = i - 1;
-        while (j >= 0 && (matches[j]->specificity > key->specificity ||
-                          (matches[j]->specificity == key->specificity && matches[j]->order > key->order))) {
-            matches[j + 1] = matches[j];
+        size_t j = i;
+        while (j > 0 && (matches[j - 1]->specificity > key->specificity ||
+                         (matches[j - 1]->specificity == key->specificity && matches[j - 1]->order > key->order))) {
+            matches[j] = matches[j - 1];
             j--;
         }
-        matches[j + 1] = key;
+        matches[j] = key;
     }
 
-    css_decl_t inl[CSS_MAX_DECLS_RULE];
+    css_decl_t *inl = NULL;
     size_t n_inl = 0;
     if (inline_style && *inline_style) {
-        n_inl = parse_decls_into(inline_style, strlen(inline_style), inl, CSS_MAX_DECLS_RULE, NULL);
+        n_inl = parse_decls_into(inline_style, strlen(inline_style), &inl, NULL);
     }
 
     /* Resolve background/font-size non-important first, then full cascade so color contrast/em use updated parent/bg */
     for (int imp = 0; imp <= 1; imp++) {
-        for (int i = 0; i < nm; i++) {
+        for (size_t i = 0; i < nm; i++) {
             const css_rule_t *r = matches[i];
             for (uint16_t d = 0; d < r->n_decls; d++) {
                 if ((int)r->decls[d].important == imp) {
@@ -1386,6 +1538,8 @@ void ipo_css_compute(const ipo_css_sheet_t *sheet,
         free(inl[d].prop);
         free(inl[d].val);
     }
+    free(inl);
+    free(matches);
 }
 
 int ipo_css_resolve_table_bg(const ipo_css_sheet_t *sheet,

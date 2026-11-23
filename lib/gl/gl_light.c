@@ -5,6 +5,10 @@
 void glShadeModel(GLenum mode) {
     GLContext *ctx = gl_get_current_context();
     if (!ctx) return;
+    if (ctx->is_compiling_list) {
+        gl_list_record_cmd(ctx, GL_DL_CMD_SHADEMODEL, mode, NULL, 0);
+        if (ctx->list_compile_mode == GL_COMPILE) return;
+    }
     if (mode == GL_FLAT || mode == GL_SMOOTH) {
         ctx->shade_model = mode;
     } else {
@@ -24,12 +28,17 @@ void glLighti(GLenum light, GLenum pname, GLint param) {
 void glLightfv(GLenum light, GLenum pname, const GLfloat *params) {
     GLContext *ctx = gl_get_current_context();
     if (!ctx || !params) return;
-    if (light < GL_LIGHT0 || light > GL_LIGHT7) {
+    if (light < GL_LIGHT0 || (light - GL_LIGHT0) > (GLenum)INT32_MAX - 1u) {
         ctx->error_flag = GL_INVALID_ENUM;
         return;
     }
+    int idx = (int)(light - GL_LIGHT0);
+    if (!gl_ensure_light_capacity(ctx, idx + 1)) {
+        ctx->error_flag = GL_OUT_OF_MEMORY;
+        return;
+    }
 
-    gl_light_t *l = &ctx->lights[light - GL_LIGHT0];
+    gl_light_t *l = &ctx->lights[idx];
     switch (pname) {
         case GL_AMBIENT:               memcpy(l->ambient, params, 4 * sizeof(GLfloat)); break;
         case GL_DIFFUSE:               memcpy(l->diffuse, params, 4 * sizeof(GLfloat)); break;

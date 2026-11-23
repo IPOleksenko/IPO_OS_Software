@@ -561,7 +561,7 @@ void jsint_scan_script_tags(struct f_data_c *fd)
 	while (e < eof && *e != '<') {
 		es:
 		if (!uv && (*e == '"' || *e == '\'')) uv = *e, bs = 0;
-		else if (*e == '\\' && uv) bs = 1;
+		else if (*e == '\\' && uv) bs = !bs;
 		else if (*e == uv && !bs) uv = 0;
 		else bs = 0;
 		e++;

@@ -41,6 +41,7 @@ char *strtok_r(char *str, const char *delim, char **saveptr);
 char *strdup(const char *s);
 char *strndup(const char *s, size_t n);
 char *strerror(int errnum);
+int strerror_r(int errnum, char *buf, size_t buflen);
 
 #ifdef __cplusplus
 }

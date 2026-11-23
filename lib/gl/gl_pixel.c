@@ -6,6 +6,10 @@ void glReadPixels(GLint x, GLint y, GLsizei width, GLsizei height, GLenum format
     GLContext *ctx = gl_get_current_context();
     if (!ctx || !ctx->color_buffer || !pixels || width <= 0 || height <= 0) return;
 
+    if (ctx->gpu_dirty_content) {
+        gl_gpu_sync_readback(ctx);
+    }
+
     for (int cy = 0; cy < height; cy++) {
         int sy = y + cy;
         if (sy < 0 || sy >= ctx->height) continue;

@@ -47,11 +47,39 @@ void glGenTextures(GLsizei n, GLuint *textures) {
     GLContext *ctx = gl_get_current_context();
     if (!ctx || !textures || n <= 0) return;
 
-    static GLuint next_id = 1;
+    GLuint max_id = 0u;
+    for (int s = 0; s < ctx->texture_count; s++) {
+        if (ctx->textures[s] && ctx->textures[s]->id > max_id) {
+            max_id = ctx->textures[s]->id;
+        }
+    }
+
     for (GLsizei i = 0; i < n; i++) {
-        GLuint id = next_id++;
-        get_or_create_texture(ctx, id);
-        textures[i] = id;
+        gl_texture_t *reused = NULL;
+        for (int s = 0; s < ctx->texture_count; s++) {
+            if (ctx->textures[s] && !ctx->textures[s]->in_use) {
+                reused = ctx->textures[s];
+                break;
+            }
+        }
+        if (reused) {
+            GLuint id = reused->id ? reused->id : ++max_id;
+            if (id > max_id) max_id = id;
+            memset(reused, 0, sizeof(*reused));
+            reused->id         = id;
+            reused->target     = GL_TEXTURE_2D;
+            reused->min_filter = GL_NEAREST;
+            reused->mag_filter = GL_NEAREST;
+            reused->wrap_s     = GL_REPEAT;
+            reused->wrap_t     = GL_REPEAT;
+            reused->wrap_r     = GL_REPEAT;
+            reused->in_use     = true;
+            textures[i] = id;
+        } else {
+            GLuint id = ++max_id;
+            get_or_create_texture(ctx, id);
+            textures[i] = id;
+        }
     }
 }
 
@@ -77,6 +105,7 @@ void glDeleteTextures(GLsizei n, const GLuint *textures) {
     for (GLsizei i = 0; i < n; i++) {
         gl_texture_t *t = get_texture(ctx, textures[i]);
         if (t) {
+            gl_gpu_destroy_texture(ctx, t);
             t->in_use = false;
             if (t->pixels) {
                 kfree(t->pixels);
@@ -194,6 +223,7 @@ void glTexImage2D(GLenum target, GLint level, GLint internalformat, GLsizei widt
     } else {
         memset(t->pixels, 0xFF, num_pixels * sizeof(uint32_t));
     }
+    t->gpu_dirty = true;
 }
 
 void glTexImage1D(GLenum target, GLint level, GLint internalformat, GLsizei width, GLint border, GLenum format, GLenum type, const GLvoid *pixels) {
@@ -250,6 +280,7 @@ void glTexSubImage2D(GLenum target, GLint level, GLint xoffset, GLint yoffset, G
             t->pixels[dst_idx] = unpack_pixel(pixels, format, type, src_idx);
         }
     }
+    t->gpu_dirty = true;
 }
 
 void glTexSubImage1D(GLenum target, GLint level, GLint xoffset, GLsizei width, GLenum format, GLenum type, const GLvoid *pixels) {
@@ -285,6 +316,7 @@ void glCopyTexImage2D(GLenum target, GLint level, GLenum internalformat, GLint x
     (void)level; (void)internalformat; (void)border;
     GLContext *ctx = gl_get_current_context();
     if (!ctx || !ctx->color_buffer) return;
+    if (ctx->gpu_dirty_content) gl_gpu_sync_readback(ctx);
 
     gl_texture_t *t = get_or_create_texture(ctx, ctx->current_texture_2d);
     if (!t) return;
@@ -310,12 +342,14 @@ void glCopyTexImage2D(GLenum target, GLint level, GLenum internalformat, GLint x
             t->pixels[(size_t)cy * width + cx] = p;
         }
     }
+    t->gpu_dirty = true;
 }
 
 void glCopyTexSubImage2D(GLenum target, GLint level, GLint xoffset, GLint yoffset, GLint x, GLint y, GLsizei width, GLsizei height) {
     (void)target; (void)level;
     GLContext *ctx = gl_get_current_context();
     if (!ctx || !ctx->color_buffer) return;
+    if (ctx->gpu_dirty_content) gl_gpu_sync_readback(ctx);
 
     gl_texture_t *t = get_texture(ctx, ctx->current_texture_2d);
     if (!t || !t->pixels) return;
@@ -335,5 +369,6 @@ void glCopyTexSubImage2D(GLenum target, GLint level, GLint xoffset, GLint yoffse
             t->pixels[(size_t)dy * t->width + dx] = p;
         }
     }
+    t->gpu_dirty = true;
 }
 

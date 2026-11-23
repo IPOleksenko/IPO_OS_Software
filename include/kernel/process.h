@@ -6,9 +6,9 @@
 #include <file_system/ipo_fs.h>
 
 // Dynamic memory allocation for processes
-#define PROCESS_HEAP_START       0x00800000   // Start of process heap area
-#define USER_HEAP_START          0x08000000u  // Start of isolated user process heaps (128 MB)
-#define USER_HEAP_PROCESS_STRIDE 0x10000000u  // Dynamic stride between process heaps (256 MB)
+#define PROCESS_HEAP_START       0x00800000u  // 8 MiB
+#define USER_HEAP_START          0x10000000u  // 256 MiB
+#define USER_HEAP_PROCESS_STRIDE 0x10000000u  // Dynamic stride between process heaps (256 MiB)
 
 // Protection flags
 #define PROT_NONE  0

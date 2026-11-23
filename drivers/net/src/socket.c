@@ -2,6 +2,7 @@
 #include <net/tcp.h>
 #include <net/dns.h>
 #include <net/net.h>
+#include <net/net_lock.h>
 #include <driver/net/rtl8139.h>
 #include <system/timer.h>
 #include <system/state.h>
@@ -182,8 +183,11 @@ int accept_timeout(int sockfd, struct sockaddr *addr, socklen_t *addrlen, uint32
             }
         }
 
-        ipo_syscall(IPO_SYSCALL_PROCESS_YIELD, 0, NULL);
-        io_wait();
+        net_lock_yield_sleep();
+        s = get_socket(sockfd);
+        if (!s || !s->is_listening || !s->tcb) {
+            return -1;
+        }
     }
 
     /* Pop child TCB from queue */
@@ -275,8 +279,11 @@ int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
             tcp_abort(s->tcb);
             return -1;
         }
-        ipo_syscall(IPO_SYSCALL_PROCESS_YIELD, 0, NULL);
-        io_wait();
+        net_lock_yield_sleep();
+        s = get_socket(sockfd);
+        if (!s || !s->tcb) {
+            return -1;
+        }
     }
 
     return 0;
@@ -342,8 +349,11 @@ ssize_t send(int sockfd, const void *buf, size_t len, int flags) {
             }
             net_poll();
             wnd = s->tcb->snd_wnd ? s->tcb->snd_wnd : cur_mss;
-            ipo_syscall(IPO_SYSCALL_PROCESS_YIELD, 0, NULL);
-            io_wait();
+            net_lock_yield_sleep();
+            s = get_socket(sockfd);
+            if (!s || !s->tcb) {
+                return (total_sent > 0) ? (ssize_t)total_sent : -1;
+            }
         }
 
         size_t chunk = len - total_sent;
@@ -447,8 +457,11 @@ ssize_t recv(int sockfd, void *buf, size_t len, int flags) {
             return 0; /* EOF */
         }
 
-        ipo_syscall(IPO_SYSCALL_PROCESS_YIELD, 0, NULL);
-        io_wait();
+        net_lock_yield_sleep();
+        s = get_socket(sockfd);
+        if (!s || !s->tcb) {
+            return -1;
+        }
     }
 
     return -1;

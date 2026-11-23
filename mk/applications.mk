@@ -5,7 +5,7 @@
 .PHONY: applications clean-applications
 
 APPS_SRCS_RAW    := $(shell find $(APPS_DIR) -maxdepth 2 -name "*.c" -type f)
-GENERIC_APP_SRCS := $(filter-out $(APPS_DIR)/tcc/% $(APPS_DIR)/lua/% $(APPS_DIR)/micropython/% $(APPS_DIR)/nasm/% $(APPS_DIR)/doom/% $(APPS_DIR)/links/% $(APPS_DIR)/binfmt/% $(APPS_DIR)/elf_loader/% $(APPS_DIR)/SENSE-The-Game/%, $(APPS_SRCS_RAW))
+GENERIC_APP_SRCS := $(filter-out $(APPS_DIR)/tcc/% $(APPS_DIR)/lua/% $(APPS_DIR)/micropython/% $(APPS_DIR)/nasm/% $(APPS_DIR)/doom/% $(APPS_DIR)/wolf3d/% $(APPS_DIR)/quake/% $(APPS_DIR)/links/% $(APPS_DIR)/git/% $(APPS_DIR)/pacman/% $(APPS_DIR)/donkey_kong/% $(APPS_DIR)/pokered/% $(APPS_DIR)/tetris/% $(APPS_DIR)/mario/% $(APPS_DIR)/zelda/% $(APPS_DIR)/invaders/% $(APPS_DIR)/spacewar/% $(APPS_DIR)/binfmt/% $(APPS_DIR)/elf_loader/% $(APPS_DIR)/SENSE-The-Game/%, $(APPS_SRCS_RAW))
 SENSE_PORT_DIR   := $(APPS_DIR)/SENSE-The-Game
 SENSE_UPSTREAM   := $(THIRD_PARTY_DIR)/SENSE-The-Game/app/src/main
 SENSE_CPP_DIR    := $(SENSE_UPSTREAM)/cpp
@@ -17,8 +17,19 @@ SENSE_HAVE_UPSTREAM := $(and $(wildcard $(SENSE_CPP_DIR)/main.cpp),$(wildcard $(
 
 APPS_BINS        := $(patsubst $(APPS_DIR)/%.c, $(APPS_BUILD)/%.bin, $(GENERIC_APP_SRCS)) \
                     $(APPS_BUILD)/links/links.bin \
+                    $(APPS_BUILD)/git/git.bin \
+                    $(APPS_BUILD)/pacman/pacman.bin \
+                    $(APPS_BUILD)/donkey_kong/donkey_kong.bin \
+                    $(APPS_BUILD)/pokered/pokered.bin \
+                    $(APPS_BUILD)/tetris/tetris.bin \
+                    $(APPS_BUILD)/mario/mario.bin \
+                    $(APPS_BUILD)/zelda/zelda.bin \
+                    $(APPS_BUILD)/invaders/invaders.bin \
+                    $(APPS_BUILD)/spacewar/spacewar.bin \
                     $(APPS_BUILD)/tcc/tcc.bin \
                     $(APPS_BUILD)/doom/doom.bin \
+                    $(APPS_BUILD)/wolf3d/wolf3d.bin \
+                    $(APPS_BUILD)/quake/quake.bin \
                     $(if $(SENSE_HAVE_UPSTREAM),$(SENSE_STAMP)) \
                     $(APPS_BUILD)/binfmt/binfmt.bin \
                     $(APPS_BUILD)/elf_loader/elf_loader.bin
@@ -27,13 +38,90 @@ APP_ENTRY_OBJ    := $(APPS_BUILD)/entry.o
 
 applications: lib $(APPS_BINS)
 
-.PHONY: links links-force
+.PHONY: links links-force git git-force pacman pacman-force donkey_kong donkey_kong-force pokered pokered-force tetris tetris-force mario mario-force zelda zelda-force invaders invaders-force spacewar spacewar-force wolf3d wolf3d-force quake quake-force
 links: lib $(APPS_BUILD)/links/links.bin
 
 links-force:
 
 $(APPS_BUILD)/links/links.bin: links-force $(USER_LIBC_A) $(USER_LIBM_A) $(USER_LIBCXX_A) $(APP_LIB_A) $(BEARSSL_LIB_A)
 	$(MAKE) -C $(APPS_DIR)/links links
+
+git: lib $(APPS_BUILD)/git/git.bin
+
+git-force:
+
+$(APPS_BUILD)/git/git.bin: git-force $(USER_LIBC_A) $(USER_LIBM_A) $(APP_LIB_A) $(BEARSSL_LIB_A)
+	$(MAKE) -C $(APPS_DIR)/git git
+
+pacman: lib $(APPS_BUILD)/pacman/pacman.bin
+
+pacman-force:
+
+$(APPS_BUILD)/pacman/pacman.bin: pacman-force $(USER_LIBC_A) $(USER_LIBM_A) $(APP_LIB_A)
+	$(MAKE) -C $(APPS_DIR)/pacman pacman
+
+mario: lib $(APPS_BUILD)/mario/mario.bin
+
+mario-force:
+
+$(APPS_BUILD)/mario/mario.bin: mario-force $(USER_LIBC_A) $(USER_LIBM_A) $(APP_LIB_A)
+	$(MAKE) -C $(APPS_DIR)/mario mario
+
+zelda: lib $(APPS_BUILD)/zelda/zelda.bin
+
+zelda-force:
+
+$(APPS_BUILD)/zelda/zelda.bin: zelda-force $(USER_LIBC_A) $(USER_LIBM_A) $(APP_LIB_A)
+	$(MAKE) -C $(APPS_DIR)/zelda zelda
+
+invaders: lib $(APPS_BUILD)/invaders/invaders.bin
+
+invaders-force:
+
+$(APPS_BUILD)/invaders/invaders.bin: invaders-force $(USER_CRT0) $(USER_LIBC_A) $(USER_LIBM_A) $(APP_LIB_A)
+	$(MAKE) -C $(APPS_DIR)/invaders invaders
+
+spacewar: lib $(APPS_BUILD)/spacewar/spacewar.bin
+
+spacewar-force:
+
+$(APPS_BUILD)/spacewar/spacewar.bin: spacewar-force $(USER_CRT0) $(USER_LIBC_A) $(USER_LIBM_A) $(APP_LIB_A)
+	$(MAKE) -C $(APPS_DIR)/spacewar spacewar
+
+donkey_kong: lib $(APPS_BUILD)/donkey_kong/donkey_kong.bin
+
+donkey_kong-force:
+
+$(APPS_BUILD)/donkey_kong/donkey_kong.bin: donkey_kong-force $(USER_LIBC_A) $(USER_LIBM_A) $(APP_LIB_A)
+	$(MAKE) -C $(APPS_DIR)/donkey_kong donkey_kong
+
+pokered: lib $(APPS_BUILD)/pokered/pokered.bin
+
+pokered-force:
+
+$(APPS_BUILD)/pokered/pokered.bin: pokered-force $(USER_LIBC_A) $(USER_LIBM_A) $(APP_LIB_A)
+	$(MAKE) -C $(APPS_DIR)/pokered pokered
+
+tetris: lib $(APPS_BUILD)/tetris/tetris.bin
+
+tetris-force:
+
+$(APPS_BUILD)/tetris/tetris.bin: tetris-force $(USER_LIBC_A) $(USER_LIBM_A) $(APP_LIB_A)
+	$(MAKE) -C $(APPS_DIR)/tetris tetris
+
+wolf3d: lib $(APPS_BUILD)/wolf3d/wolf3d.bin
+
+wolf3d-force:
+
+$(APPS_BUILD)/wolf3d/wolf3d.bin: wolf3d-force $(USER_LIBC_A) $(USER_LIBM_A) $(APP_LIB_A)
+	$(MAKE) -C $(APPS_DIR)/wolf3d wolf3d
+
+quake: lib $(APPS_BUILD)/quake/quake.bin
+
+quake-force:
+
+$(APPS_BUILD)/quake/quake.bin: quake-force $(USER_LIBC_A) $(USER_LIBM_A) $(APP_LIB_A)
+	$(MAKE) -C $(APPS_DIR)/quake quake
 
 $(APP_ENTRY_OBJ): $(APPS_DIR)/entry.s
 	@mkdir -p $(dir $@)
@@ -199,8 +287,7 @@ SENSE_CPP_SRCS := \
 	$(SENSE_CPP_DIR)/utils/text_manager.cpp \
 	$(SENSE_CPP_DIR)/utils/texture.cpp
 
-SENSE_CPP_OBJS := $(patsubst $(SENSE_CPP_DIR)/%.cpp,$(SENSE_BUILD_DIR)/upstream/%.o,$(SENSE_CPP_SRCS)) \
-	$(SENSE_BUILD_DIR)/sense_cxx_rt.o
+SENSE_CPP_OBJS := $(patsubst $(SENSE_CPP_DIR)/%.cpp,$(SENSE_BUILD_DIR)/upstream/%.o,$(SENSE_CPP_SRCS))
 SENSE_SDL_OBJS := $(SENSE_BUILD_DIR)/compat_sdl/sense_sdl.o \
 	$(SENSE_BUILD_DIR)/compat_sdl/sense_ttf.o \
 	$(SENSE_BUILD_DIR)/compat_sdl/sense_mem.o \
@@ -249,13 +336,13 @@ $(SENSE_BUILD_DIR)/wuffs/image_wuffs.o: $(THIRD_PARTY_DIR)/northstar_media/image
 	@mkdir -p $(dir $@)
 	$(CC) -c $< -o $@ $(APPS_CFLAGS) -std=gnu11 -I$(APPS_DIR)/links/port/media -iquote $(THIRD_PARTY_DIR)/northstar_media -iquote $(THIRD_PARTY_DIR)/wuffs -Wno-unused-function
 
-$(SENSE_STAMP): $(SENSE_CPP_OBJS) $(SENSE_SDL_OBJS) $(USER_CRT0) $(APP_LIB_A) $(USER_LIBC_A) $(USER_LIBM_A) $(LIB_DIR)/linker.ld
+$(SENSE_STAMP): $(SENSE_CPP_OBJS) $(SENSE_SDL_OBJS) $(USER_CRT0) $(APP_LIB_A) $(USER_LIBC_A) $(USER_LIBM_A) $(USER_LIBCXX_A) $(LIB_DIR)/linker.ld
 	@mkdir -p $(dir $@)
 	@echo "[applications] Building SENSE: The Game port: $(SENSE_BIN)"
 	@$(CC) $(APPS_CFLAGS) -no-pie -Wl,-T,$(LIB_DIR)/linker.ld -Wl,-q \
 		$(USER_CRT0) $(SENSE_CPP_OBJS) $(SENSE_SDL_OBJS) \
 		-Wl,--allow-multiple-definition \
-		-Wl,--start-group $(USER_LIBC_A) $(USER_LIBM_A) $(APP_LIB_A) -lgcc -Wl,--end-group \
+		-Wl,--start-group $(USER_LIBC_A) $(USER_LIBM_A) $(USER_LIBCXX_A) $(APP_LIB_A) -lgcc -Wl,--end-group \
 		-o $@.elf -nostdlib -nostartfiles 2>&1 | grep -v "PIE\|relocation" || true
 	@test -f $@.elf
 	@cp $@.elf "$(SENSE_BIN)"
@@ -319,9 +406,12 @@ $(APPS_BUILD)/elf_loader/elf_loader.bin: $(APPS_BUILD)/elf_loader/loader_entry.o
 # ------------------------------------------------------------------------------
 # Generic Userland Applications (ELF32)
 # ------------------------------------------------------------------------------
+GENERIC_APP_OBJS := $(patsubst $(APPS_DIR)/%.c, $(APPS_BUILD)/%.o, $(GENERIC_APP_SRCS))
+-include $(GENERIC_APP_OBJS:.o=.d)
+
 $(APPS_BUILD)/%.o: $(APPS_DIR)/%.c
 	@mkdir -p $(dir $@)
-	$(CC) -c $< -o $@ -std=gnu11 -g $(APPS_CFLAGS)
+	$(CC) -c $< -o $@ -std=gnu11 -g -MMD -MP $(APPS_CFLAGS)
 
 $(APPS_BUILD)/%.bin: $(APPS_BUILD)/%.o $(APP_ENTRY_OBJ) $(APP_LIB_A) $(USER_LIBC_A) $(USER_LIBM_A)
 	@mkdir -p $(dir $@)

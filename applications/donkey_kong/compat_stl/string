@@ -1,0 +1,19 @@
+#pragma once
+#include_next <string>
+
+namespace std {
+
+inline float stof(const string& s, size_t* idx = nullptr) {
+    char* end = nullptr;
+    double v = strtod(s.c_str(), &end);
+    if (idx) *idx = static_cast<size_t>(end - s.c_str());
+    return static_cast<float>(v);
+}
+
+inline string to_string(double v) {
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%g", v);
+    return string(buf);
+}
+
+} // namespace std

@@ -33,15 +33,15 @@ make all
   ```bash
   make lib
   ```
-- **Loadable kernel drivers only** (`build/drivers/` — `touchpad.kmd`, `gamepad.kmd`, `rtl8139.kmd`, `custom_proto.kmd`):
+- **Loadable kernel drivers only** (`build/drivers/` — executable `.kmd` wrappers and modules: `touchpad`, `gamepad`, `rtl8139` [RTL8139/E1000/VirtIO-Net + TCP/IP stack], `custom_proto`):
   ```bash
   make drivers
   ```
-- **Applications only** (`build/applications/` — user `.bin` executables including `links`, `tcc`, `doom`, `SENSE: The Game`, `binfmt`, `elf_loader`):
+- **Applications only** (`build/applications/` — user `.bin` executables including `links`, `tcc`, `doom`, `SENSE-The-Game`, `gl_cube`, `gl_gears`, `gl_teapot`, `gpu_info`, `sdk_3d_audio_demo`, `quake`, `wolf3d`, `binfmt`, `elf_loader`):
   ```bash
   make applications
   ```
-- **In-OS toolchain only** (`build/toolchain/` — `gcc.elf`, `g++.elf`, binutils `.elf`, `lua`/`luac`, `nasm.elf`, `python.elf`):
+- **In-OS toolchain only** (`build/toolchain/` — `gcc.elf`, `g++.elf`, binutils `.elf` [`ld`, `as`, `ar`, `nm`, `objcopy`, `objdump`, `readelf`, `ranlib`, `strip`], `lua`/`luac`, `nasm.elf`, `python.elf`):
   ```bash
   make toolchain
   ```
@@ -119,18 +119,18 @@ print(f"Result: {status}")
 
 ## 🛠️ Disk Utilities
 
-- **`tools/disk_editor.py`** — CLI editor for the `IPO_FS` filesystem (supports `format`, `ls`, `cat`, `mkdir`, `touch`, `put`, `rm`; defaults: `--image build/disk.img`, `--start-lba 2048`):
+- **`tools/disk_editor.py`** — CLI editor for the `IPO_FS` filesystem (supports `format`, `ls`, `cat`, `mkdir`, `touch`, `put`, `rm`, 56-bit inodes; defaults: `--image build/disks/disk.img`, `--start-lba 2048`):
   ```bash
-  python3 tools/disk_editor.py --image build/disk.img ls /
-  python3 tools/disk_editor.py --image build/disk.img put local_file.txt /dest.txt
-  python3 tools/disk_editor.py --image build/disk.img cat /remote.txt > local.txt
-  python3 tools/disk_editor.py --image build/disk.img mkdir /mydir
-  python3 tools/disk_editor.py --image build/disk.img rm /dest.txt
-  python3 tools/disk_editor.py --image build/disk.img format
+  python3 tools/disk_editor.py --image build/disks/disk.img ls /
+  python3 tools/disk_editor.py --image build/disks/disk.img put local_file.txt /dest.txt
+  python3 tools/disk_editor.py --image build/disks/disk.img cat /remote.txt > local.txt
+  python3 tools/disk_editor.py --image build/disks/disk.img mkdir /mydir
+  python3 tools/disk_editor.py --image build/disks/disk.img rm /dest.txt
+  python3 tools/disk_editor.py --image build/disks/disk.img format
   ```
 - **`tools/build_font_db.py`** — Generates `IFNT` binary font databases in `build/fonts/` (`fixed.fnt`, `terminus.fnt`, `bold.fnt`) covering ASCII, Cyrillic, and Chinese Hanzi glyphs (invoked by `make font-databases`).
-- **`tools/format_disk_via_os.py`** — Injects MBR partition 1 (`LBA 2048`) and boots `IPO_OS` (`--boot` and `--kernel`) in headless QEMU to format and mount the `IPO_FS` filesystem on the target disk image (default `--disk build/disk.img`, `--size-mb 128`).
-- **`tools/create_live_image.py`** — Builds a unified bootable raw Live USB disk image (`build/IPO_OS.img` by default, 512 MiB or matching `--disk`), combining `boot.bin`, `kernel.bin`, MBR partition table, `IPO_FS` superblocks (`2030`/`2039`), zeroed WAL journal, and `--disk` partition data (invoked by `make live-image`).
+- **`tools/format_disk_via_os.py`** — Injects MBR partition 1 (`LBA 2048`) and boots `IPO_OS` (`--os-image IPO_OS.bin` or `--boot`/`--kernel`) in headless `qemu-system-x86_64` to format and mount the `IPO_FS` filesystem on the target disk image (default `--disk build/disks/disk.img`, `--size-mb 128`).
+- **`tools/create_live_image.py`** — Builds a unified bootable raw Live USB disk image (`build/IPO_OS.img` by default, 512 MiB or matching `--disk`), combining `IPO_OS.bin` (`--os-image` or `--boot` + `--kernel`), MBR partition table, `IPO_FS` superblocks (`2030`/`2039`), zeroed WAL journal, and `--disk` partition data (invoked by `make live-image`).
 
 ---
 

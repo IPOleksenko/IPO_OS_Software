@@ -44,10 +44,14 @@ static ipo_ps2_byte_event_t *s_ps2_evs = NULL;
 static uint32_t     s_ps2_evs_cap = 0u;
 
 static bool tp_ensure_slot(int slot) {
-    if (slot < 0 || slot >= 1024) return false;
+    if (slot < 0) return false;
     if (slot < s_slots_cap) return true;
     int new_cap = s_slots_cap > 0 ? s_slots_cap : 8;
-    while (new_cap <= slot) new_cap *= 2;
+    while (new_cap <= slot) {
+        if (new_cap > INT32_MAX / 2) { new_cap = slot + 1; break; }
+        new_cap *= 2;
+    }
+    if ((size_t)new_cap > SIZE_MAX / sizeof(tp_slot_t)) return false;
     tp_slot_t *ns = (tp_slot_t *)krealloc(s_slots, (size_t)new_cap * sizeof(tp_slot_t));
     if (!ns) return false;
     memset(ns + s_slots_cap, 0, (size_t)(new_cap - s_slots_cap) * sizeof(tp_slot_t));
@@ -58,6 +62,14 @@ static bool tp_ensure_slot(int slot) {
 
 static bool tp_record_dbg_event(uint16_t type, uint16_t code, int32_t value) {
     if (s_dbg_total >= s_dbg_cap) {
+        if (s_dbg_cap >= 1024u) {
+            uint32_t idx = s_dbg_total % s_dbg_cap;
+            s_dbg_events[idx].type  = type;
+            s_dbg_events[idx].code  = code;
+            s_dbg_events[idx].value = value;
+            s_dbg_total++;
+            return true;
+        }
         uint32_t new_cap = (s_dbg_cap > 0u) ? (s_dbg_cap * 2u) : 16u;
         tp_dbg_ev_t *ne = (tp_dbg_ev_t *)krealloc(s_dbg_events, (size_t)new_cap * sizeof(tp_dbg_ev_t));
         if (!ne) return false;
@@ -196,8 +208,29 @@ static void tp_probe_ps2_synaptics(void) {
     sreq.reply_len = 3u;
     sreq.reply = stat;
     if (ipo_ps2_transact(&sreq) == 0 && stat[1] == 0x47u && stat[2] != 0x00u) {
+        /* Program Synaptics Mode Byte: bit7=Absolute(0x80), bit6=HighRate(0x40), bit0=W-mode(0x01) */
+        static const uint8_t mode_nibbles[4] = { 0x03u, 0x00u, 0x00u, 0x01u }; /* 0xC1 = 1100 0001b */
+        for (int n = 0; n < 4; n++) {
+            uint8_t val = mode_nibbles[n];
+            ipo_ps2_transact_req_t mreq;
+            memset(&mreq, 0, sizeof(mreq));
+            mreq.cmd = 0xE8u;
+            mreq.port_id = IPO_PS2_PORT_AUX;
+            mreq.param_len = 1u;
+            mreq.params = &val;
+            if (ipo_ps2_transact(&mreq) != 0) break;
+        }
+        uint8_t rate = 20u;
+        ipo_ps2_transact_req_t rreq;
+        memset(&rreq, 0, sizeof(rreq));
+        rreq.cmd = 0xF3u;
+        rreq.port_id = IPO_PS2_PORT_AUX;
+        rreq.param_len = 1u;
+        rreq.params = &rate;
+        (void)ipo_ps2_transact(&rreq);
+
         s_synaptics_ok = true;
-        serial_printf("[touchpad] Synaptics PS/2 touchpad detected (id=%02x.%02x)\n", stat[0], stat[2]);
+        serial_printf("[touchpad] Synaptics PS/2 touchpad detected (id=%02x.%02x, abs+W mode)\n", stat[0], stat[2]);
     }
 }
 
@@ -224,13 +257,13 @@ static void tp_process_synaptics_byte(uint8_t b) {
     int32_t yn = (y <= 1408) ? 10000 : ((y >= 4448) ? 0 : (10000 - ((y - 1408) * 10000) / 3040));
 
     if (z < 12) {
-        if (s_slots[0].active) tp_emit_finger_up(0);
-        if (s_slots[1].active) tp_emit_finger_up(1);
+        if (s_slots && s_slots_cap > 0 && s_slots[0].active) tp_emit_finger_up(0);
+        if (s_slots && s_slots_cap > 1 && s_slots[1].active) tp_emit_finger_up(1);
     } else {
         tp_emit_finger_down(0, 1, xn, yn);
         if (w == 0u) {
             tp_emit_finger_down(1, 2, xn, yn);
-        } else if (s_slots[1].active) {
+        } else if (s_slots && s_slots_cap > 1 && s_slots[1].active) {
             tp_emit_finger_up(1);
         }
     }
@@ -253,8 +286,9 @@ static void tp_poll_task(void) {
                 tp_process_synaptics_byte(s_ps2_evs[i].byte);
             }
             if (n < cap) break;
+            if (cap > UINT32_MAX / 2u) break;
             uint32_t new_cap = cap * 2u;
-            if (new_cap > 1024u) break;
+            if ((size_t)new_cap > SIZE_MAX / sizeof(ipo_ps2_byte_event_t)) break;
             ipo_ps2_byte_event_t *nb = (ipo_ps2_byte_event_t *)krealloc(
                 s_ps2_evs, (size_t)new_cap * sizeof(ipo_ps2_byte_event_t));
             if (!nb) break;
@@ -329,7 +363,7 @@ static int tp_on_command(const char *cmd, int argc, char **argv) {
     return 0;
 }
 
-static int tp_read(void *buf, size_t size, uint32_t offset) {
+static int tp_read(void *buf, size_t size, uint64_t offset) {
     (void)offset;
     if (!buf || size < sizeof(uint32_t)) return -1;
     uint32_t count = tp_active_count();
@@ -356,7 +390,9 @@ int kmd_main_init(void) {
 
     bool has_vio = vio_probe_and_init(&s_vio_tp, tp_vio_match);
     tp_probe_ps2_synaptics();
-    s_ps2_hook = ipo_ps2_hook_register(IPO_PS2_CHAN_AUX, IPO_PS2_HOOK_OBSERVE, 0u);
+    if (s_synaptics_ok) {
+        s_ps2_hook = ipo_ps2_hook_register(IPO_PS2_CHAN_AUX, IPO_PS2_HOOK_EXCLUSIVE, 0u);
+    }
 
     ipo_input_dev_desc_t desc;
     memset(&desc, 0, sizeof(desc));

@@ -14,15 +14,23 @@ int readline(vstr_t *line, const char *prompt) {
         fflush(stdout);
     }
     vstr_reset(line);
-    char buf[1024];
-    if (!fgets(buf, sizeof(buf), stdin)) {
-        return CHAR_CTRL_D;
+    size_t read_bytes = 0;
+    for (;;) {
+        int ch = fgetc(stdin);
+        if (ch == EOF) {
+            if (read_bytes == 0) {
+                return CHAR_CTRL_D;
+            }
+            break;
+        }
+        read_bytes++;
+        if (ch == '\n') {
+            break;
+        }
+        if (ch != '\r') {
+            vstr_add_byte(line, ch);
+        }
     }
-    size_t len = strlen(buf);
-    while (len > 0 && (buf[len - 1] == '\n' || buf[len - 1] == '\r')) {
-        buf[--len] = '\0';
-    }
-    vstr_add_strn(line, buf, len);
     return 0;
 }
 

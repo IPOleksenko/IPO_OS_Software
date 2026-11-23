@@ -32,6 +32,21 @@
 
 #define PATH_MAX 1024
 #define NAME_MAX 255
+#ifndef SSIZE_MAX
+#define SSIZE_MAX INT_MAX
+#endif
+#ifndef HOST_NAME_MAX
+#define HOST_NAME_MAX 255
+#endif
+#ifndef _POSIX_PATH_MAX
+#define _POSIX_PATH_MAX 256
+#endif
+#ifndef PIPE_BUF
+#define PIPE_BUF 4096
+#endif
+#ifndef IOV_MAX
+#define IOV_MAX 1024
+#endif
 
 #endif
 

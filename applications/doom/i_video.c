@@ -20,6 +20,7 @@
 #include <wm.h>
 #include <syscall.h>
 #include <kernel/input_ext.h>
+#include <ipo/gfx.h>
 
 extern boolean system_is_interrupted(void);
 extern void system_clear_interrupt(void);
@@ -29,6 +30,9 @@ static boolean s_graphics_inited = false;
 static boolean s_e0_prefix = false;
 static uint8_t s_cached_pal[256][3];
 static uint8_t s_pal_lut[256];
+static uint32_t s_pal32[256];
+static uint32_t s_doom_xrgb32[320 * 200];
+static boolean s_use_truecolor32 = false;
 static uint8_t s_wm_palette[248][3];
 static boolean s_wm_pal_ready = false;
 static boolean s_pal_valid = false;
@@ -136,6 +140,10 @@ void I_InitGraphics(void) {
 
     s_pal_valid = false;
     s_e0_prefix = false;
+    {
+        ipo_gfx_caps_t caps;
+        s_use_truecolor32 = (ipo_gfx_get_caps(&caps) == 0 && caps.active_hw_bpp >= 15u);
+    }
     s_graphics_inited = true;
 }
 
@@ -170,7 +178,10 @@ void I_SetPalette(byte *palette) {
             s_cached_pal[i][0] = r;
             s_cached_pal[i][1] = g;
             s_cached_pal[i][2] = b;
-            s_pal_lut[i] = find_nearest_wm_color(r, g, b);
+            s_pal32[i] = 0xFF000000u | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
+            if (!s_use_truecolor32) {
+                s_pal_lut[i] = find_nearest_wm_color(r, g, b);
+            }
         }
     }
     s_pal_valid = true;
@@ -216,47 +227,72 @@ void I_FinishUpdate(void) {
     }
 
     src_fb = screens[0];
-    dst_fb = s_win->framebuf;
 
-    if (dw == SCREENWIDTH && dh == SCREENHEIGHT) {
+    if (s_use_truecolor32) {
         size_t i;
         size_t total = (size_t)SCREENWIDTH * (size_t)SCREENHEIGHT;
-        for (i = 0; i < total; i += 4) {
-            dst_fb[i + 0] = s_pal_lut[src_fb[i + 0]];
-            dst_fb[i + 1] = s_pal_lut[src_fb[i + 1]];
-            dst_fb[i + 2] = s_pal_lut[src_fb[i + 2]];
-            dst_fb[i + 3] = s_pal_lut[src_fb[i + 3]];
+        ipo_gfx_surface_desc_t surf;
+        for (i = 0; i < total; i += 4u) {
+            s_doom_xrgb32[i + 0u] = s_pal32[src_fb[i + 0u]];
+            s_doom_xrgb32[i + 1u] = s_pal32[src_fb[i + 1u]];
+            s_doom_xrgb32[i + 2u] = s_pal32[src_fb[i + 2u]];
+            s_doom_xrgb32[i + 3u] = s_pal32[src_fb[i + 3u]];
         }
-    } else if (ensure_x_lut(dw)) {
-        int y, x;
-        int prev_sy = -1;
-        uint8_t *prev_dst = NULL;
-        for (y = 0; y < dh; y++) {
-            int sy = (y * SCREENHEIGHT) / dh;
-            uint8_t *dst_row = dst_fb + (size_t)y * (size_t)dw;
-            const uint8_t *src_row;
-            if (sy == prev_sy && prev_dst) {
-                memcpy(dst_row, prev_dst, (size_t)dw);
-                continue;
-            }
-            src_row = src_fb + (size_t)sy * SCREENWIDTH;
-            for (x = 0; x < dw; x++) {
-                dst_row[x] = s_pal_lut[src_row[s_x_lut[x]]];
-            }
-            prev_sy = sy;
-            prev_dst = dst_row;
-        }
-    }
+        memset(&surf, 0, sizeof(surf));
+        surf.struct_size = (uint32_t)sizeof(surf);
+        surf.width = (uint32_t)SCREENWIDTH;
+        surf.height = (uint32_t)SCREENHEIGHT;
+        surf.stride_bytes = (uint32_t)(SCREENWIDTH * 4);
+        surf.format_id = IPO_COLOR_FMT_XRGB8888;
+        surf.tonemap_op = IPO_TONEMAP_NONE;
+        surf.exposure = 1.0;
+        surf.pixels = s_doom_xrgb32;
+        ipo_gfx_present_window(s_win, &surf);
+    } else {
+        dst_fb = s_win->framebuf;
 
-    wm_invalidate(s_win);
+        if (dw == SCREENWIDTH && dh == SCREENHEIGHT) {
+            size_t i;
+            size_t total = (size_t)SCREENWIDTH * (size_t)SCREENHEIGHT;
+            for (i = 0; i < total; i += 4) {
+                dst_fb[i + 0] = s_pal_lut[src_fb[i + 0]];
+                dst_fb[i + 1] = s_pal_lut[src_fb[i + 1]];
+                dst_fb[i + 2] = s_pal_lut[src_fb[i + 2]];
+                dst_fb[i + 3] = s_pal_lut[src_fb[i + 3]];
+            }
+        } else if (ensure_x_lut(dw)) {
+            int y, x;
+            int prev_sy = -1;
+            uint8_t *prev_dst = NULL;
+            for (y = 0; y < dh; y++) {
+                int sy = (y * SCREENHEIGHT) / dh;
+                uint8_t *dst_row = dst_fb + (size_t)y * (size_t)dw;
+                const uint8_t *src_row;
+                if (sy == prev_sy && prev_dst) {
+                    memcpy(dst_row, prev_dst, (size_t)dw);
+                    continue;
+                }
+                src_row = src_fb + (size_t)sy * SCREENWIDTH;
+                for (x = 0; x < dw; x++) {
+                    dst_row[x] = s_pal_lut[src_row[s_x_lut[x]]];
+                }
+                prev_sy = sy;
+                prev_dst = dst_row;
+            }
+        }
+
+        wm_invalidate(s_win);
+    }
 
     {
         static uint32_t s_fps_last_ms = 0;
         static uint32_t s_fps_frames = 0;
+        static uint32_t s_last_yield_ms = 0;
         extern int serial_printf(const char *fmt, ...);
         uint32_t now = (uint32_t)ipo_syscall(IPO_SYSCALL_MILLIS, 0u, NULL);
         if (s_fps_last_ms == 0u) {
             s_fps_last_ms = now;
+            s_last_yield_ms = now;
         }
         s_fps_frames++;
         uint32_t elapsed = now - s_fps_last_ms;
@@ -266,9 +302,11 @@ void I_FinishUpdate(void) {
             s_fps_frames = 0;
             s_fps_last_ms = now;
         }
+        if (now - s_last_yield_ms >= 8u) {
+            s_last_yield_ms = now;
+            ipo_syscall(IPO_SYSCALL_PROCESS_YIELD, 0u, NULL);
+        }
     }
-
-    ipo_syscall(IPO_SYSCALL_PROCESS_YIELD, 0u, NULL);
 }
 
 void I_WaitVBL(int count) {

@@ -1,0 +1,126 @@
+#ifndef _CPP_ATOMIC_H
+#define _CPP_ATOMIC_H
+
+#include <stddef.h>
+#include <stdint.h>
+
+namespace std {
+
+enum memory_order {
+    memory_order_relaxed = __ATOMIC_RELAXED,
+    memory_order_consume = __ATOMIC_CONSUME,
+    memory_order_acquire = __ATOMIC_ACQUIRE,
+    memory_order_release = __ATOMIC_RELEASE,
+    memory_order_acq_rel = __ATOMIC_ACQ_REL,
+    memory_order_seq_cst = __ATOMIC_SEQ_CST
+};
+
+inline void atomic_thread_fence(memory_order order) noexcept {
+    __atomic_thread_fence(order);
+}
+
+inline void atomic_signal_fence(memory_order order) noexcept {
+    __atomic_signal_fence(order);
+}
+
+class atomic_flag {
+private:
+    volatile bool m_flag;
+public:
+    atomic_flag() noexcept : m_flag(false) {}
+    atomic_flag(const atomic_flag&) = delete;
+    atomic_flag& operator=(const atomic_flag&) = delete;
+
+    bool test_and_set(memory_order order = memory_order_seq_cst) noexcept {
+        return __atomic_test_and_set(&m_flag, order);
+    }
+
+    void clear(memory_order order = memory_order_seq_cst) noexcept {
+        __atomic_clear(&m_flag, order);
+    }
+};
+
+#define ATOMIC_FLAG_INIT {}
+
+template <typename T>
+class atomic {
+private:
+    T m_val;
+public:
+    atomic() noexcept = default;
+    constexpr atomic(T desired) noexcept : m_val(desired) {}
+    atomic(const atomic&) = delete;
+    atomic& operator=(const atomic&) = delete;
+
+    void store(T desired, memory_order order = memory_order_seq_cst) noexcept {
+        __atomic_store(&m_val, &desired, order);
+    }
+
+    T load(memory_order order = memory_order_seq_cst) const noexcept {
+        T out;
+        __atomic_load(&m_val, &out, order);
+        return out;
+    }
+
+    T exchange(T desired, memory_order order = memory_order_seq_cst) noexcept {
+        T out;
+        __atomic_exchange(&m_val, &desired, &out, order);
+        return out;
+    }
+
+    bool compare_exchange_weak(T& expected, T desired,
+                               memory_order success = memory_order_seq_cst,
+                               memory_order failure = memory_order_seq_cst) noexcept {
+        return __atomic_compare_exchange(&m_val, &expected, &desired, true, success, failure);
+    }
+
+    bool compare_exchange_strong(T& expected, T desired,
+                                 memory_order success = memory_order_seq_cst,
+                                 memory_order failure = memory_order_seq_cst) noexcept {
+        return __atomic_compare_exchange(&m_val, &expected, &desired, false, success, failure);
+    }
+
+    T fetch_add(T arg, memory_order order = memory_order_seq_cst) noexcept {
+        return __atomic_fetch_add(&m_val, arg, order);
+    }
+
+    T fetch_sub(T arg, memory_order order = memory_order_seq_cst) noexcept {
+        return __atomic_fetch_sub(&m_val, arg, order);
+    }
+
+    T fetch_and(T arg, memory_order order = memory_order_seq_cst) noexcept {
+        return __atomic_fetch_and(&m_val, arg, order);
+    }
+
+    T fetch_or(T arg, memory_order order = memory_order_seq_cst) noexcept {
+        return __atomic_fetch_or(&m_val, arg, order);
+    }
+
+    T fetch_xor(T arg, memory_order order = memory_order_seq_cst) noexcept {
+        return __atomic_fetch_xor(&m_val, arg, order);
+    }
+
+    operator T() const noexcept { return load(); }
+    T operator=(T desired) noexcept { store(desired); return desired; }
+    T operator++() noexcept { return fetch_add(static_cast<T>(1)) + static_cast<T>(1); }
+    T operator++(int) noexcept { return fetch_add(static_cast<T>(1)); }
+    T operator--() noexcept { return fetch_sub(static_cast<T>(1)) - static_cast<T>(1); }
+    T operator--(int) noexcept { return fetch_sub(static_cast<T>(1)); }
+    T operator+=(T arg) noexcept { return fetch_add(arg) + arg; }
+    T operator-=(T arg) noexcept { return fetch_sub(arg) - arg; }
+};
+
+typedef atomic<bool> atomic_bool;
+typedef atomic<int> atomic_int;
+typedef atomic<unsigned int> atomic_uint;
+typedef atomic<long> atomic_long;
+typedef atomic<unsigned long> atomic_ulong;
+typedef atomic<int32_t> atomic_int32_t;
+typedef atomic<uint32_t> atomic_uint32_t;
+typedef atomic<int64_t> atomic_int64_t;
+typedef atomic<uint64_t> atomic_uint64_t;
+typedef atomic<size_t> atomic_size_t;
+
+} // namespace std
+
+#endif

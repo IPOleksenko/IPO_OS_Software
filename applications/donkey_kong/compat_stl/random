@@ -1,0 +1,50 @@
+#pragma once
+#include_next <random>
+#include <initializer_list>
+#include <vector>
+
+namespace std {
+
+class seed_seq {
+    vector<uint32_t> m_seeds;
+public:
+    seed_seq() = default;
+    template <class T>
+    seed_seq(initializer_list<T> il) {
+        for (auto v : il) m_seeds.push_back(static_cast<uint32_t>(v));
+    }
+    template <class RandomIt>
+    void generate(RandomIt first, RandomIt last) const {
+        uint32_t acc = 0x9E3779B9u;
+        for (uint32_t s : m_seeds) {
+            acc ^= s * 0x85EBCA6Bu;
+            acc = (acc << 13) | (acc >> 19);
+        }
+        if (acc == 0) acc = 0x12345678u;
+        for (auto it = first; it != last; ++it) {
+            acc ^= acc << 13;
+            acc ^= acc >> 17;
+            acc ^= acc << 5;
+            *it = acc ? acc : 0xA5A55A5Au;
+        }
+    }
+};
+
+template <class RealType = double>
+class uniform_real_distribution {
+    RealType m_a;
+    RealType m_b;
+public:
+    using result_type = RealType;
+    explicit uniform_real_distribution(RealType a = 0.0, RealType b = 1.0) : m_a(a), m_b(b) {}
+
+    template <class Gen>
+    RealType operator()(Gen& g) const {
+        double lo = static_cast<double>(g.min());
+        double hi = static_cast<double>(g.max());
+        double u = (static_cast<double>(g()) - lo) / (hi - lo + 1.0);
+        return static_cast<RealType>(static_cast<double>(m_a) + u * (static_cast<double>(m_b) - static_cast<double>(m_a)));
+    }
+};
+
+} // namespace std

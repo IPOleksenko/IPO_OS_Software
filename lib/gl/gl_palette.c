@@ -16,30 +16,9 @@ void gl_palette_init(void) {
     if (!vga_is_graphics_mode()) return;
     if (g_palette_initialized) return;
 
-    /* 16..31: 16-level monochrome grayscale ramp */
-    outb(0x3C8, 16);
-    for (int i = 0; i < 16; i++) {
-        uint8_t g = (uint8_t)(i * 63 / 15);
-        outb(0x3C9, g);
-        outb(0x3C9, g);
-        outb(0x3C9, g);
-    }
-
-    /* 32..247: 6x6x6 RGB color cube (216 colors) */
-    outb(0x3C8, 32);
-    for (int r = 0; r < 6; r++) {
-        for (int g = 0; g < 6; g++) {
-            for (int b = 0; b < 6; b++) {
-                uint8_t vr = (uint8_t)(r * 63 / 5);
-                uint8_t vg = (uint8_t)(g * 63 / 5);
-                uint8_t vb = (uint8_t)(b * 63 / 5);
-                outb(0x3C9, vr);
-                outb(0x3C9, vg);
-                outb(0x3C9, vb);
-            }
-        }
-    }
-
+    /* Palette indices 16..31 (grayscale) and 32..247 (6x6x6 cube) are maintained
+     * by the kernel display driver (vga_gfx_init_default_palette); avoid raw
+     * userland VGA DAC I/O port writes that could race with other processes. */
     g_palette_initialized = true;
 }
 

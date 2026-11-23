@@ -2,24 +2,51 @@
 #include <stdint.h>
 
 double fabs(double x) {
+#ifdef __SSE2__
+    union { double d; uint64_t u; } cv;
+    cv.d = x;
+    cv.u &= 0x7FFFFFFFFFFFFFFFULL;
+    return cv.d;
+#else
     double res;
     __asm__ __volatile__ ("fabs" : "=t" (res) : "0" (x));
     return res;
+#endif
 }
 
 float fabsf(float x) {
+#ifdef __SSE2__
+    union { float f; uint32_t u; } cv;
+    cv.f = x;
+    cv.u &= 0x7FFFFFFFu;
+    return cv.f;
+#else
     return (float)fabs((double)x);
+#endif
 }
 
 double sqrt(double x) {
     if (x < 0.0) return NAN;
+#ifdef __SSE2__
+    double res;
+    __asm__ __volatile__ ("sqrtsd %1, %0" : "=x" (res) : "x" (x));
+    return res;
+#else
     double res;
     __asm__ __volatile__ ("fsqrt" : "=t" (res) : "0" (x));
     return res;
+#endif
 }
 
 float sqrtf(float x) {
+    if (x < 0.0f) return (float)NAN;
+#ifdef __SSE2__
+    float res;
+    __asm__ __volatile__ ("sqrtss %1, %0" : "=x" (res) : "x" (x));
+    return res;
+#else
     return (float)sqrt((double)x);
+#endif
 }
 
 double sin(double x) {
@@ -197,6 +224,25 @@ double tanh(double x) {
 }
 
 double floor(double x) {
+#ifdef __SSE2__
+    if (x >= -2147483648.0 && x < 2147483648.0) {
+        if (x == 0.0) return x;
+        int32_t i;
+        __asm__ ("cvttsd2si %1, %0" : "=r"(i) : "x"(x));
+        double t = (double)i;
+        if (t > x) t -= 1.0;
+        return t;
+    }
+    union { double d; uint64_t u; } cv;
+    cv.d = x;
+    int exp = (int)((cv.u >> 52) & 0x7FFu) - 1023;
+    if (exp >= 52) return x;
+    uint64_t frac_mask = (1ULL << (52 - exp)) - 1ULL;
+    if ((cv.u & frac_mask) == 0ULL) return x;
+    if (cv.u >> 63) cv.u += frac_mask + 1ULL;
+    cv.u &= ~frac_mask;
+    return cv.d;
+#else
     uint16_t old_cw, new_cw;
     double res;
     __asm__ __volatile__ ("fnstcw %0" : "=m" (old_cw));
@@ -205,13 +251,46 @@ double floor(double x) {
     __asm__ __volatile__ ("frndint" : "=t" (res) : "0" (x));
     __asm__ __volatile__ ("fldcw %0" : : "m" (old_cw));
     return res;
+#endif
 }
 
 float floorf(float x) {
+#ifdef __SSE2__
+    if (x >= -2147483648.0f && x < 2147483648.0f) {
+        if (x == 0.0f) return x;
+        int32_t i;
+        __asm__ ("cvttss2si %1, %0" : "=r"(i) : "x"(x));
+        float t = (float)i;
+        if (t > x) t -= 1.0f;
+        return t;
+    }
     return (float)floor((double)x);
+#else
+    return (float)floor((double)x);
+#endif
 }
 
 double ceil(double x) {
+#ifdef __SSE2__
+    if (x > -2147483648.0 && x <= 2147483647.0) {
+        if (x == 0.0) return x;
+        int32_t i;
+        __asm__ ("cvttsd2si %1, %0" : "=r"(i) : "x"(x));
+        double t = (double)i;
+        if (t < x) t += 1.0;
+        if (t == 0.0 && x < 0.0) return -0.0;
+        return t;
+    }
+    union { double d; uint64_t u; } cv;
+    cv.d = x;
+    int exp = (int)((cv.u >> 52) & 0x7FFu) - 1023;
+    if (exp >= 52) return x;
+    uint64_t frac_mask = (1ULL << (52 - exp)) - 1ULL;
+    if ((cv.u & frac_mask) == 0ULL) return x;
+    if (!(cv.u >> 63)) cv.u += frac_mask + 1ULL;
+    cv.u &= ~frac_mask;
+    return cv.d;
+#else
     uint16_t old_cw, new_cw;
     double res;
     __asm__ __volatile__ ("fnstcw %0" : "=m" (old_cw));
@@ -220,13 +299,43 @@ double ceil(double x) {
     __asm__ __volatile__ ("frndint" : "=t" (res) : "0" (x));
     __asm__ __volatile__ ("fldcw %0" : : "m" (old_cw));
     return res;
+#endif
 }
 
 float ceilf(float x) {
+#ifdef __SSE2__
+    if (x > -2147483648.0f && x <= 2147483647.0f) {
+        if (x == 0.0f) return x;
+        int32_t i;
+        __asm__ ("cvttss2si %1, %0" : "=r"(i) : "x"(x));
+        float t = (float)i;
+        if (t < x) t += 1.0f;
+        if (t == 0.0f && x < 0.0f) return -0.0f;
+        return t;
+    }
     return (float)ceil((double)x);
+#else
+    return (float)ceil((double)x);
+#endif
 }
 
 double trunc(double x) {
+#ifdef __SSE2__
+    if (x > -2147483648.0 && x < 2147483648.0) {
+        if (x == 0.0) return x;
+        int32_t i;
+        __asm__ ("cvttsd2si %1, %0" : "=r"(i) : "x"(x));
+        double t = (double)i;
+        return (t == 0.0 && x < 0.0) ? -0.0 : t;
+    }
+    union { double d; uint64_t u; } cv;
+    cv.d = x;
+    int exp = (int)((cv.u >> 52) & 0x7FFu) - 1023;
+    if (exp >= 52) return x;
+    uint64_t frac_mask = (1ULL << (52 - exp)) - 1ULL;
+    cv.u &= ~frac_mask;
+    return cv.d;
+#else
     uint16_t old_cw, new_cw;
     double res;
     __asm__ __volatile__ ("fnstcw %0" : "=m" (old_cw));
@@ -235,6 +344,7 @@ double trunc(double x) {
     __asm__ __volatile__ ("frndint" : "=t" (res) : "0" (x));
     __asm__ __volatile__ ("fldcw %0" : : "m" (old_cw));
     return res;
+#endif
 }
 
 double round(double x) {

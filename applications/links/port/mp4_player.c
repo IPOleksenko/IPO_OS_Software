@@ -7,13 +7,14 @@
 #include "oh264_wrap.h"
 
 #include <driver/audio_core.h>
+#include <ipo/audio.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <syscall.h>
 
 #define YT_ANDROID_UA "com.google.android.youtube/20.10.38 (Linux; U; Android 14) gzip"
-#define MP4_VQ_CAP    96
 
 typedef enum {
     MP4_ST_IDLE = 0,
@@ -29,13 +30,13 @@ typedef struct {
 
 struct mp4_player {
     mp4_state_t state;
-    char input_url[4096];
-    char video_id[16];
-    char stream_url[4096];
-    char stream_ua[160];
-    char title[160];
-    char author[80];
-    char status_text[160];
+    char *input_url;
+    char *video_id;
+    char *stream_url;
+    char *stream_ua;
+    char *title;
+    char *author;
+    char *status_text;
 
     yt_http_stream_t http;
 
@@ -59,8 +60,9 @@ struct mp4_player {
     ipo_h264_dec_t *h264;
     ns_aac_decoder *aac;
 
-    /* Pending video sample ring */
-    mp4_vq_item_t vq[MP4_VQ_CAP];
+    /* Dynamic pending video sample ring */
+    mp4_vq_item_t *vq;
+    int vq_cap;
     int vq_head;
     int vq_tail;
     int vq_count;
@@ -99,6 +101,7 @@ struct mp4_player {
 
     /* Playback state & clock */
     bool paused;
+    bool audio_buf_paused;
     bool muted;
     bool playback_started;
     bool end_reached;
@@ -107,6 +110,78 @@ struct mp4_player {
     uint32_t audio_base_ms;
     uint32_t clock_last_ms;
 };
+
+static void mp4_set_str(char **dst, const char *s) {
+    char *copy = s ? strdup(s) : NULL;
+    free(*dst);
+    *dst = copy;
+}
+
+static void mp4_set_fmt(char **dst, const char *fmt, ...) {
+    va_list ap, ap2;
+    va_start(ap, fmt);
+    va_copy(ap2, ap);
+    int need = vsnprintf(NULL, 0, fmt, ap2);
+    va_end(ap2);
+    if (need < 0) {
+        va_end(ap);
+        return;
+    }
+    char *buf = (char *)malloc((size_t)need + 1u);
+    if (buf) {
+        vsnprintf(buf, (size_t)need + 1u, fmt, ap);
+        free(*dst);
+        *dst = buf;
+    }
+    va_end(ap);
+}
+
+static char *mp4_fmt_alloc(const char *fmt, ...) {
+    va_list ap, ap2;
+    va_start(ap, fmt);
+    va_copy(ap2, ap);
+    int need = vsnprintf(NULL, 0, fmt, ap2);
+    va_end(ap2);
+    if (need < 0) {
+        va_end(ap);
+        return NULL;
+    }
+    char *buf = (char *)malloc((size_t)need + 1u);
+    if (buf) vsnprintf(buf, (size_t)need + 1u, fmt, ap);
+    va_end(ap);
+    return buf;
+}
+
+static bool vq_push(mp4_player_t *p, ns_mp4_sample smp, uint32_t pts_ms) {
+    if (!p) return false;
+    if (p->vq_count >= p->vq_cap) {
+        int new_cap = p->vq_cap ? p->vq_cap * 2 : 64;
+        if (new_cap <= p->vq_cap || (size_t)new_cap > SIZE_MAX / sizeof(mp4_vq_item_t)) return false;
+        mp4_vq_item_t *nvq = (mp4_vq_item_t *)malloc((size_t)new_cap * sizeof(mp4_vq_item_t));
+        if (!nvq) return false;
+        for (int i = 0; i < p->vq_count; i++) {
+            nvq[i] = p->vq[(p->vq_head + i) % p->vq_cap];
+        }
+        free(p->vq);
+        p->vq = nvq;
+        p->vq_cap = new_cap;
+        p->vq_head = 0;
+        p->vq_tail = p->vq_count;
+    }
+    p->vq[p->vq_tail].smp = smp;
+    p->vq[p->vq_tail].pts_ms = pts_ms;
+    p->vq_tail = (p->vq_tail + 1) % p->vq_cap;
+    p->vq_count++;
+    return true;
+}
+
+static mp4_vq_item_t vq_pop(mp4_player_t *p) {
+    mp4_vq_item_t it = p->vq[p->vq_head];
+    p->vq[p->vq_head].smp.data = NULL;
+    p->vq_head = (p->vq_head + 1) % p->vq_cap;
+    p->vq_count--;
+    return it;
+}
 
 static uint32_t mp4_millis(void) {
     return (uint32_t)ipo_syscall(IPO_SYSCALL_MILLIS, 0u, NULL);
@@ -120,12 +195,12 @@ static uint32_t track_time_to_ms(gint64 pts, gint64 edit, guint32 timescale) {
 }
 
 static void clear_vq(mp4_player_t *p) {
-    while (p->vq_count > 0) {
+    while (p->vq_count > 0 && p->vq && p->vq_cap > 0) {
         if (p->vq[p->vq_head].smp.data) {
             g_bytes_unref(p->vq[p->vq_head].smp.data);
         }
         p->vq[p->vq_head].smp.data = NULL;
-        p->vq_head = (p->vq_head + 1) % MP4_VQ_CAP;
+        p->vq_head = (p->vq_head + 1) % p->vq_cap;
         p->vq_count--;
     }
     p->vq_head = 0;
@@ -162,7 +237,16 @@ static void recreate_audio_stream(mp4_player_t *p) {
 }
 
 static size_t est_played_frames(const mp4_player_t *p) {
-    if (!p->audio_stream || p->audio_expected_frames == 0) return 0;
+    if (!p->audio_stream) return 0;
+    ipo_audio_clock_t clk;
+    memset(&clk, 0, sizeof(clk));
+    clk.struct_size = (uint32_t)sizeof(clk);
+    if (ipo_audio_get_stream_clock(p->audio_stream, &clk) == 0 && clk.played_frames > 0u) {
+        size_t played = (size_t)clk.played_frames;
+        if (played > p->audio_frames_written) played = p->audio_frames_written;
+        return played;
+    }
+    if (p->audio_expected_frames == 0) return 0;
     double prog = audio_stream_get_progress(p->audio_stream);
     if (prog <= 0.0) return 0;
     if (prog >= 1.0) return p->audio_frames_written;
@@ -208,13 +292,21 @@ mp4_player_t *mp4_player_create(void) {
     p->http.sock = -1;
     p->aac_tmp_floats = 8192u;
     p->aac_tmp = (float *)malloc(p->aac_tmp_floats * sizeof(float));
-    snprintf(p->status_text, sizeof(p->status_text), "Idle");
+    mp4_set_str(&p->status_text, "Idle");
     return p;
 }
 
 void mp4_player_destroy(mp4_player_t *p) {
     if (!p) return;
     reset_media_state(p);
+    free(p->vq);
+    free(p->input_url);
+    free(p->video_id);
+    free(p->stream_url);
+    free(p->stream_ua);
+    free(p->title);
+    free(p->author);
+    free(p->status_text);
     if (p->yt_json) free(p->yt_json);
     if (p->seek_buf) free(p->seek_buf);
     if (p->rgb_buf) free(p->rgb_buf);
@@ -247,21 +339,22 @@ int mp4_player_open(mp4_player_t *p, const char *url) {
 
     const char *clean = (url && *url) ? url : "https://www.youtube.com/watch?v=YE7VzlLtp-4";
     if (strncmp(clean, "ipo-video:", 10) == 0) clean += 10;
-    snprintf(p->input_url, sizeof(p->input_url), "%s", clean);
+    mp4_set_str(&p->input_url, clean);
     p->paused = false;
     p->dirty = true;
     p->clock_last_ms = mp4_millis();
 
     if (is_direct_mp4_url(clean)) {
-        snprintf(p->stream_url, sizeof(p->stream_url), "%s", clean);
-        snprintf(p->stream_ua, sizeof(p->stream_ua), "Mozilla/5.0 (IPO_OS; Links/2.22)");
-        snprintf(p->title, sizeof(p->title), "MP4 Stream");
-        snprintf(p->status_text, sizeof(p->status_text), "Connecting MP4 stream...");
+        mp4_set_str(&p->stream_url, clean);
+        mp4_set_str(&p->stream_ua, "Mozilla/5.0 (IPO_OS; Links/2.22)");
+        mp4_set_str(&p->title, "MP4 Stream");
+        mp4_set_str(&p->status_text, "Connecting MP4 stream...");
         p->demux = ns_mp4_demuxer_new();
-        if (!p->demux || yt_http_stream_open(&p->http, "GET", p->stream_url, NULL, NULL, 0,
-                                             p->stream_ua, false, 0) != 0) {
-            snprintf(p->status_text, sizeof(p->status_text), "Error: %s",
-                     p->http.err_msg[0] ? p->http.err_msg : "stream open failed");
+        if (!p->demux || !p->stream_url ||
+            yt_http_stream_open(&p->http, "GET", p->stream_url, NULL, NULL, 0,
+                                p->stream_ua, false, 0) != 0) {
+            mp4_set_fmt(&p->status_text, "Error: %s",
+                        (p->http.err_msg && p->http.err_msg[0]) ? p->http.err_msg : "stream open failed");
             p->state = MP4_ST_ERROR;
             return -1;
         }
@@ -269,36 +362,45 @@ int mp4_player_open(mp4_player_t *p, const char *url) {
         return 0;
     }
 
-    if (yt_extract_video_id(clean, p->video_id, sizeof(p->video_id)) != 0) {
-        snprintf(p->video_id, sizeof(p->video_id), "YE7VzlLtp-4");
+    free(p->video_id);
+    p->video_id = yt_extract_video_id_alloc(clean);
+    if (!p->video_id) {
+        p->video_id = strdup("YE7VzlLtp-4");
     }
-    snprintf(p->title, sizeof(p->title), "YouTube [%s]", p->video_id);
-    snprintf(p->status_text, sizeof(p->status_text), "Resolving YouTube stream [%s]...", p->video_id);
+    mp4_set_fmt(&p->title, "YouTube [%s]", p->video_id ? p->video_id : "");
+    mp4_set_fmt(&p->status_text, "Resolving YouTube stream [%s]...", p->video_id ? p->video_id : "");
 
     if (!p->yt_json) {
         p->yt_json_cap = 262144u;
         p->yt_json = (char *)malloc(p->yt_json_cap);
         if (!p->yt_json) {
             p->state = MP4_ST_ERROR;
-            snprintf(p->status_text, sizeof(p->status_text), "OOM resolving video");
+            mp4_set_str(&p->status_text, "OOM resolving video");
             return -1;
         }
     }
     p->yt_json_len = 0;
 
-    char payload[512];
-    snprintf(payload, sizeof(payload),
-             "{\"videoId\":\"%s\",\"contentCheckOk\":true,\"racyCheckOk\":true,"
-             "\"context\":{\"client\":{\"clientName\":\"ANDROID\",\"clientVersion\":\"20.10.38\","
-             "\"osName\":\"Android\",\"osVersion\":\"14\",\"androidSdkVersion\":34,"
-             "\"hl\":\"en\",\"gl\":\"US\"}}}",
-             p->video_id);
+    char *payload = mp4_fmt_alloc(
+        "{\"videoId\":\"%s\",\"contentCheckOk\":true,\"racyCheckOk\":true,"
+        "\"context\":{\"client\":{\"clientName\":\"ANDROID\",\"clientVersion\":\"20.10.38\","
+        "\"osName\":\"Android\",\"osVersion\":\"14\",\"androidSdkVersion\":34,"
+        "\"hl\":\"en\",\"gl\":\"US\"}}}",
+        p->video_id ? p->video_id : "");
+    if (!payload) {
+        mp4_set_str(&p->status_text, "OOM resolving video");
+        p->state = MP4_ST_ERROR;
+        return -1;
+    }
 
-    if (yt_http_stream_open(&p->http, "POST",
-                            "https://www.youtube.com/youtubei/v1/player?prettyPrint=false",
-                            "application/json", payload, strlen(payload),
-                            YT_ANDROID_UA, false, 0) != 0) {
-        snprintf(p->status_text, sizeof(p->status_text), "Innertube error: %s", p->http.err_msg);
+    int rc = yt_http_stream_open(&p->http, "POST",
+                                 "https://www.youtube.com/youtubei/v1/player?prettyPrint=false",
+                                 "application/json", payload, strlen(payload),
+                                 YT_ANDROID_UA, false, 0);
+    free(payload);
+    if (rc != 0) {
+        mp4_set_fmt(&p->status_text, "Innertube error: %s",
+                    p->http.err_msg ? p->http.err_msg : "error");
         p->state = MP4_ST_ERROR;
         return -1;
     }
@@ -373,9 +475,9 @@ static void setup_tracks_from_demux(mp4_player_t *p) {
                   p->has_video ? 1 : 0, p->src_w, p->src_h, (unsigned)p->v_timescale,
                   p->has_audio ? 1 : 0, p->audio_rate, p->audio_channels, (unsigned)p->duration_ms);
     if (p->has_video) {
-        snprintf(p->status_text, sizeof(p->status_text), "Decoding H.264 %dx%d + AAC...", p->src_w, p->src_h);
+        mp4_set_fmt(&p->status_text, "Decoding H.264 %dx%d + AAC...", p->src_w, p->src_h);
     } else {
-        snprintf(p->status_text, sizeof(p->status_text), "Error: No H.264 track found");
+        mp4_set_str(&p->status_text, "Error: No H.264 track found");
         p->state = MP4_ST_ERROR;
     }
     p->dirty = true;
@@ -406,8 +508,11 @@ static void append_aac_pcm_to_ring(mp4_player_t *p, const float *src, int frames
 
 static void pump_samples_from_demux(mp4_player_t *p) {
     if (!p->tracks_ready) return;
-    for (int iter = 0; iter < 96; iter++) {
-        if (p->vq_count >= MP4_VQ_CAP - 4) break;
+    bool steady = p->playback_started && !p->audio_buf_paused &&
+                  p->vq_count >= 16 &&
+                  (!p->has_audio || audio_ahead_frames(p) >= (size_t)p->audio_rate);
+    int max_iters = steady ? 16 : 96;
+    for (int iter = 0; iter < max_iters; iter++) {
         if (p->has_audio && audio_ahead_frames(p) + 4096u >= p->audio_ring_frames) break;
 
         ns_mp4_sample smp;
@@ -415,10 +520,10 @@ static void pump_samples_from_demux(mp4_player_t *p) {
 
         if (smp.track_id == p->v_track_id) {
             uint32_t pts_ms = track_time_to_ms(smp.pts, p->v_edit, p->v_timescale);
-            p->vq[p->vq_tail].smp = smp;
-            p->vq[p->vq_tail].pts_ms = pts_ms;
-            p->vq_tail = (p->vq_tail + 1) % MP4_VQ_CAP;
-            p->vq_count++;
+            if (!vq_push(p, smp, pts_ms)) {
+                if (smp.data) g_bytes_unref(smp.data);
+                break;
+            }
         } else if (p->has_audio && smp.track_id == p->a_track_id && p->aac) {
             uint32_t a_ms = track_time_to_ms(smp.pts, p->a_edit, p->a_timescale);
             if (p->seeking_skip_audio && a_ms + 30u < p->audio_base_ms) {
@@ -485,18 +590,22 @@ static void pump_network_into_demux(mp4_player_t *p) {
     if (p->stream_eof) return;
     bool need_moov = !p->tracks_ready;
     if (!need_moov) {
-        if (p->vq_count >= 40 && (!p->has_audio || audio_ahead_frames(p) >= (size_t)(p->audio_rate * 2))) {
+        if (p->vq_count >= 75 && (!p->has_audio || audio_ahead_frames(p) >= (size_t)(p->audio_rate * 3))) {
             return;
         }
     }
 
     uint8_t buf[16384];
-    int max_loops = need_moov ? 16 : 6;
+    bool steady_net = !need_moov && p->playback_started && !p->audio_buf_paused &&
+                      p->vq_count >= 20 &&
+                      (!p->has_audio || audio_ahead_frames(p) >= (size_t)(p->audio_rate * 3 / 2));
+    int max_loops = need_moov ? 16 : (steady_net ? 2 : ((p->vq_count < 16 || (p->has_audio && audio_ahead_frames(p) < (size_t)p->audio_rate)) ? 10 : 4));
     for (int i = 0; i < max_loops && !p->stream_eof; i++) {
         bool eof = false;
         int n = yt_http_stream_read(&p->http, buf, sizeof(buf), &eof);
         if (n < 0) {
-            snprintf(p->status_text, sizeof(p->status_text), "Stream error: %s", p->http.err_msg);
+            mp4_set_fmt(&p->status_text, "Stream error: %s",
+                        p->http.err_msg ? p->http.err_msg : "read error");
             p->state = MP4_ST_ERROR;
             return;
         }
@@ -505,7 +614,7 @@ static void pump_network_into_demux(mp4_player_t *p) {
             p->net_bytes += (uint64_t)n;
             if (!p->seek_mode) {
                 if (!ns_mp4_demuxer_append(p->demux, buf, (gsize)n)) {
-                    snprintf(p->status_text, sizeof(p->status_text), "MP4 parse error");
+                    mp4_set_str(&p->status_text, "MP4 parse error");
                     p->state = MP4_ST_ERROR;
                     return;
                 }
@@ -532,8 +641,8 @@ static void pump_network_into_demux(mp4_player_t *p) {
                 feed_seek_bytes(p, buf, (size_t)n);
             }
             if (!p->tracks_ready && (p->net_bytes & 0xFFFFu) < (uint64_t)n) {
-                snprintf(p->status_text, sizeof(p->status_text), "Buffering MP4 (%lu KB)...",
-                         (unsigned long)(p->net_bytes / 1024u));
+                mp4_set_fmt(&p->status_text, "Buffering MP4 (%lu KB)...",
+                            (unsigned long)(p->net_bytes / 1024u));
                 p->dirty = true;
             }
         }
@@ -596,7 +705,8 @@ void mp4_player_tick(mp4_player_t *p, uint32_t now_ms, int target_w, int target_
             bool eof = false;
             int n = yt_http_stream_read(&p->http, tmp, sizeof(tmp), &eof);
             if (n < 0) {
-                snprintf(p->status_text, sizeof(p->status_text), "YT resolve error: %s", p->http.err_msg);
+                mp4_set_fmt(&p->status_text, "YT resolve error: %s",
+                            p->http.err_msg ? p->http.err_msg : "error");
                 p->state = MP4_ST_ERROR;
                 yt_http_stream_close(&p->http);
                 p->dirty = true;
@@ -620,27 +730,33 @@ void mp4_player_tick(mp4_player_t *p, uint32_t now_ms, int target_w, int target_
 
                 yt_player_info_t info;
                 if (yt_parse_player_json(p->yt_json, p->yt_json_len, p->video_id, &info) != 0) {
-                    snprintf(p->status_text, sizeof(p->status_text), "%s",
-                             info.error_msg[0] ? info.error_msg : "YouTube playback unavailable");
+                    mp4_set_str(&p->status_text,
+                                (info.error_msg && info.error_msg[0]) ? info.error_msg : "YouTube playback unavailable");
+                    yt_player_info_free(&info);
                     p->state = MP4_ST_ERROR;
                     p->dirty = true;
                     return;
                 }
-                if (info.title[0]) snprintf(p->title, sizeof(p->title), "%s", info.title);
-                if (info.author[0]) snprintf(p->author, sizeof(p->author), "%s", info.author);
+                if (info.title && info.title[0]) mp4_set_str(&p->title, info.title);
+                if (info.author && info.author[0]) mp4_set_str(&p->author, info.author);
                 p->duration_ms = info.duration_ms;
-                snprintf(p->stream_url, sizeof(p->stream_url), "%s", info.stream_url);
-                snprintf(p->stream_ua, sizeof(p->stream_ua), "%s", YT_ANDROID_UA);
-                snprintf(p->status_text, sizeof(p->status_text), "Connecting MP4 (%dx%d)...",
-                         info.width, info.height);
+                mp4_set_str(&p->stream_url, info.stream_url ? info.stream_url : "");
+                mp4_set_str(&p->stream_ua, YT_ANDROID_UA);
+                mp4_set_fmt(&p->status_text, "Connecting MP4 (%dx%d)...",
+                            info.width, info.height);
                 serial_printf("[yt_mp4] resolved id=%s title=\"%s\" %dx%d@%dfps dur=%ums\n",
-                              p->video_id, p->title, info.width, info.height, info.fps,
+                              p->video_id ? p->video_id : "",
+                              p->title ? p->title : "",
+                              info.width, info.height, info.fps,
                               (unsigned)p->duration_ms);
+                yt_player_info_free(&info);
 
                 p->demux = ns_mp4_demuxer_new();
-                if (!p->demux || yt_http_stream_open(&p->http, "GET", p->stream_url, NULL, NULL, 0,
-                                                     p->stream_ua, false, 0) != 0) {
-                    snprintf(p->status_text, sizeof(p->status_text), "Stream open error: %s", p->http.err_msg);
+                if (!p->demux || !p->stream_url ||
+                    yt_http_stream_open(&p->http, "GET", p->stream_url, NULL, NULL, 0,
+                                        p->stream_ua, false, 0) != 0) {
+                    mp4_set_fmt(&p->status_text, "Stream open error: %s",
+                                p->http.err_msg ? p->http.err_msg : "error");
                     p->state = MP4_ST_ERROR;
                     p->dirty = true;
                     return;
@@ -663,9 +779,7 @@ void mp4_player_tick(mp4_player_t *p, uint32_t now_ms, int target_w, int target_
     /* Initial pre-roll decode so frame #1 displays immediately */
     if (!p->has_frame && p->vq_count > 0) {
         while (p->vq_count > 0 && !p->has_frame) {
-            mp4_vq_item_t it = p->vq[p->vq_head];
-            p->vq_head = (p->vq_head + 1) % MP4_VQ_CAP;
-            p->vq_count--;
+            mp4_vq_item_t it = vq_pop(p);
             bool draw_now = (it.pts_ms + 40u >= p->pos_ms) || (p->vq_count == 0);
             decode_one_video_item(p, &it, target_w, target_h, draw_now);
             if (it.smp.data) g_bytes_unref(it.smp.data);
@@ -673,12 +787,13 @@ void mp4_player_tick(mp4_player_t *p, uint32_t now_ms, int target_w, int target_
     }
 
     if (!p->playback_started) {
-        bool audio_ok = !p->has_audio || (p->audio_frames_written >= (size_t)(p->audio_rate / 4)) || p->stream_eof;
-        if (p->has_frame && audio_ok) {
+        bool audio_ok = !p->has_audio || (p->audio_frames_written >= (size_t)(p->audio_rate / 2)) || p->stream_eof;
+        bool video_ok = p->has_frame && (p->vq_count >= 10 || p->stream_eof);
+        if (video_ok && audio_ok) {
             p->playback_started = true;
             p->clock_last_ms = now_ms;
             if (!p->paused && p->audio_stream) audio_stream_play(p->audio_stream);
-            snprintf(p->status_text, sizeof(p->status_text), "Playing");
+            mp4_set_str(&p->status_text, "Playing");
             p->dirty = true;
         } else {
             p->clock_last_ms = now_ms;
@@ -693,27 +808,41 @@ void mp4_player_tick(mp4_player_t *p, uint32_t now_ms, int target_w, int target_
 
     uint32_t dt = now_ms - p->clock_last_ms;
     p->clock_last_ms = now_ms;
-    if (dt > 120u) dt = 120u;
+    if (dt > 100u) dt = 100u;
 
     /* Pause advancing clock if starving mid-stream while more network bytes remain */
     if (p->vq_count == 0 && !p->stream_eof) {
-        if (p->audio_stream) audio_stream_pause(p->audio_stream);
-        snprintf(p->status_text, sizeof(p->status_text), "Buffering...");
-        p->dirty = true;
+        if (!p->audio_buf_paused) {
+            if (p->audio_stream) audio_stream_pause(p->audio_stream);
+            p->audio_buf_paused = true;
+            mp4_set_str(&p->status_text, "Buffering...");
+            p->dirty = true;
+        }
         return;
-    } else if (p->audio_stream && !p->paused) {
-        audio_stream_play(p->audio_stream);
+    } else if (p->audio_buf_paused) {
+        bool rebuf_ok = p->stream_eof ||
+                        (p->vq_count >= 8 && (!p->has_audio || audio_ahead_frames(p) >= (size_t)(p->audio_rate / 3)));
+        if (!rebuf_ok) {
+            return;
+        }
+        p->audio_buf_paused = false;
+        mp4_set_str(&p->status_text, "Playing");
+        if (p->audio_stream && !p->paused) {
+            audio_stream_play(p->audio_stream);
+        }
     }
 
     p->pos_ms += dt;
-    if (p->has_audio && p->audio_stream && p->audio_frames_written > 0 && !p->demux_eof) {
+    if (p->has_audio && p->audio_stream && p->audio_frames_written > 0) {
         size_t played = est_played_frames(p);
         if (played > 0) {
             uint32_t a_clk = p->audio_base_ms +
                 (uint32_t)(((uint64_t)played * 1000ULL) / (uint64_t)p->audio_rate);
             int32_t drift = (int32_t)p->pos_ms - (int32_t)a_clk;
-            if (drift > 180 || drift < -180) {
+            if (drift > 45 || drift < -45) {
                 p->pos_ms = a_clk;
+            } else {
+                p->pos_ms = (uint32_t)((int32_t)p->pos_ms - (drift / 4));
             }
         }
     }
@@ -721,18 +850,28 @@ void mp4_player_tick(mp4_player_t *p, uint32_t now_ms, int target_w, int target_
         p->pos_ms = p->duration_ms;
     }
 
-    /* Count ready frames up to current clock */
+    /* Count ready frames up to current clock, pacing 1 frame per tick unless >90ms behind */
     int ready_n = 0;
     for (int i = 0; i < p->vq_count; i++) {
-        int idx = (p->vq_head + i) % MP4_VQ_CAP;
+        int idx = (p->vq_head + i) % p->vq_cap;
         if (p->vq[idx].pts_ms <= p->pos_ms) ready_n++;
         else break;
     }
-    for (int i = 0; i < ready_n; i++) {
-        mp4_vq_item_t it = p->vq[p->vq_head];
-        p->vq_head = (p->vq_head + 1) % MP4_VQ_CAP;
-        p->vq_count--;
-        decode_one_video_item(p, &it, target_w, target_h, (i == ready_n - 1));
+    int dec_n = 0;
+    if (ready_n > 0) {
+        uint32_t head_pts = p->vq[p->vq_head].pts_ms;
+        uint32_t lag_ms = (p->pos_ms > head_pts) ? (p->pos_ms - head_pts) : 0u;
+        if (lag_ms < 90u) {
+            dec_n = 1;
+        } else if (lag_ms < 180u) {
+            dec_n = (ready_n > 2) ? 2 : ready_n;
+        } else {
+            dec_n = (ready_n > 3) ? 3 : ready_n;
+        }
+    }
+    for (int i = 0; i < dec_n; i++) {
+        mp4_vq_item_t it = vq_pop(p);
+        decode_one_video_item(p, &it, target_w, target_h, (i == dec_n - 1));
         if (it.smp.data) g_bytes_unref(it.smp.data);
     }
 
@@ -745,14 +884,25 @@ void mp4_player_tick(mp4_player_t *p, uint32_t now_ms, int target_w, int target_
                 (void)out_ts;
                 p->decoded_frames++;
                 p->has_frame = true;
+                p->dirty = true;
             } else {
                 p->end_reached = true;
+                p->dirty = true;
             }
         } else {
             p->end_reached = true;
+            p->dirty = true;
         }
     }
-    p->dirty = true;
+    if (dec_n > 0) {
+        p->dirty = true;
+    } else {
+        static uint32_t s_last_bar_ms = 0;
+        if (now_ms - s_last_bar_ms >= 50u) {
+            s_last_bar_ms = now_ms;
+            p->dirty = true;
+        }
+    }
 }
 
 void mp4_player_set_paused(mp4_player_t *p, bool paused) {
@@ -807,11 +957,12 @@ void mp4_player_seek_ms(mp4_player_t *p, uint32_t pos_ms) {
 
     if (yt_http_stream_open(&p->http, "GET", p->stream_url, NULL, NULL, 0,
                             p->stream_ua, true, offset) != 0) {
-        snprintf(p->status_text, sizeof(p->status_text), "Seek failed: %s", p->http.err_msg);
+        mp4_set_fmt(&p->status_text, "Seek failed: %s",
+                    p->http.err_msg ? p->http.err_msg : "error");
         p->state = MP4_ST_ERROR;
     } else {
-        snprintf(p->status_text, sizeof(p->status_text), "Seeking to %02u:%02u...",
-                 (unsigned)(pos_ms / 60000u), (unsigned)((pos_ms / 1000u) % 60u));
+        mp4_set_fmt(&p->status_text, "Seeking to %02u:%02u...",
+                    (unsigned)(pos_ms / 60000u), (unsigned)((pos_ms / 1000u) % 60u));
         p->state = MP4_ST_STREAM;
     }
     p->dirty = true;
@@ -821,8 +972,8 @@ bool mp4_player_is_paused(const mp4_player_t *p) { return p ? p->paused : false;
 bool mp4_player_is_muted(const mp4_player_t *p) { return p ? p->muted : false; }
 uint32_t mp4_player_pos_ms(const mp4_player_t *p) { return p ? p->pos_ms : 0u; }
 uint32_t mp4_player_duration_ms(const mp4_player_t *p) { return (p && p->duration_ms > 0) ? p->duration_ms : 60000u; }
-const char *mp4_player_title(const mp4_player_t *p) { return (p && p->title[0]) ? p->title : "YouTube Stream"; }
-const char *mp4_player_status_text(const mp4_player_t *p) { return (p && p->status_text[0]) ? p->status_text : "Idle"; }
+const char *mp4_player_title(const mp4_player_t *p) { return (p && p->title && p->title[0]) ? p->title : "YouTube Stream"; }
+const char *mp4_player_status_text(const mp4_player_t *p) { return (p && p->status_text && p->status_text[0]) ? p->status_text : "Idle"; }
 bool mp4_player_has_frame(const mp4_player_t *p) { return p ? p->has_frame : false; }
 bool mp4_player_has_audio(const mp4_player_t *p) { return p ? p->has_audio : false; }
 int  mp4_player_audio_rate(const mp4_player_t *p) { return p ? p->audio_rate : 0; }

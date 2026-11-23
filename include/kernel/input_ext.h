@@ -39,6 +39,13 @@ extern "C" {
 #define IPO_SHORTCUT_FLAG_PASSIVE       (1u << 4)
 #define IPO_SHORTCUT_FLAG_ALLOW_REPEAT  (1u << 5)
 
+#ifndef IPO_HOTKEY_MODE_DEFAULT
+#define IPO_HOTKEY_MODE_DEFAULT         0x00u
+#define IPO_HOTKEY_MODE_DISABLE_OS      0x01u
+#define IPO_HOTKEY_MODE_OVERRIDE_APP    0x02u
+#define IPO_HOTKEY_MODE_INCLUDE_CTRL_C  0x04u
+#endif
+
 /* Generic Input Event Types & Capabilities */
 #define IPO_EV_SYN                 0x00u
 #define IPO_EV_KEY                 0x01u

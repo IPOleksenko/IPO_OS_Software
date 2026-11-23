@@ -11,6 +11,10 @@
 #define SYS_FS_CLOSE          0x1018u
 #define SYS_SBRK              0x1045u
 #define SYS_SET_RETURN_VALUE  0x1029u
+#define SYS_MMAP              0x1206u
+
+#define LOADER_PROT_RWX               (1u | 2u | 4u)
+#define LOADER_MAP_PRIVATE_FIXED_ANON (0x02u | 0x10u | 0x20u)
 
 extern void call_struct_entry_stack(uint32_t entry_addr, void *ret_buf, int argc, char **argv, char **envp, void *new_stack_top);
 extern uint64_t call_app_entry_stack(uint32_t entry_addr, int argc, char **argv, char **envp, void *new_stack_top);
@@ -93,6 +97,42 @@ static inline void *heap_alloc(size_t size) {
     return p;
 }
 
+static bool map_fixed_anon_rwx(uint32_t start, uint32_t end) {
+    if (end <= start) return true;
+    uint32_t args[4];
+    args[0] = start;
+    args[1] = end - start;
+    args[2] = LOADER_PROT_RWX;
+    args[3] = LOADER_MAP_PRIVATE_FIXED_ANON;
+    int res = raw_syscall(SYS_MMAP, 4u, args);
+    return (uint32_t)res == start;
+}
+
+/* Map private RWX pages for non-relocatable ET_EXEC segments outside our own image. */
+static bool loader_map_fixed_target(uint32_t min_vaddr, uint32_t max_vaddr, const char *argv0) {
+    uint32_t self_end = 0x00804000u;
+    struct ipo_inode self_st;
+    if (argv0 && argv0[0] == '/' && sys_stat(argv0, &self_st) == 0 && self_st.size > 0) {
+        self_end = 0x00800000u + (((uint32_t)self_st.size + 4095u) & ~4095u);
+    } else if (sys_stat("/applications/elf_loader", &self_st) == 0 && self_st.size > 0) {
+        self_end = 0x00800000u + (((uint32_t)self_st.size + 4095u) & ~4095u);
+    }
+
+    uint32_t map_start = min_vaddr & ~4095u;
+    uint32_t map_end = (max_vaddr + 4095u) & ~4095u;
+    if (map_end < max_vaddr || map_end <= map_start) return false;
+
+    if (map_start < 0x00800000u) {
+        uint32_t lo_end = (map_end < 0x00800000u) ? map_end : 0x00800000u;
+        if (!map_fixed_anon_rwx(map_start, lo_end)) return false;
+    }
+    if (map_end > self_end) {
+        uint32_t hi_start = (map_start > self_end) ? map_start : self_end;
+        if (!map_fixed_anon_rwx(hi_start, map_end)) return false;
+    }
+    return true;
+}
+
 static bool is_entry_struct_return(const uint8_t *code, size_t max_len) {
     if (!code || max_len < 5) return false;
 
@@ -126,7 +166,25 @@ static bool is_entry_struct_return(const uint8_t *code, size_t max_len) {
             return true;
         }
         if (code[i] == 0xC3) {
-            if (i + 4 < scan_limit && code[i + 1] == 0x55 && code[i + 2] == 0x89 && code[i + 3] == 0xE5) {
+            /* Stop at scalar epilogue boundaries (pop ebp/leave/lea-esp + ret, or ret + pad + prologue)
+             * so we do not scan past _start into an adjacent struct-returning main(). */
+            if (i >= 1 && (code[i - 1] == 0x5D || code[i - 1] == 0xC9)) {
+                return false;
+            }
+            if (i >= 3 && code[i - 3] == 0x8D && code[i - 2] == 0x61 && code[i - 1] == 0xFC) {
+                return false;
+            }
+            size_t j = i + 1;
+            while (j < scan_limit && (code[j] == 0x90 || code[j] == 0xCC || code[j] == 0x00)) {
+                j++;
+            }
+            if (j + 1 < scan_limit && code[j] == 0x66 && code[j + 1] == 0x90) {
+                j += 2;
+            }
+            if (j >= scan_limit ||
+                (j + 2 < scan_limit && code[j] == 0x55 && code[j + 1] == 0x89 && code[j + 2] == 0xE5) ||
+                (j + 3 < scan_limit && code[j] == 0x8D && code[j + 1] == 0x4C && code[j + 2] == 0x24 && code[j + 3] == 0x04) ||
+                (j + 1 < scan_limit && code[j] == 0x0F && code[j + 1] == 0x1F)) {
                 return false;
             }
         }
@@ -167,28 +225,26 @@ uint64_t loader_main(int argc, char **argv, char **envp) {
         ehdr.e_ident[EI_MAG3] != ELFMAG3 ||
         ehdr.e_ident[EI_CLASS] != ELFCLASS32 ||
         ehdr.e_machine != EM_386 ||
-        ehdr.e_type != ET_EXEC ||
+        (ehdr.e_type != ET_EXEC && ehdr.e_type != ET_DYN) ||
+        ehdr.e_phentsize < sizeof(Elf32_Phdr) ||
         ehdr.e_phoff == 0 ||
-        ehdr.e_phnum == 0) {
+        ehdr.e_phnum == 0 ||
+        (uint32_t)ehdr.e_phnum > 0xFFFFFFFFu / sizeof(Elf32_Phdr)) {
         sys_close(fd);
         return 126;
     }
 
     uint32_t ph_bytes = (uint32_t)ehdr.e_phnum * sizeof(Elf32_Phdr);
-    if (ehdr.e_phoff + ph_bytes > file_size) {
+    if (ehdr.e_phoff > file_size || ph_bytes > file_size - ehdr.e_phoff) {
         sys_close(fd);
         return 126;
     }
 
-    /* Read program headers on stack if small, or heap */
-    Elf32_Phdr phdrs_stack[16];
-    Elf32_Phdr *phdrs = phdrs_stack;
-    if (ehdr.e_phnum > 16) {
-        phdrs = (Elf32_Phdr *)heap_alloc(ph_bytes);
-        if (!phdrs) {
-            sys_close(fd);
-            return 126;
-        }
+    /* Read program headers dynamically from heap */
+    Elf32_Phdr *phdrs = (Elf32_Phdr *)heap_alloc(ph_bytes);
+    if (!phdrs) {
+        sys_close(fd);
+        return 126;
     }
 
     if (sys_read(fd, phdrs, ph_bytes, ehdr.e_phoff) != (int)ph_bytes) {
@@ -202,6 +258,12 @@ uint64_t loader_main(int argc, char **argv, char **envp) {
 
     for (uint16_t i = 0; i < ehdr.e_phnum; i++) {
         if (phdrs[i].p_type != PT_LOAD) continue;
+        if (phdrs[i].p_memsz == 0u) continue;
+        if (phdrs[i].p_filesz > phdrs[i].p_memsz ||
+            phdrs[i].p_memsz > 0xFFFFFFFFu - phdrs[i].p_vaddr) {
+            sys_close(fd);
+            return 126;
+        }
         load_count++;
         if (phdrs[i].p_vaddr < min_vaddr) {
             min_vaddr = phdrs[i].p_vaddr;
@@ -218,6 +280,10 @@ uint64_t loader_main(int argc, char **argv, char **envp) {
     }
 
     uint32_t total_span = max_vaddr - min_vaddr;
+    if (total_span > 0xFFFFFFBFu) {
+        sys_close(fd);
+        return 126;
+    }
     uint8_t *staging = (uint8_t *)heap_alloc((size_t)total_span + 64u);
     if (!staging) {
         sys_close(fd);
@@ -230,7 +296,8 @@ uint64_t loader_main(int argc, char **argv, char **envp) {
     for (uint16_t i = 0; i < ehdr.e_phnum; i++) {
         if (phdrs[i].p_type != PT_LOAD) continue;
         if (phdrs[i].p_filesz > 0) {
-            if (phdrs[i].p_offset + phdrs[i].p_filesz > file_size) {
+            if (phdrs[i].p_offset > file_size ||
+                phdrs[i].p_filesz > file_size - phdrs[i].p_offset) {
                 sys_close(fd);
                 return 126;
             }
@@ -245,12 +312,17 @@ uint64_t loader_main(int argc, char **argv, char **envp) {
     /* Apply SHT_REL relocations using temporary heap space that is reclaimed afterwards */
     bool has_relocs = false;
     uint32_t delta = (uint32_t)(uintptr_t)staging - min_vaddr;
-    if (delta != 0 && ehdr.e_shoff != 0 && ehdr.e_shnum != 0) {
+    if (delta != 0 && ehdr.e_shoff != 0 && ehdr.e_shnum != 0 &&
+        ehdr.e_shentsize >= sizeof(Elf32_Shdr) &&
+        (uint32_t)ehdr.e_shnum <= 0xFFFFFFFFu / sizeof(Elf32_Shdr)) {
         uint32_t sh_bytes = (uint32_t)ehdr.e_shnum * sizeof(Elf32_Shdr);
-        if (ehdr.e_shoff + sh_bytes <= file_size) {
+        if (ehdr.e_shoff <= file_size && sh_bytes <= file_size - ehdr.e_shoff) {
             void *mark_before_reloc = sys_sbrk(0);
             Elf32_Shdr *shdrs = (Elf32_Shdr *)heap_alloc(sh_bytes);
             if (shdrs && sys_read(fd, shdrs, sh_bytes, ehdr.e_shoff) == (int)sh_bytes) {
+                Elf32_Sym *cached_symtab = NULL;
+                uint32_t cached_num_syms = 0;
+                uint32_t cached_sym_sec = 0xFFFFFFFFu;
                 for (uint16_t s = 0; s < ehdr.e_shnum; s++) {
                     if (shdrs[s].sh_type != SHT_REL) continue;
                     has_relocs = true;
@@ -261,20 +333,29 @@ uint64_t loader_main(int argc, char **argv, char **envp) {
                     uint32_t target_vaddr = shdrs[target_sec].sh_addr;
                     uint32_t rel_bytes = shdrs[s].sh_size;
                     uint32_t num_relocs = rel_bytes / sizeof(Elf32_Rel);
-                    if (num_relocs == 0 || shdrs[s].sh_offset + rel_bytes > file_size) {
+                    if (num_relocs == 0 || shdrs[s].sh_offset > file_size ||
+                        rel_bytes > file_size - shdrs[s].sh_offset) {
                         continue;
                     }
 
-                    /* Load linked symbol table if valid */
+                    /* Load linked symbol table if valid (cached across SHT_REL sections) */
                     Elf32_Sym *symtab = NULL;
                     uint32_t num_syms = 0;
                     uint32_t sym_sec = shdrs[s].sh_link;
-                    if (sym_sec < ehdr.e_shnum && shdrs[sym_sec].sh_type == SHT_SYMTAB &&
+                    if (sym_sec == cached_sym_sec) {
+                        symtab = cached_symtab;
+                        num_syms = cached_num_syms;
+                    } else if (sym_sec < ehdr.e_shnum &&
+                        (shdrs[sym_sec].sh_type == SHT_SYMTAB || shdrs[sym_sec].sh_type == SHT_DYNSYM) &&
                         shdrs[sym_sec].sh_size > 0 &&
-                        shdrs[sym_sec].sh_offset + shdrs[sym_sec].sh_size <= file_size) {
+                        shdrs[sym_sec].sh_offset <= file_size &&
+                        shdrs[sym_sec].sh_size <= file_size - shdrs[sym_sec].sh_offset) {
                         symtab = (Elf32_Sym *)heap_alloc(shdrs[sym_sec].sh_size);
                         if (symtab && sys_read(fd, symtab, shdrs[sym_sec].sh_size, shdrs[sym_sec].sh_offset) == (int)shdrs[sym_sec].sh_size) {
                             num_syms = shdrs[sym_sec].sh_size / sizeof(Elf32_Sym);
+                            cached_symtab = symtab;
+                            cached_num_syms = num_syms;
+                            cached_sym_sec = sym_sec;
                         } else {
                             symtab = NULL;
                         }
@@ -285,29 +366,56 @@ uint64_t loader_main(int argc, char **argv, char **envp) {
                         for (uint32_t r = 0; r < num_relocs; r++) {
                             uint8_t type = (uint8_t)ELF32_R_TYPE(relocs[r].r_info);
                             uint32_t sym_idx = ELF32_R_SYM(relocs[r].r_info);
+                            bool has_sym = (symtab && sym_idx > 0 && sym_idx < num_syms);
+                            bool sym_relocatable = true;
+                            uint32_t sym_val = 0u;
 
-                            if (symtab && sym_idx > 0 && sym_idx < num_syms) {
+                            if (has_sym) {
                                 uint16_t shndx = symtab[sym_idx].st_shndx;
+                                sym_val = symtab[sym_idx].st_value;
                                 if (shndx == SHN_UNDEF || shndx == SHN_ABS) {
-                                    continue;
+                                    sym_relocatable = false;
                                 }
                             }
 
-                            if (type == R_386_32 || type == R_386_RELATIVE) {
-                                uint32_t r_off = relocs[r].r_offset;
-                                uint32_t patch_offset;
-                                if (r_off >= min_vaddr && r_off < max_vaddr) {
-                                    patch_offset = r_off - min_vaddr;
-                                } else if (target_vaddr >= min_vaddr && (target_vaddr - min_vaddr + r_off) < total_span) {
-                                    patch_offset = (target_vaddr - min_vaddr) + r_off;
-                                } else {
-                                    continue;
+                            uint32_t r_off = relocs[r].r_offset;
+                            uint32_t patch_offset;
+                            if (r_off >= min_vaddr && r_off < max_vaddr) {
+                                patch_offset = r_off - min_vaddr;
+                            } else if (target_vaddr >= min_vaddr &&
+                                       r_off < total_span &&
+                                       (target_vaddr - min_vaddr) <= total_span - r_off) {
+                                patch_offset = (target_vaddr - min_vaddr) + r_off;
+                            } else {
+                                continue;
+                            }
+                            if (total_span < 4u || patch_offset > total_span - 4u) {
+                                continue;
+                            }
+
+                            uint32_t *patch_ptr = (uint32_t *)(staging + patch_offset);
+                            uint32_t orig_val = *patch_ptr;
+
+                            if (type == R_386_RELATIVE) {
+                                *patch_ptr = orig_val + delta;
+                            } else if (type == R_386_32) {
+                                if (!sym_relocatable) continue;
+                                if (ehdr.e_type == ET_DYN) {
+                                    *patch_ptr = (has_sym ? (sym_val + delta) : (orig_val + delta));
+                                } else if (orig_val >= min_vaddr && orig_val <= (max_vaddr + 0x1000u)) {
+                                    *patch_ptr = orig_val + delta;
+                                } else if (has_sym && sym_val >= min_vaddr && sym_val <= (max_vaddr + 0x1000u)) {
+                                    *patch_ptr = orig_val + delta;
                                 }
-                                if (patch_offset + 4 <= total_span) {
-                                    uint32_t orig_val = *(uint32_t *)(staging + patch_offset);
-                                    if (orig_val != 0 && orig_val >= (min_vaddr - 0x10000u) && orig_val <= (max_vaddr + 0x10000u)) {
-                                        *(uint32_t *)(staging + patch_offset) = orig_val + delta;
-                                    }
+                            } else if (type == R_386_GLOB_DAT || type == R_386_JMP_SLOT) {
+                                if (!sym_relocatable || !has_sym) continue;
+                                if (sym_val >= min_vaddr && sym_val <= (max_vaddr + 0x1000u)) {
+                                    *patch_ptr = sym_val + delta;
+                                }
+                            } else if (type == R_386_PC32) {
+                                /* Internal P-relative offsets cancel (+delta - +delta); adjust ABS targets */
+                                if (has_sym && symtab[sym_idx].st_shndx == SHN_ABS) {
+                                    *patch_ptr = orig_val - delta;
                                 }
                             }
                         }
@@ -347,15 +455,17 @@ uint64_t loader_main(int argc, char **argv, char **envp) {
         }
     }
 
-    /* Save detected format string to stack before staging might be moved */
-    char detected_format_buf[64];
-    detected_format_buf[0] = '\0';
+    /* Save detected format string on heap before staging might be moved */
     if (detected_format) {
         size_t dlen = str_len(detected_format);
-        if (dlen >= sizeof(detected_format_buf)) dlen = sizeof(detected_format_buf) - 1;
-        mem_copy(detected_format_buf, detected_format, dlen);
-        detected_format_buf[dlen] = '\0';
-        detected_format = detected_format_buf;
+        char *fmt_copy = (char *)heap_alloc(dlen + 1u);
+        if (fmt_copy) {
+            mem_copy(fmt_copy, detected_format, dlen);
+            fmt_copy[dlen] = '\0';
+            detected_format = fmt_copy;
+        } else {
+            detected_format = NULL;
+        }
     }
 
     /* Construct target argc/argv array in heap */
@@ -389,11 +499,18 @@ uint64_t loader_main(int argc, char **argv, char **envp) {
     uint32_t *app_stack_top = NULL;
 
     uint32_t target_entry = ehdr.e_entry;
-    uint32_t entry_offset = (target_entry >= min_vaddr && target_entry < max_vaddr) ? (target_entry - min_vaddr) : 0;
+    if (target_entry < min_vaddr || target_entry >= max_vaddr) {
+        return 126;
+    }
+    uint32_t entry_offset = target_entry - min_vaddr;
     bool is_struct = is_entry_struct_return(staging + entry_offset, (size_t)(total_span - entry_offset));
-    bool copy_to_base = (!has_relocs && min_vaddr == 0x00800000u);
+    bool copy_to_base = (ehdr.e_type == ET_EXEC && !has_relocs &&
+                         min_vaddr >= 0x00100000u && max_vaddr <= 0xBF000000u);
 
     if (copy_to_base) {
+        if (!loader_map_fixed_target(min_vaddr, max_vaddr, (argc > 0 && argv) ? argv[0] : NULL)) {
+            return 126;
+        }
         if (detected_format && detected_format[0] != '\0') {
             uint32_t fmt_args[2];
             fmt_args[0] = 99u; /* Register embedded return format for process */

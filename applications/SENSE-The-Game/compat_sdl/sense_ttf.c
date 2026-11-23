@@ -10,8 +10,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define GLYPH_CACHE_CAP 512
-
 typedef struct {
     float x0, y0, x1, y1;
     int dir; /* +1 downward, -1 upward */
@@ -56,7 +54,8 @@ struct TTF_Font {
     int baseline;
     uint64_t content_hash;
 
-    TT_CachedGlyph cache[GLYPH_CACHE_CAP];
+    TT_CachedGlyph *cache;
+    int cache_cap;
     uint32_t stamp_seq;
 };
 
@@ -462,21 +461,33 @@ static int cmp_hit(const void *a, const void *b) {
 }
 
 static const TT_CachedGlyph *tt_get_glyph(TTF_Font *f, uint32_t cp) {
-    uint32_t oldest_idx = 0;
-    uint32_t oldest_stamp = 0xFFFFFFFFu;
+    static const TT_CachedGlyph s_empty_glyph = {0};
+    int free_idx = -1;
 
-    for (uint32_t i = 0; i < GLYPH_CACHE_CAP; i++) {
+    for (int i = 0; i < f->cache_cap; i++) {
         if (f->cache[i].alpha && f->cache[i].cp == cp && f->cache[i].stamp != 0) {
             f->cache[i].stamp = ++f->stamp_seq;
             return &f->cache[i];
         }
-        if (f->cache[i].stamp < oldest_stamp) {
-            oldest_stamp = f->cache[i].stamp;
-            oldest_idx = i;
+        if (f->cache[i].stamp == 0 && free_idx < 0) {
+            free_idx = i;
         }
     }
 
-    TT_CachedGlyph *slot = &f->cache[oldest_idx];
+    if (free_idx < 0) {
+        int new_cap = f->cache_cap ? (f->cache_cap * 2) : 64;
+        if (new_cap <= f->cache_cap || (size_t)new_cap > SIZE_MAX / sizeof(TT_CachedGlyph)) {
+            return &s_empty_glyph;
+        }
+        TT_CachedGlyph *nc = (TT_CachedGlyph *)realloc(f->cache, (size_t)new_cap * sizeof(TT_CachedGlyph));
+        if (!nc) return &s_empty_glyph;
+        memset(nc + f->cache_cap, 0, (size_t)(new_cap - f->cache_cap) * sizeof(TT_CachedGlyph));
+        free_idx = f->cache_cap;
+        f->cache = nc;
+        f->cache_cap = new_cap;
+    }
+
+    TT_CachedGlyph *slot = &f->cache[free_idx];
     free(slot->alpha);
     memset(slot, 0, sizeof(*slot));
     slot->cp = cp;
@@ -591,7 +602,10 @@ int TTF_Init(void) {
     return 0;
 }
 
+static void ttf_text_cache_free(void);
+
 void TTF_Quit(void) {
+    ttf_text_cache_free();
 }
 
 TTF_Font *TTF_OpenFontRW(SDL_RWops *src, int freesrc, int ptsize) {
@@ -718,9 +732,10 @@ TTF_Font *TTF_OpenFont(const char *file, int ptsize) {
 
 void TTF_CloseFont(TTF_Font *font) {
     if (!font) return;
-    for (int i = 0; i < GLYPH_CACHE_CAP; i++) {
+    for (int i = 0; i < font->cache_cap; i++) {
         free(font->cache[i].alpha);
     }
+    free(font->cache);
     if (font->own_buf) free(font->buf);
     free(font);
 }
@@ -759,8 +774,6 @@ static uint32_t decode_utf8(const char **p) {
     return '?';
 }
 
-#define TTF_TEXT_CACHE_CAP 64
-
 typedef struct {
     uint64_t font_hash;
     uint64_t text_hash;
@@ -773,9 +786,20 @@ typedef struct {
     uint32_t stamp;
 } TTFTextCacheEntry;
 
-static TTFTextCacheEntry s_ttf_cache[TTF_TEXT_CACHE_CAP];
+static TTFTextCacheEntry *s_ttf_cache = NULL;
+static int s_ttf_cache_cap = 0;
 static uint32_t s_ttf_cache_stamp = 0;
 static uint64_t s_ttf_cache_ver = 1;
+
+static void ttf_text_cache_free(void) {
+    for (int i = 0; i < s_ttf_cache_cap; i++) {
+        free(s_ttf_cache[i].text);
+        free(s_ttf_cache[i].pixels);
+    }
+    free(s_ttf_cache);
+    s_ttf_cache = NULL;
+    s_ttf_cache_cap = 0;
+}
 
 static uint64_t fnv1a_text(const char *s, size_t len) {
     uint64_t h = 14695981039346656037ULL;
@@ -810,9 +834,8 @@ SDL_Surface *TTF_RenderUTF8_Blended(TTF_Font *font, const char *text, SDL_Color 
     /* Key cache strictly on RGB and apply fg.a at texture blit time so fades never bust cache. */
     uint32_t rgb = ((uint32_t)fg.r << 16) | ((uint32_t)fg.g << 8) | (uint32_t)fg.b;
 
-    int lru_idx = 0;
-    uint32_t lru_stamp = 0xFFFFFFFFu;
-    for (int i = 0; i < TTF_TEXT_CACHE_CAP; i++) {
+    int slot_idx = -1;
+    for (int i = 0; i < s_ttf_cache_cap; i++) {
         TTFTextCacheEntry *e = &s_ttf_cache[i];
         if (e->pixels && e->font_hash == font->content_hash &&
             e->text_hash == text_hash && e->rgba == rgb &&
@@ -820,14 +843,20 @@ SDL_Surface *TTF_RenderUTF8_Blended(TTF_Font *font, const char *text, SDL_Color 
             e->stamp = ++s_ttf_cache_stamp;
             return make_cached_surface_handle(e, fg.a);
         }
-        if (!e->pixels) {
-            lru_idx = i;
-            lru_stamp = 0;
-            break;
+        if (!e->pixels && slot_idx < 0) {
+            slot_idx = i;
         }
-        if (e->stamp < lru_stamp) {
-            lru_stamp = e->stamp;
-            lru_idx = i;
+    }
+    if (slot_idx < 0) {
+        int new_cap = s_ttf_cache_cap ? (s_ttf_cache_cap * 2) : 64;
+        if (new_cap > s_ttf_cache_cap && (size_t)new_cap <= SIZE_MAX / sizeof(TTFTextCacheEntry)) {
+            TTFTextCacheEntry *nc = (TTFTextCacheEntry *)realloc(s_ttf_cache, (size_t)new_cap * sizeof(TTFTextCacheEntry));
+            if (nc) {
+                memset(nc + s_ttf_cache_cap, 0, (size_t)(new_cap - s_ttf_cache_cap) * sizeof(TTFTextCacheEntry));
+                slot_idx = s_ttf_cache_cap;
+                s_ttf_cache = nc;
+                s_ttf_cache_cap = new_cap;
+            }
         }
     }
 
@@ -881,9 +910,9 @@ SDL_Surface *TTF_RenderUTF8_Blended(TTF_Font *font, const char *text, SDL_Color 
     }
 
     char *tcopy = (char *)malloc(text_len + 1u);
-    if (tcopy && text_len <= 1024u && (size_t)w * (size_t)h <= 512u * 1024u) {
+    if (tcopy && slot_idx >= 0) {
         memcpy(tcopy, text, text_len + 1u);
-        TTFTextCacheEntry *slot = &s_ttf_cache[lru_idx];
+        TTFTextCacheEntry *slot = &s_ttf_cache[slot_idx];
         free(slot->text);
         free(slot->pixels);
         slot->font_hash = font->content_hash;

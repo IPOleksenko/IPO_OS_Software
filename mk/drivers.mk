@@ -19,12 +19,14 @@ KMD_KSYMS_ARG := $(if $(KSYMS_FILE),--ksyms $(KSYMS_FILE),)
 KMD_CRT_O := $(DRIVERS_BUILD_DIR)/kmd_crt.o
 KMD_STUB_S := $(DRIVERS_BUILD_DIR)/kmd_stub_relocs.s
 KMD_STUB_O := $(DRIVERS_BUILD_DIR)/kmd_stub_relocs.o
+DRV_APP_ENTRY_O := $(DRIVERS_BUILD_DIR)/driver_app_entry.o
+DRV_APP_STUB_O  := $(DRIVERS_BUILD_DIR)/driver_app_stub.o
 
 DRIVERS_TARGETS := \
-	$(DRIVERS_BUILD_DIR)/touchpad.kmd \
-	$(DRIVERS_BUILD_DIR)/gamepad.kmd \
-	$(DRIVERS_BUILD_DIR)/rtl8139.kmd \
-	$(DRIVERS_BUILD_DIR)/custom_proto.kmd
+	$(DRIVERS_BUILD_DIR)/touchpad \
+	$(DRIVERS_BUILD_DIR)/gamepad \
+	$(DRIVERS_BUILD_DIR)/rtl8139 \
+	$(DRIVERS_BUILD_DIR)/custom_proto
 
 NET_DRV_SRCS := $(wildcard $(DRIVERS_DIR)/net/src/*.c)
 NET_DRV_OBJS := $(patsubst $(DRIVERS_DIR)/net/src/%.c,$(DRIVERS_BUILD_DIR)/net/%.o,$(NET_DRV_SRCS))
@@ -33,6 +35,14 @@ NET_KMD_CFLAGS := $(KMD_CFLAGS) -I$(DRIVERS_DIR)/net/include -I$(PROJECT_ROOT)/i
 .PHONY: drivers clean-drivers
 
 drivers: $(DRIVERS_TARGETS)
+
+$(DRV_APP_ENTRY_O): $(DRIVERS_DIR)/driver_app_entry.s
+	@mkdir -p $(dir $@)
+	$(CC) -m32 -fno-pic -fno-pie -c $< -o $@
+
+$(DRV_APP_STUB_O): $(DRIVERS_DIR)/driver_app_stub.c
+	@mkdir -p $(dir $@)
+	$(CC) -m32 -O2 -fno-pic -fno-pie -fno-stack-protector -ffreestanding -fno-builtin -nostdlib -nostdinc -I$(PROJECT_ROOT)/include -c $< -o $@
 
 $(KMD_CRT_O): $(DRIVERS_DIR)/kmd_crt.s
 	@mkdir -p $(dir $@)
@@ -66,6 +76,19 @@ $(DRIVERS_BUILD_DIR)/$(1).pass2.elf: $(KMD_CRT_O) $(DRIVERS_BUILD_DIR)/$(1).o $(
 
 $(DRIVERS_BUILD_DIR)/$(1).kmd: $(DRIVERS_BUILD_DIR)/$(1).pass2.elf $(TOOLS_DIR)/build_kmd.py
 	$(PYTHON) $(TOOLS_DIR)/build_kmd.py $$< -o $$@ $(KMD_KSYMS_ARG)
+
+$(DRIVERS_BUILD_DIR)/$(1).payload.S: $(DRIVERS_BUILD_DIR)/$(1).kmd
+	@printf '.section .rodata\n.global kmd_driver_name\n.global kmd_payload_start\n.global kmd_payload_end\nkmd_driver_name:\n    .asciz "$(1)"\n.balign 4\nkmd_payload_start:\n    .incbin "$(1).kmd"\nkmd_payload_end:\n' > $$@
+
+$(DRIVERS_BUILD_DIR)/$(1).payload.o: $(DRIVERS_BUILD_DIR)/$(1).payload.S $(DRIVERS_BUILD_DIR)/$(1).kmd
+	$(CC) -m32 -fno-pic -fno-pie -I$(DRIVERS_BUILD_DIR) -c $$< -o $$@
+
+$(DRIVERS_BUILD_DIR)/$(1): $(DRV_APP_ENTRY_O) $(DRV_APP_STUB_O) $(DRIVERS_BUILD_DIR)/$(1).payload.o $(DRIVERS_DIR)/driver_app.ld
+	$(LD) -m elf_i386 -T $(DRIVERS_DIR)/driver_app.ld --no-warn-rwx-segments $(DRV_APP_ENTRY_O) $(DRV_APP_STUB_O) $(DRIVERS_BUILD_DIR)/$(1).payload.o -o $$@.elf
+	$(OBJCOPY) --set-section-flags .bss=alloc,load,contents -j .text -j .rodata -j .data -j .bss -O binary $$@.elf $$@
+	@rm -f $$@.elf
+	@SIZE=$$(stat -c%s "$$@" 2>/dev/null || stat -f%z "$$@" 2>/dev/null); \
+	echo "[drivers] ✓ Created executable driver app: $$@ ($$SIZE bytes)"
 endef
 
 $(eval $(call KMD_RULE,touchpad,"IPO_OS Multi-Touch Touchpad Driver"))
@@ -92,6 +115,19 @@ $(DRIVERS_BUILD_DIR)/rtl8139.pass2.elf: $(KMD_CRT_O) $(NET_DRV_OBJS) $(DRIVERS_B
 
 $(DRIVERS_BUILD_DIR)/rtl8139.kmd: $(DRIVERS_BUILD_DIR)/rtl8139.pass2.elf $(TOOLS_DIR)/build_kmd.py
 	$(PYTHON) $(TOOLS_DIR)/build_kmd.py $< -o $@ $(KMD_KSYMS_ARG)
+
+$(DRIVERS_BUILD_DIR)/rtl8139.payload.S: $(DRIVERS_BUILD_DIR)/rtl8139.kmd
+	@printf '.section .rodata\n.global kmd_driver_name\n.global kmd_payload_start\n.global kmd_payload_end\nkmd_driver_name:\n    .asciz "rtl8139"\n.balign 4\nkmd_payload_start:\n    .incbin "rtl8139.kmd"\nkmd_payload_end:\n' > $@
+
+$(DRIVERS_BUILD_DIR)/rtl8139.payload.o: $(DRIVERS_BUILD_DIR)/rtl8139.payload.S $(DRIVERS_BUILD_DIR)/rtl8139.kmd
+	$(CC) -m32 -fno-pic -fno-pie -I$(DRIVERS_BUILD_DIR) -c $< -o $@
+
+$(DRIVERS_BUILD_DIR)/rtl8139: $(DRV_APP_ENTRY_O) $(DRV_APP_STUB_O) $(DRIVERS_BUILD_DIR)/rtl8139.payload.o $(DRIVERS_DIR)/driver_app.ld
+	$(LD) -m elf_i386 -T $(DRIVERS_DIR)/driver_app.ld --no-warn-rwx-segments $(DRV_APP_ENTRY_O) $(DRV_APP_STUB_O) $(DRIVERS_BUILD_DIR)/rtl8139.payload.o -o $@.elf
+	$(OBJCOPY) --set-section-flags .bss=alloc,load,contents -j .text -j .rodata -j .data -j .bss -O binary $@.elf $@
+	@rm -f $@.elf
+	@SIZE=$$(stat -c%s "$@" 2>/dev/null || stat -f%z "$@" 2>/dev/null); \
+	echo "[drivers] ✓ Created executable driver app: $@ ($$SIZE bytes)"
 
 clean-drivers:
 	@rm -rf $(DRIVERS_BUILD_DIR)

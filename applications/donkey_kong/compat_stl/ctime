@@ -1,0 +1,9 @@
+#pragma once
+extern "C" {
+#include <time.h>
+}
+
+namespace std {
+using ::time_t;
+using ::time;
+} // namespace std

@@ -344,7 +344,7 @@ static void g_draw_line_slice(struct graphics_device *dev, struct g_object_line 
 	int i;
 	if (sw <= 0 || sh <= 0) return;
 	g_draw_background(dev, l->bg, sx, sy, sw, sh);
-	if (!l->css_box || !l->css_box->n_layers) return;
+	if (!l->css_box || !l->css_box->n_layers || !l->css_box->layers) return;
 	for (i = 0; i < (int)l->css_box->n_layers; i++) {
 		const ipo_css_box_layer_t *ly = &l->css_box->layers[i];
 		int lx1 = xx + ly->x1;
@@ -398,7 +398,11 @@ void g_line_destruct(struct g_object *l_)
 	int i;
 	for (i = 0; i < l->n_entries; i++) l->entries[i]->destruct(l->entries[i]);
 #ifdef IPO_OS
-	if (l->css_box) { free(l->css_box); l->css_box = NULL; }
+	if (l->css_box) {
+		free(l->css_box->layers);
+		free(l->css_box);
+		l->css_box = NULL;
+	}
 #endif
 	mem_free(l);
 }

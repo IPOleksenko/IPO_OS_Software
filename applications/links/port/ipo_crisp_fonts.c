@@ -22309,52 +22309,37 @@ static const ipo_font_face_t s_faces[IPO_NUM_FACES] = {
 
 #define T2_CHUNK_SZ 64u
 #define T3_CHUNK_SZ 128u
-#define T2_CACHE_SLOTS 16
-#define T3_CACHE_SLOTS 24
 
 typedef struct {
-    int32_t  cid;
-    uint32_t stamp;
-    uint8_t *data;
-} zcache_slot_t;
+    uint8_t **data;
+    uint32_t cap;
+} zchunk_cache_t;
 
-static zcache_slot_t s_t2_cache[T2_CACHE_SLOTS];
-static zcache_slot_t s_t3_cache[T3_CACHE_SLOTS];
-static uint32_t s_cache_tick = 1u;
+static zchunk_cache_t s_t2_cache = { NULL, 0u };
+static zchunk_cache_t s_t3_cache = { NULL, 0u };
 
-static void init_zcache_once(void) {
-    static int inited = 0;
-    if (inited) return;
-    inited = 1;
-    for (int i = 0; i < T2_CACHE_SLOTS; i++) s_t2_cache[i].cid = -1;
-    for (int i = 0; i < T3_CACHE_SLOTS; i++) s_t3_cache[i].cid = -1;
-}
-
-static const uint8_t *get_chunk_data(zcache_slot_t *slots, int nslots,
+static const uint8_t *get_chunk_data(zchunk_cache_t *cache, uint32_t total_chunks,
                                      const ipo_zchunk_t *meta, const uint8_t *zblob,
                                      uint32_t cid) {
-    init_zcache_once();
-    s_cache_tick++;
-    int empty_i = -1;
-    int lru_i = 0;
-    uint32_t min_stamp = 0xFFFFFFFFu;
-    for (int i = 0; i < nslots; i++) {
-        if (slots[i].cid == (int32_t)cid) {
-            slots[i].stamp = s_cache_tick;
-            return slots[i].data;
+    if (!cache || cid >= total_chunks) return NULL;
+    if (cid >= cache->cap) {
+        uint32_t need = cid + 1u;
+        uint32_t nc = cache->cap ? cache->cap : 16u;
+        while (nc < need) {
+            if (nc > UINT32_MAX / 2u) { nc = need; break; }
+            nc *= 2u;
         }
-        if (slots[i].cid < 0 && empty_i < 0) empty_i = i;
-        if (slots[i].stamp < min_stamp) {
-            min_stamp = slots[i].stamp;
-            lru_i = i;
-        }
+        if (nc > total_chunks) nc = total_chunks;
+        if ((size_t)nc > SIZE_MAX / sizeof(uint8_t *)) return NULL;
+        uint8_t **nd = (uint8_t **)realloc(cache->data, (size_t)nc * sizeof(uint8_t *));
+        if (!nd) return NULL;
+        memset(nd + cache->cap, 0, (size_t)(nc - cache->cap) * sizeof(uint8_t *));
+        cache->data = nd;
+        cache->cap = nc;
     }
-    int slot_i = (empty_i >= 0) ? empty_i : lru_i;
-    if (slots[slot_i].data) {
-        free(slots[slot_i].data);
-        slots[slot_i].data = NULL;
+    if (cache->data[cid]) {
+        return cache->data[cid];
     }
-    slots[slot_i].cid = -1;
 
     uint32_t raw_len = meta[cid].raw_len;
     uint8_t *buf = (uint8_t *)malloc(raw_len ? raw_len : 1u);
@@ -22364,9 +22349,7 @@ static const uint8_t *get_chunk_data(zcache_slot_t *slots, int nslots,
         free(buf);
         return NULL;
     }
-    slots[slot_i].cid = (int32_t)cid;
-    slots[slot_i].stamp = s_cache_tick;
-    slots[slot_i].data = buf;
+    cache->data[cid] = buf;
     return buf;
 }
 
@@ -22495,7 +22478,7 @@ static int resolve_glyph(int style_idx, int height, uint32_t cp, resolved_glyph_
     if (t2 >= 0) {
         uint32_t cid = (uint32_t)t2 / T2_CHUNK_SZ;
         uint32_t in_c = (uint32_t)t2 % T2_CHUNK_SZ;
-        const uint8_t *cd = get_chunk_data(s_t2_cache, T2_CACHE_SLOTS, ipo_t2_chunks, ipo_t2_zblob, cid);
+        const uint8_t *cd = get_chunk_data(&s_t2_cache, ipo_t2_chunk_count, ipo_t2_chunks, ipo_t2_zblob, cid);
         if (!cd) return 0;
         int face_slot = 0;
         int src_h = 14, src_base = 11;
@@ -22526,7 +22509,7 @@ static int resolve_glyph(int style_idx, int height, uint32_t cp, resolved_glyph_
     if (t3 >= 0) {
         uint32_t cid = (uint32_t)t3 / T3_CHUNK_SZ;
         uint32_t in_c = (uint32_t)t3 % T3_CHUNK_SZ;
-        const uint8_t *cd = get_chunk_data(s_t3_cache, T3_CACHE_SLOTS, ipo_t3_chunks, ipo_t3_zblob, cid);
+        const uint8_t *cd = get_chunk_data(&s_t3_cache, ipo_t3_chunk_count, ipo_t3_chunks, ipo_t3_zblob, cid);
         if (!cd) return 0;
         uint16_t off = (uint16_t)cd[in_c * 2u] | ((uint16_t)cd[in_c * 2u + 1u] << 8);
         const uint8_t *e = cd + off;

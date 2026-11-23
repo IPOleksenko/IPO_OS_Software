@@ -84,9 +84,7 @@ typedef struct ipo_css_node {
     const unsigned char *raw_attr; /* Links raw attribute pointer for optional [attr] checks */
 } ipo_css_node_t;
 
-/* Compact per-line box paint descriptor stored on struct g_object_line */
-#define IPO_CSS_MAX_BOX_LAYERS 4
-
+/* Dynamic per-line box paint descriptor stored on struct g_object_line */
 typedef struct ipo_css_box_layer {
     int16_t x1;
     int16_t x2;
@@ -98,8 +96,8 @@ typedef struct ipo_css_box_layer {
 } ipo_css_box_layer_t;
 
 typedef struct ipo_css_line_box {
-    uint8_t n_layers;
-    ipo_css_box_layer_t layers[IPO_CSS_MAX_BOX_LAYERS];
+    uint32_t n_layers;
+    ipo_css_box_layer_t *layers;
 } ipo_css_line_box_t;
 
 /* Inline box styling passed via par_format / special_f */

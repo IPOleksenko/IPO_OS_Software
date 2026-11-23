@@ -152,14 +152,23 @@ def load_applications_to_disk(
             app_name = app.name[:-4] if app.name.endswith(".bin") else app.name
             safe_put_executable(disk, app, f"/applications/{app_name}")
 
-    # 1b. Upload loadable kernel drivers (.kmd)
+    # 1b. Upload executable driver applications to /drivers
     drivers_dir = project_root / "build" / "drivers"
     if drivers_dir.is_dir():
-        kmd_files = sorted(drivers_dir.glob("*.kmd"))
-        if kmd_files:
-            print(f"Uploading {len(kmd_files)} kernel driver(s) to /drivers...")
-            for kmd in kmd_files:
-                safe_put(disk, kmd, f"/drivers/{kmd.name}")
+        try:
+            for existing in disk.ls("/drivers"):
+                if existing.endswith(".kmd"):
+                    disk.rm(f"/drivers/{existing}")
+        except Exception:
+            pass
+        drv_apps = sorted(
+            p for p in drivers_dir.iterdir()
+            if p.is_file() and "." not in p.name
+        )
+        if drv_apps:
+            print(f"Uploading {len(drv_apps)} executable driver(s) to /drivers...")
+            for drv in drv_apps:
+                safe_put_executable(disk, drv, f"/drivers/{drv.name}")
 
     # Upload all data files while preserving their directory structure.
     data_dir = project_root / "data"
@@ -212,31 +221,26 @@ def load_applications_to_disk(
                 dest = f"/fonts/{font.name}"
                 disk.put(str(font), dest)
 
-    # 4. Upload compiler headers
+    # 4. Upload compiler headers recursively (preserves GL/, ipo/, kernel/, sys/, c++/, etc.)
     tcc_include = project_root / "applications" / "tcc" / "include"
     if tcc_include.exists():
-        for h in tcc_include.glob("*.h"):
-            safe_put(disk, h, f"/include/{h.name}")
+        for h in sorted(tcc_include.rglob("*")):
+            if h.is_file():
+                rel = h.relative_to(tcc_include).as_posix()
+                if "/" in rel:
+                    safe_mkdir(disk, f"/include/{rel.rsplit('/', 1)[0]}")
+                safe_put(disk, h, f"/include/{rel}")
 
     include_dir = project_root / "include"
     if not include_dir.exists():
         include_dir = project_root / "applications" / "include"
     if include_dir.exists():
-        for h in include_dir.glob("*.h"):
-            safe_put(disk, h, f"/include/{h.name}")
-
-        sys_include = include_dir / "sys"
-        if sys_include.exists():
-            safe_mkdir(disk, "/include/sys")
-            for h in sys_include.glob("*.h"):
-                safe_put(disk, h, f"/include/sys/{h.name}")
-
-        cxx_include = include_dir / "c++"
-        if cxx_include.exists():
-            safe_mkdir(disk, "/include/c++")
-            for h in cxx_include.glob("*"):
-                if h.is_file():
-                    safe_put(disk, h, f"/include/c++/{h.name}")
+        all_entries = sorted(include_dir.rglob("*"))
+        inc_dirs = [d for d in all_entries if d.is_dir()]
+        for d in sorted(inc_dirs, key=lambda p: (len(p.relative_to(include_dir).parts), p)):
+            safe_mkdir(disk, f"/include/{d.relative_to(include_dir).as_posix()}")
+        for h in [f for f in all_entries if f.is_file()]:
+            safe_put(disk, h, f"/include/{h.relative_to(include_dir).as_posix()}")
 
     # 5. Upload C/C++ runtime and libraries
     lib_dir = project_root / "build" / "lib"

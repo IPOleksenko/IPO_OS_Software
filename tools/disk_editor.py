@@ -10,9 +10,17 @@ IPO_INODE_EXTENTS = 4
 IPO_EXTENT_NODE_EXTENTS = 20
 IPO_INODE_TYPE_DIR = 0x1
 IPO_INODE_TYPE_FILE = 0x2
+IPO_FS_FLAG_LINKED_EXTENTS = 0x0001
+IPO_FS_FLAG_DYNAMIC_INODES = 0x0002
 
-SB_FMT = '<8sQIIQQQQQ'
+SB_FMT = '<8sQIIQQQQQIIQQQQ'
 SB_SIZE = struct.calcsize(SB_FMT)
+
+CHUNK_DESC_FMT = '<QQQII'
+CHUNK_DESC_SIZE = struct.calcsize(CHUNK_DESC_FMT)
+IPO_CHUNK_NODE_CHUNKS = 15
+CHUNK_NODE_HDR_FMT = '<IIQ'
+CHUNK_NODE_HDR_SIZE = struct.calcsize(CHUNK_NODE_HDR_FMT)
 
 EXTENT_FMT = '<QQII'
 EXTENT_SIZE = struct.calcsize(EXTENT_FMT)
@@ -20,8 +28,27 @@ EXTENT_SIZE = struct.calcsize(EXTENT_FMT)
 INODE_FMT = '<IIQ' + ('QQII' * IPO_INODE_EXTENTS) + 'Q8s'
 INODE_SIZE = struct.calcsize(INODE_FMT)
 INODES_PER_BLOCK = BLOCK_SIZE // INODE_SIZE
-DIRENTRY_HDR_FMT = '<III B 3s'
+DIRENTRY_HDR_FMT = '<IIIBBBB'
 DIRENTRY_HDR_SIZE = struct.calcsize(DIRENTRY_HDR_FMT)
+
+
+def _pack_direntry_hdr(ino, rec_len, name_len, typ):
+    return struct.pack(
+        DIRENTRY_HDR_FMT,
+        ino & 0xFFFFFFFF,
+        rec_len,
+        name_len,
+        typ,
+        (ino >> 32) & 0xFF,
+        (ino >> 40) & 0xFF,
+        (ino >> 48) & 0xFF,
+    )
+
+
+def _unpack_direntry_hdr(raw_hdr):
+    ino_lo, rec_len, name_len, typ, hi0, hi1, hi2 = struct.unpack(DIRENTRY_HDR_FMT, raw_hdr)
+    ino = ino_lo | (hi0 << 32) | (hi1 << 40) | (hi2 << 48)
+    return ino, rec_len, name_len, typ
 
 
 class DiskError(Exception):
@@ -76,16 +103,50 @@ class DiskImage:
         sb = struct.unpack(SB_FMT, buf[:SB_SIZE])
         if sb[0].rstrip(b'\x00') != b'IPO_FS':
             raise DiskError("not IPO_FS")
+        inode_count = sb[4]
+        primary_inodes = sb[9]
+        dyn_inodes_cnt = sb[13]
+        if primary_inodes == 0 and inode_count > 0:
+            primary_inodes = max(0, inode_count - dyn_inodes_cnt)
         self.sb = {
             'fs_size_blocks': sb[1],
             'block_size': sb[2],
             'flags': sb[3],
-            'inode_count': sb[4],
+            'inode_count': inode_count,
             'inode_bitmap_start': sb[5],
             'block_bitmap_start': sb[6],
             'inode_table_start': sb[7],
             'data_blocks_start': sb[8],
+            'primary_inodes': primary_inodes,
+            'reserved': sb[10],
+            'dynamic_chunk_tree': sb[11],
+            'dynamic_chunks_count': sb[12],
+            'dynamic_inodes_count': dyn_inodes_cnt,
+            'dynamic_inodes_used': sb[14],
         }
+
+    def _save_superblock(self):
+        magic = b'IPO_FS\x00\x00'
+        sb_data = struct.pack(SB_FMT,
+            magic,
+            self.sb['fs_size_blocks'],
+            self.sb['block_size'],
+            self.sb['flags'],
+            self.sb['inode_count'],
+            self.sb['inode_bitmap_start'],
+            self.sb['block_bitmap_start'],
+            self.sb['inode_table_start'],
+            self.sb['data_blocks_start'],
+            self.sb['primary_inodes'],
+            self.sb.get('reserved', 0),
+            self.sb['dynamic_chunk_tree'],
+            self.sb['dynamic_chunks_count'],
+            self.sb['dynamic_inodes_count'],
+            self.sb['dynamic_inodes_used'],
+        )
+        sb_block = bytearray(self.read_block(0))
+        sb_block[:SB_SIZE] = sb_data
+        self.write_block(0, bytes(sb_block))
 
     def format_disk(self, total_inodes=None):
         """Format disk with a new IPO_FS filesystem"""
@@ -113,12 +174,18 @@ class DiskImage:
         self.sb = {
             'fs_size_blocks': total_blocks,
             'block_size': BLOCK_SIZE,
-            'flags': 1,
+            'flags': IPO_FS_FLAG_LINKED_EXTENTS | IPO_FS_FLAG_DYNAMIC_INODES,
             'inode_count': total_inodes,
             'inode_bitmap_start': inode_bitmap_start,
             'block_bitmap_start': block_bitmap_start,
             'inode_table_start': inode_table_start,
             'data_blocks_start': data_blocks_start,
+            'primary_inodes': total_inodes,
+            'reserved': 0,
+            'dynamic_chunk_tree': 0,
+            'dynamic_chunks_count': 0,
+            'dynamic_inodes_count': 0,
+            'dynamic_inodes_used': 0,
         }
         
         # Write superblock
@@ -127,12 +194,18 @@ class DiskImage:
             magic,
             self.sb['fs_size_blocks'],
             self.sb['block_size'],
-            1,
+            self.sb['flags'],
             self.sb['inode_count'],
             self.sb['inode_bitmap_start'],
             self.sb['block_bitmap_start'],
             self.sb['inode_table_start'],
             self.sb['data_blocks_start'],
+            self.sb['primary_inodes'],
+            0,
+            0,
+            0,
+            0,
+            0,
         )
         # Pad to BLOCK_SIZE
         sb_block = sb_data + b'\x00' * (BLOCK_SIZE - len(sb_data))
@@ -191,12 +264,29 @@ class DiskImage:
         print("Disk formatted successfully")
     # ================= INODES =================
 
-    def read_inode(self, ino):
+    def _locate_inode_block_offset(self, ino):
         if ino <= 0 or ino > self.sb['inode_count']:
             raise DiskError("invalid inode")
-        idx = ino - 1
-        block = self.sb['inode_table_start'] + idx // INODES_PER_BLOCK
-        offset = (idx % INODES_PER_BLOCK) * INODE_SIZE
+        if ino <= self.sb['primary_inodes']:
+            idx = ino - 1
+            return self.sb['inode_table_start'] + idx // INODES_PER_BLOCK, (idx % INODES_PER_BLOCK) * INODE_SIZE
+        curr = self.sb.get('dynamic_chunk_tree', 0)
+        seen = set()
+        while curr != 0 and curr not in seen:
+            seen.add(curr)
+            raw = self.read_block(curr)
+            count, flags, next_node = struct.unpack_from(CHUNK_NODE_HDR_FMT, raw, 0)
+            for i in range(min(count, IPO_CHUNK_NODE_CHUNKS)):
+                off = CHUNK_NODE_HDR_SIZE + i * CHUNK_DESC_SIZE
+                start_ino, tbl_blk, bmp, cnt, free_cnt = struct.unpack_from(CHUNK_DESC_FMT, raw, off)
+                if start_ino <= ino < start_ino + cnt:
+                    idx = ino - start_ino
+                    return tbl_blk + idx // INODES_PER_BLOCK, (idx % INODES_PER_BLOCK) * INODE_SIZE
+            curr = next_node
+        raise DiskError(f"dynamic inode {ino} chunk not found")
+
+    def read_inode(self, ino):
+        block, offset = self._locate_inode_block_offset(ino)
         raw = self.read_block(block)[offset:offset + INODE_SIZE]
         mode, links_count, size = struct.unpack_from('<IIQ', raw, 0)
         extents = []
@@ -219,9 +309,7 @@ class DiskImage:
         }
 
     def write_inode(self, ino, inode):
-        idx = ino - 1
-        block = self.sb['inode_table_start'] + idx // INODES_PER_BLOCK
-        offset = (idx % INODES_PER_BLOCK) * INODE_SIZE
+        block, offset = self._locate_inode_block_offset(ino)
         buf = bytearray(self.read_block(block))
         packed = bytearray(INODE_SIZE)
         struct.pack_into('<IIQ', packed, 0, inode['mode'], inode['links_count'], inode['size'])
@@ -302,12 +390,99 @@ class DiskImage:
     # ================= ALLOCATION =================
 
     def allocate_inode(self):
-        for i in range(self.sb['inode_count']):
+        for i in range(self.sb['primary_inodes']):
             if not self.bitmap_get(self.sb['inode_bitmap_start'], i):
                 self.bitmap_set(self.sb['inode_bitmap_start'], i, 1)
                 self.write_inode(i + 1, self.empty_inode())
                 return i + 1
-        return -1
+        # Search existing dynamic chunks
+        curr = self.sb.get('dynamic_chunk_tree', 0)
+        last_node_blk = 0
+        last_raw = None
+        seen = set()
+        while curr != 0 and curr not in seen:
+            seen.add(curr)
+            raw = bytearray(self.read_block(curr))
+            count, flags, next_node = struct.unpack_from(CHUNK_NODE_HDR_FMT, raw, 0)
+            for i in range(min(count, IPO_CHUNK_NODE_CHUNKS)):
+                off = CHUNK_NODE_HDR_SIZE + i * CHUNK_DESC_SIZE
+                start_ino, tbl_blk, bmp, cnt, free_cnt = struct.unpack_from(CHUNK_DESC_FMT, raw, off)
+                if free_cnt > 0:
+                    for bit in range(cnt):
+                        if not (bmp & (1 << bit)):
+                            bmp |= (1 << bit)
+                            free_cnt -= 1
+                            struct.pack_into(CHUNK_DESC_FMT, raw, off, start_ino, tbl_blk, bmp, cnt, free_cnt)
+                            self.write_block(curr, bytes(raw))
+                            self.sb['dynamic_inodes_used'] += 1
+                            self._save_superblock()
+                            ino = start_ino + bit
+                            self.write_inode(ino, self.empty_inode())
+                            return ino
+            last_node_blk = curr
+            last_raw = raw
+            curr = next_node
+        # Allocate a new 64-inode dynamic chunk
+        chunk_ino_cnt = 64
+        tbl_blocks = (chunk_ino_cnt * INODE_SIZE + BLOCK_SIZE - 1) // BLOCK_SIZE
+        # Reserve contiguous blocks in data bitmap
+        total = self.sb['fs_size_blocks'] - self.sb['data_blocks_start']
+        run_start = -1
+        run_len = 0
+        for bit_idx in range(total):
+            if not self.bitmap_get(self.sb['block_bitmap_start'], bit_idx):
+                if run_start < 0:
+                    run_start = bit_idx
+                run_len += 1
+                if run_len == tbl_blocks:
+                    break
+            else:
+                run_start = -1
+                run_len = 0
+        if run_len < tbl_blocks:
+            return -1
+        for k in range(tbl_blocks):
+            self.bitmap_set(self.sb['block_bitmap_start'], run_start + k, 1)
+            self.write_block(self.sb['data_blocks_start'] + run_start + k, b'\x00' * BLOCK_SIZE)
+        tbl_blk = self.sb['data_blocks_start'] + run_start
+        start_ino = self.sb['inode_count'] + 1
+        new_bmp = 1
+        new_free = chunk_ino_cnt - 1
+
+        if last_node_blk != 0 and last_raw is not None:
+            count, flags, next_node = struct.unpack_from(CHUNK_NODE_HDR_FMT, last_raw, 0)
+            if count < IPO_CHUNK_NODE_CHUNKS:
+                off = CHUNK_NODE_HDR_SIZE + count * CHUNK_DESC_SIZE
+                struct.pack_into(CHUNK_DESC_FMT, last_raw, off, start_ino, tbl_blk, new_bmp, chunk_ino_cnt, new_free)
+                struct.pack_into('<I', last_raw, 0, count + 1)
+                self.write_block(last_node_blk, bytes(last_raw))
+            else:
+                new_node_blk = self.allocate_block()
+                if new_node_blk < 0:
+                    return -1
+                node_buf = bytearray(BLOCK_SIZE)
+                struct.pack_into(CHUNK_NODE_HDR_FMT, node_buf, 0, 1, 0, 0)
+                struct.pack_into(CHUNK_DESC_FMT, node_buf, CHUNK_NODE_HDR_SIZE, start_ino, tbl_blk, new_bmp, chunk_ino_cnt, new_free)
+                self.write_block(new_node_blk, bytes(node_buf))
+                struct.pack_into('<Q', last_raw, 8, new_node_blk)
+                self.write_block(last_node_blk, bytes(last_raw))
+        else:
+            new_node_blk = self.allocate_block()
+            if new_node_blk < 0:
+                return -1
+            node_buf = bytearray(BLOCK_SIZE)
+            struct.pack_into(CHUNK_NODE_HDR_FMT, node_buf, 0, 1, 0, 0)
+            struct.pack_into(CHUNK_DESC_FMT, node_buf, CHUNK_NODE_HDR_SIZE, start_ino, tbl_blk, new_bmp, chunk_ino_cnt, new_free)
+            self.write_block(new_node_blk, bytes(node_buf))
+            self.sb['dynamic_chunk_tree'] = new_node_blk
+
+        self.sb['inode_count'] += chunk_ino_cnt
+        self.sb['dynamic_chunks_count'] += 1
+        self.sb['dynamic_inodes_count'] += chunk_ino_cnt
+        self.sb['dynamic_inodes_used'] += 1
+        self.sb['flags'] |= IPO_FS_FLAG_DYNAMIC_INODES
+        self._save_superblock()
+        return start_ino
 
     def allocate_block(self):
         total = self.sb['fs_size_blocks'] - self.sb['data_blocks_start']
@@ -486,11 +661,13 @@ class DiskImage:
         copied = 0
         for b in range(first_block, last_block + 1):
             phys = self.get_block_for_inode(inode, b, alloc=False)
-            if phys <= 0:
-                break
-            block_data = self.read_block(phys)
             block_offset = offset % BLOCK_SIZE if b == first_block else 0
             tocopy = min(BLOCK_SIZE - block_offset, size - copied)
+            if phys <= 0:
+                result.extend(b'\x00' * tocopy)
+                copied += tocopy
+                continue
+            block_data = self.read_block(phys)
             result.extend(block_data[block_offset:block_offset + tocopy])
             copied += tocopy
         return bytes(result)
@@ -520,9 +697,9 @@ class DiskImage:
 
     def pack_dir_dots(self, self_ino, parent_ino):
         # . -> rec_len = 20, name_len = 1
-        d1 = struct.pack(DIRENTRY_HDR_FMT, self_ino, 20, 1, IPO_INODE_TYPE_DIR, b'\x00\x00\x00') + b'.\x00\x00\x00'
+        d1 = _pack_direntry_hdr(self_ino, 20, 1, IPO_INODE_TYPE_DIR) + b'.\x00\x00\x00'
         # .. -> rec_len = 20, name_len = 2
-        d2 = struct.pack(DIRENTRY_HDR_FMT, parent_ino, 20, 2, IPO_INODE_TYPE_DIR, b'\x00\x00\x00') + b'..\x00\x00'
+        d2 = _pack_direntry_hdr(parent_ino, 20, 2, IPO_INODE_TYPE_DIR) + b'..\x00\x00'
         return d1 + d2
 
     # ================= DIRECTORY =================
@@ -534,7 +711,7 @@ class DiskImage:
             raw_hdr = self.read_inode_bytes(inode, DIRENTRY_HDR_SIZE, offset)
             if len(raw_hdr) < DIRENTRY_HDR_SIZE:
                 break
-            ino, rec_len, name_len, typ, _ = struct.unpack(DIRENTRY_HDR_FMT, raw_hdr)
+            ino, rec_len, name_len, typ = _unpack_direntry_hdr(raw_hdr)
             if rec_len < DIRENTRY_HDR_SIZE:
                 break
             if ino != 0 and name_len > 0:
@@ -566,7 +743,7 @@ class DiskImage:
             raw_hdr = self.read_inode_bytes(din, DIRENTRY_HDR_SIZE, offset)
             if len(raw_hdr) < DIRENTRY_HDR_SIZE:
                 break
-            slot_ino, slot_rec_len, _, _, _ = struct.unpack(DIRENTRY_HDR_FMT, raw_hdr)
+            slot_ino, slot_rec_len, _, _ = _unpack_direntry_hdr(raw_hdr)
             if slot_rec_len < DIRENTRY_HDR_SIZE:
                 break
             if slot_ino == 0 and slot_rec_len >= needed_rec_len:
@@ -575,7 +752,7 @@ class DiskImage:
                 break
             offset += slot_rec_len
 
-        entry_data = struct.pack(DIRENTRY_HDR_FMT, ino, actual_rec_len, name_len, typ, b'\x00\x00\x00') + name_bytes + b'\x00'
+        entry_data = _pack_direntry_hdr(ino, actual_rec_len, name_len, typ) + name_bytes + b'\x00'
         if len(entry_data) < actual_rec_len:
             entry_data += b'\x00' * (actual_rec_len - len(entry_data))
 
@@ -764,8 +941,33 @@ class DiskImage:
 
         # free blocks
         self.free_inode_blocks(inode)
-        # clear inode bitmap
-        self.bitmap_set(self.sb['inode_bitmap_start'], ino - 1, 0)
+        # clear inode bitmap (primary vs dynamic chunk)
+        if ino <= self.sb['primary_inodes']:
+            self.bitmap_set(self.sb['inode_bitmap_start'], ino - 1, 0)
+        else:
+            curr = self.sb.get('dynamic_chunk_tree', 0)
+            seen = set()
+            cleared = False
+            while curr != 0 and curr not in seen and not cleared:
+                seen.add(curr)
+                raw = bytearray(self.read_block(curr))
+                count, flags, next_node = struct.unpack_from(CHUNK_NODE_HDR_FMT, raw, 0)
+                for i in range(min(count, IPO_CHUNK_NODE_CHUNKS)):
+                    off = CHUNK_NODE_HDR_SIZE + i * CHUNK_DESC_SIZE
+                    start_ino, tbl_blk, bmp, cnt, free_cnt = struct.unpack_from(CHUNK_DESC_FMT, raw, off)
+                    if start_ino <= ino < start_ino + cnt:
+                        bit = ino - start_ino
+                        if bmp & (1 << bit):
+                            bmp &= ~(1 << bit)
+                            free_cnt += 1
+                            struct.pack_into(CHUNK_DESC_FMT, raw, off, start_ino, tbl_blk, bmp, cnt, free_cnt)
+                            self.write_block(curr, bytes(raw))
+                            if self.sb['dynamic_inodes_used'] > 0:
+                                self.sb['dynamic_inodes_used'] -= 1
+                                self._save_superblock()
+                        cleared = True
+                        break
+                curr = next_node
         # zero the inode on disk
         self.write_inode(ino, self.empty_inode())
         return True
@@ -775,7 +977,7 @@ class DiskImage:
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument('-i', '--image', default='build/disk.img')
+    p.add_argument('-i', '--image', default='build/disks/disk.img')
     p.add_argument('-s', '--start-lba', type=int, default=2048)
     sub = p.add_subparsers(dest='cmd')
     sub.add_parser('format')

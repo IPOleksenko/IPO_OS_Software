@@ -633,7 +633,7 @@ static char *alloc_dynamic_lang_tag(void) {
 
 /* Full-screen Vim Help Reference Overlay */
 static void render_help_screen(void) {
-    static const char *help_lines[25] = {
+    static const char *help_lines[] = {
         "========================= VIM EDITOR - HELP REFERENCE =========================",
         " MODES:",
         "   NORMAL (navigation/cmds) | INSERT (text input) | COMMAND (:)",
@@ -668,9 +668,10 @@ static void render_help_screen(void) {
         back_buffer[i] = vga_entry(' ', VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
     }
 
-    for (int i = 0; i < 25; i++) {
-        int r = (i == 24) ? (vh - 1) : i;
-        if (i < 24 && r >= vh - 1) continue;
+    const int help_count = (int)(sizeof(help_lines) / sizeof(help_lines[0]));
+    for (int i = 0; i < help_count; i++) {
+        int r = (i == help_count - 1) ? (vh - 1) : i;
+        if (i < help_count - 1 && r >= vh - 1) continue;
         const char *line = help_lines[i];
         int len = (int)strlen(line);
         uint16_t *dst_row = &back_buffer[r * vw];
@@ -678,7 +679,7 @@ static void render_help_screen(void) {
         enum vga_color fg = VGA_COLOR_LIGHT_GREY;
         enum vga_color bg = VGA_COLOR_BLACK;
 
-        if (i == 0 || i == 24) {
+        if (i == 0 || i == help_count - 1) {
             fg = VGA_COLOR_BLACK;
             bg = VGA_COLOR_LIGHT_CYAN;
         } else if (strncmp(line, " MODES:", 7) == 0 ||

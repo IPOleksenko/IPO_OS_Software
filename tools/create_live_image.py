@@ -28,12 +28,11 @@ WAL_JOURNAL_LBA = 2031
 WAL_JOURNAL_SECTORS = 8
 
 STORAGE_POOL_MAGIC = 0x504F4F4C  # 'POOL'
-STORAGE_POOL_SB_VERSION = 2
 
 
 def build_superblock(total_sectors: int, member_name: str = "ata0") -> bytes:
-    """Builds a packed 512-byte storage_pool_disk_sb_t with valid CRC32."""
-    pool_uuid = b"IPO_STORAGE_POOL\x00\x00\x00\x00"[:16]
+    """Builds a packed 512-byte storage pool superblock matching IPO_OS layout with CRC32."""
+    pool_uuid = b"IPO_STORAGE_POOL"[:16]
     local_uuid = b"MEMBER-00\x00\x00\x00\x00\x00\x00\x00"[:16]
     member_idx = 0
     member_count = 1
@@ -61,11 +60,10 @@ def build_superblock(total_sectors: int, member_name: str = "ata0") -> bytes:
     recovery_count = 0
     reserved = b"\x00" * 52
 
-    # Pack first 508 bytes
+    # Pack 64-byte raw superblock header + 384-byte inline members + 4-byte align + recovery_count + reserved[52]
     pre_crc = struct.pack(
-        "<II16s16sIIQIII",
+        "<I16s16sIIQIII",
         STORAGE_POOL_MAGIC,
-        STORAGE_POOL_SB_VERSION,
         pool_uuid,
         local_uuid,
         member_idx,
@@ -74,7 +72,7 @@ def build_superblock(total_sectors: int, member_name: str = "ata0") -> bytes:
         chunk_size,
         generation,
         state,
-    ) + members_block + struct.pack("<I52s", recovery_count, reserved)
+    ) + members_block + b"\x00\x00\x00\x00" + struct.pack("<I52s", recovery_count, reserved)
 
     assert len(pre_crc) == 508, f"Expected 508 bytes, got {len(pre_crc)}"
     crc = binascii.crc32(pre_crc) & 0xFFFFFFFF
@@ -117,20 +115,28 @@ def main():
     parser = argparse.ArgumentParser(description="Create unified Live USB bootable image for IPO_OS")
     repo_root = Path(__file__).resolve().parent.parent
 
+    parser.add_argument("--os-image", type=Path, default=None, help="Unified IPO_OS.bin binary")
     parser.add_argument("--boot", type=Path, default=repo_root / "build" / "boot" / "boot.bin")
     parser.add_argument("--kernel", type=Path, default=repo_root / "build" / "kernel" / "kernel.bin")
-    parser.add_argument("--disk", type=Path, default=repo_root / "build" / "disk.img")
+    parser.add_argument("--disk", type=Path, default=repo_root / "build" / "disks" / "disk.img")
     parser.add_argument("--output", type=Path, default=repo_root / "build" / "IPO_OS.img")
     parser.add_argument("--size-mb", type=int, default=512)
 
     args = parser.parse_args()
 
-    if not args.boot.exists() or not args.kernel.exists():
-        print(f"Error: boot.bin or kernel.bin not found. Run make first.")
-        return 1
-
-    boot_bytes = args.boot.read_bytes()
-    kernel_bytes = args.kernel.read_bytes()
+    if args.os_image is not None:
+        if not args.os_image.exists():
+            print(f"Error: {args.os_image} not found.")
+            return 1
+        os_bytes = args.os_image.read_bytes()
+        boot_bytes = os_bytes[:SECTOR_SIZE]
+        kernel_bytes = os_bytes[SECTOR_SIZE:]
+    else:
+        if not args.boot.exists() or not args.kernel.exists():
+            print(f"Error: boot.bin or kernel.bin not found. Specify --os-image IPO_OS.bin or run make first.")
+            return 1
+        boot_bytes = args.boot.read_bytes()
+        kernel_bytes = args.kernel.read_bytes()
 
     # Determine size from disk.img if present
     if args.disk.exists():

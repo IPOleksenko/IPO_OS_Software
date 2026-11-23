@@ -27,6 +27,8 @@ extern char **environ;
 int close(int fd);
 ssize_t read(int fd, void *buf, size_t count);
 ssize_t write(int fd, const void *buf, size_t count);
+ssize_t pread(int fd, void *buf, size_t count, off_t offset);
+ssize_t pwrite(int fd, const void *buf, size_t count, off_t offset);
 off_t lseek(int fd, off_t offset, int whence);
 int unlink(const char *pathname);
 int rmdir(const char *pathname);
@@ -57,6 +59,27 @@ int ftruncate(int fd, off_t length);
 int truncate(const char *path, off_t length);
 ssize_t readlink(const char *pathname, char *buf, size_t bufsiz);
 int symlink(const char *target, const char *linkpath);
+
+#ifndef _SC_CLK_TCK
+#define _SC_CLK_TCK          2
+#endif
+#ifndef _SC_OPEN_MAX
+#define _SC_OPEN_MAX         4
+#endif
+#ifndef _SC_PAGESIZE
+#define _SC_PAGESIZE         30
+#endif
+#ifndef _SC_PAGE_SIZE
+#define _SC_PAGE_SIZE        30
+#endif
+#ifndef _SC_NPROCESSORS_CONF
+#define _SC_NPROCESSORS_CONF 83
+#endif
+#ifndef _SC_NPROCESSORS_ONLN
+#define _SC_NPROCESSORS_ONLN 84
+#endif
+
+long sysconf(int name);
 
 #ifdef __cplusplus
 }

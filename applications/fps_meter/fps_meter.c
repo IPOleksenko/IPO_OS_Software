@@ -23,26 +23,23 @@ static void fps_draw_fmt(uint8_t *fb, uint16_t cur_w, uint16_t cur_h, int x, int
     va_list ap, aq;
     va_start(ap, fmt);
     va_copy(aq, ap);
-    int len = vsnprintf(NULL, 0, fmt, aq);
+    int n = vsnprintf(NULL, 0, fmt, aq);
     va_end(aq);
-    if (len < 0) {
+    if (n <= 0) {
         va_end(ap);
         return;
     }
-    char *buf = (char *)malloc((size_t)len + 1u);
-    if (!buf) {
-        va_end(ap);
-        return;
+    char *buf = (char *)malloc((size_t)n + 1u);
+    if (buf) {
+        vsnprintf(buf, (size_t)n + 1u, fmt, ap);
+        wm_buf_draw_string(fb, cur_w, cur_h, x, y, buf, col);
+        free(buf);
     }
-    vsnprintf(buf, (size_t)len + 1u, fmt, ap);
     va_end(ap);
-    wm_buf_draw_string(fb, cur_w, cur_h, x, y, buf, col);
-    free(buf);
 }
 
 #define WIN_W 220
 #define WIN_H 120
-#define HIST_LEN 96
 
 #define CLR_BLACK         0
 #define CLR_BLUE          1
@@ -69,9 +66,11 @@ static void on_window_event(wm_window_t *w, uint32_t event, uint32_t data) {
     if (event == WM_EVENT_CLOSE) {
         running = false;
     } else if (event == WM_EVENT_KEY_DOWN) {
-        uint8_t sc = (uint8_t)(data & 0x7F);
-        if (sc == 19) { /* 'R' key */
+        uint8_t sc = (uint8_t)(data & 0xFFu);
+        if (sc == 19u) { /* 'R' key */
             reset_requested = true;
+        } else if (sc == 0x01u || sc == 0x10u) { /* Esc or Q */
+            running = false;
         }
     } else if (event == WM_EVENT_CLICK) {
         /* Click anywhere to reset stats */
@@ -98,7 +97,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    int hist_cap = HIST_LEN;
+    int hist_cap = (win->w > 40) ? ((win->w - 20) / 2) : 16;
     uint16_t *history = (uint16_t *)calloc((size_t)hist_cap, sizeof(uint16_t));
     if (!history) {
         wm_destroy_window(win);
@@ -278,6 +277,7 @@ int main(int argc, char **argv) {
             }
 
             wm_invalidate(win);
+            wm_compositor_tick();
         }
 
         /* Uncapped frame processing: cooperative single yield per frame */

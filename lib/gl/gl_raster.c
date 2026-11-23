@@ -251,10 +251,11 @@ static void get_blend_factors(GLenum factor, float rs, float gs, float bs, float
 static void write_fragment(GLContext *ctx, int x, int y, uint16_t z_val, float r, float g, float b, float a, float eye_z) {
     if (x < 0 || x >= ctx->width || y < 0 || y >= ctx->height) return;
 
-    /* Scissor test */
+    /* Scissor test (convert GL bottom-up scissor_y to top-down framebuffer coords) */
     if (ctx->scissor_enabled) {
+        int top_sc_y = ctx->height - (ctx->scissor_y + ctx->scissor_h);
         if (x < ctx->scissor_x || x >= (ctx->scissor_x + ctx->scissor_w) ||
-            y < ctx->scissor_y || y >= (ctx->scissor_y + ctx->scissor_h)) {
+            y < top_sc_y || y >= (top_sc_y + ctx->scissor_h)) {
             return;
         }
     }
@@ -338,9 +339,9 @@ static void write_fragment(GLContext *ctx, int x, int y, uint16_t z_val, float r
         get_blend_factors(ctx->blend_dfactor, r, g, b, a, rd, gd, bd, ad, &fdr, &fdg, &fdb, &fda);
 
         if (ctx->blend_equation == GL_FUNC_SUBTRACT) {
-            r = r * fsr - rd * fdr; g = g * fsg - gd * fdr; b = b * fsb - bd * fdb; a = a * fsa - ad * fda;
+            r = r * fsr - rd * fdr; g = g * fsg - gd * fdg; b = b * fsb - bd * fdb; a = a * fsa - ad * fda;
         } else if (ctx->blend_equation == GL_FUNC_REVERSE_SUBTRACT) {
-            r = rd * fdr - r * fsr; g = gd * fdr - g * fsg; b = bd * fdb - b * fsb; a = ad * fda - a * fsa;
+            r = rd * fdr - r * fsr; g = gd * fdg - g * fsg; b = bd * fdb - b * fsb; a = ad * fda - a * fsa;
         } else if (ctx->blend_equation == GL_MIN) {
             if (rd < r) r = rd;
             if (gd < g) g = gd;
@@ -353,7 +354,7 @@ static void write_fragment(GLContext *ctx, int x, int y, uint16_t z_val, float r
             if (ad > a) a = ad;
         } else {
             /* GL_FUNC_ADD */
-            r = r * fsr + rd * fdr; g = g * fsg + gd * fdr; b = b * fsb + bd * fdb; a = a * fsa + ad * fda;
+            r = r * fsr + rd * fdr; g = g * fsg + gd * fdg; b = b * fsb + bd * fdb; a = a * fsa + ad * fda;
         }
     }
 
@@ -514,55 +515,104 @@ void gl_rasterize_triangle(GLContext *ctx, gl_vertex_t *v0, gl_vertex_t *v1, gl_
         }
     }
 
+    float dw0_dx = (y1 - y2) * inv_area;
+    float dw1_dx = (y2 - y0) * inv_area;
+    float dw0_dy = (x2 - x1) * inv_area;
+    float dw1_dy = (x0 - x2) * inv_area;
+
+    float fx_start = (float)min_x + 0.5f;
+    float fy_start = (float)min_y + 0.5f;
+    float w0_base = ((x1 - fx_start) * (y2 - fy_start) - (y1 - fy_start) * (x2 - fx_start)) * inv_area;
+    float w1_base = ((x2 - fx_start) * (y0 - fy_start) - (y2 - fy_start) * (x0 - fx_start)) * inv_area;
+
+    float z0 = v0->win[2], z1 = v1->win[2], z2 = v2->win[2];
+    float dz_dx = dw0_dx * (z0 - z2) + dw1_dx * (z1 - z2);
+    float dz_dy = dw0_dy * (z0 - z2) + dw1_dy * (z1 - z2);
+    float z_base = z2 + w0_base * (z0 - z2) + w1_base * (z1 - z2);
+
+    float dr_dx = dw0_dx * (v0->color[0] - v2->color[0]) + dw1_dx * (v1->color[0] - v2->color[0]);
+    float dr_dy = dw0_dy * (v0->color[0] - v2->color[0]) + dw1_dy * (v1->color[0] - v2->color[0]);
+    float r_base = v2->color[0] + w0_base * (v0->color[0] - v2->color[0]) + w1_base * (v1->color[0] - v2->color[0]);
+
+    float dg_dx = dw0_dx * (v0->color[1] - v2->color[1]) + dw1_dx * (v1->color[1] - v2->color[1]);
+    float dg_dy = dw0_dy * (v0->color[1] - v2->color[1]) + dw1_dy * (v1->color[1] - v2->color[1]);
+    float g_base = v2->color[1] + w0_base * (v0->color[1] - v2->color[1]) + w1_base * (v1->color[1] - v2->color[1]);
+
+    float db_dx = dw0_dx * (v0->color[2] - v2->color[2]) + dw1_dx * (v1->color[2] - v2->color[2]);
+    float db_dy = dw0_dy * (v0->color[2] - v2->color[2]) + dw1_dy * (v1->color[2] - v2->color[2]);
+    float b_base = v2->color[2] + w0_base * (v0->color[2] - v2->color[2]) + w1_base * (v1->color[2] - v2->color[2]);
+
+    float da_dx = dw0_dx * (v0->color[3] - v2->color[3]) + dw1_dx * (v1->color[3] - v2->color[3]);
+    float da_dy = dw0_dy * (v0->color[3] - v2->color[3]) + dw1_dy * (v1->color[3] - v2->color[3]);
+    float a_base = v2->color[3] + w0_base * (v0->color[3] - v2->color[3]) + w1_base * (v1->color[3] - v2->color[3]);
+
+    float dez_dx = dw0_dx * (v0->eye[2] - v2->eye[2]) + dw1_dx * (v1->eye[2] - v2->eye[2]);
+    float dez_dy = dw0_dy * (v0->eye[2] - v2->eye[2]) + dw1_dy * (v1->eye[2] - v2->eye[2]);
+    float ez_base = v2->eye[2] + w0_base * (v0->eye[2] - v2->eye[2]) + w1_base * (v1->eye[2] - v2->eye[2]);
+
+    float iw0 = v0->inv_w, iw1 = v1->inv_w, iw2 = v2->inv_w;
+    float diw_dx = dw0_dx * (iw0 - iw2) + dw1_dx * (iw1 - iw2);
+    float diw_dy = dw0_dy * (iw0 - iw2) + dw1_dy * (iw1 - iw2);
+    float iw_base = iw2 + w0_base * (iw0 - iw2) + w1_base * (iw1 - iw2);
+
+    float sw0 = v0->tex[0] * iw0, sw1 = v1->tex[0] * iw1, sw2 = v2->tex[0] * iw2;
+    float dsw_dx = dw0_dx * (sw0 - sw2) + dw1_dx * (sw1 - sw2);
+    float dsw_dy = dw0_dy * (sw0 - sw2) + dw1_dy * (sw1 - sw2);
+    float sw_base = sw2 + w0_base * (sw0 - sw2) + w1_base * (sw1 - sw2);
+
+    float tw0 = v0->tex[1] * iw0, tw1 = v1->tex[1] * iw1, tw2 = v2->tex[1] * iw2;
+    float dtw_dx = dw0_dx * (tw0 - tw2) + dw1_dx * (tw1 - tw2);
+    float dtw_dy = dw0_dy * (tw0 - tw2) + dw1_dy * (tw1 - tw2);
+    float tw_base = tw2 + w0_base * (tw0 - tw2) + w1_base * (tw1 - tw2);
+
     for (int py = min_y; py <= max_y; py++) {
-        float fy = (float)py + 0.5f;
+        int y_off = py - min_y;
+        float fy_off = (float)y_off;
+        float w0 = w0_base + fy_off * dw0_dy;
+        float w1 = w1_base + fy_off * dw1_dy;
+        float zc = z_base + fy_off * dz_dy;
+        float rc = r_base + fy_off * dr_dy;
+        float gc = g_base + fy_off * dg_dy;
+        float bc = b_base + fy_off * db_dy;
+        float ac = a_base + fy_off * da_dy;
+        float ezc = ez_base + fy_off * dez_dy;
+        float iwc = iw_base + fy_off * diw_dy;
+        float swc = sw_base + fy_off * dsw_dy;
+        float twc = tw_base + fy_off * dtw_dy;
+        bool had_inside = false;
+
         for (int px = min_x; px <= max_x; px++) {
-            float fx = (float)px + 0.5f;
-
-            /* Barycentric weights */
-            float w0 = ((x1 - fx) * (y2 - fy) - (y1 - fy) * (x2 - fx)) * inv_area;
-            float w1 = ((x2 - fx) * (y0 - fy) - (y2 - fy) * (x0 - fx)) * inv_area;
             float w2 = 1.0f - w0 - w1;
-
-            if (w0 < -0.001f || w1 < -0.001f || w2 < -0.001f) continue;
-
-            /* Interpolate 1/w and depth */
-            float inv_w = w0 * v0->inv_w + w1 * v1->inv_w + w2 * v2->inv_w;
-            if (inv_w == 0.0f) continue;
-            float w_frag = 1.0f / inv_w;
-
-            float z_norm = (w0 * v0->win[2] + w1 * v1->win[2] + w2 * v2->win[2]);
-            if (z_norm < 0.0f) z_norm = 0.0f; else if (z_norm > 1.0f) z_norm = 1.0f;
-            uint16_t z_val = (uint16_t)(z_norm * 65535.0f);
-
-            /* Interpolate color (Gouraud shading) */
-            float r = (w0 * v0->color[0] + w1 * v1->color[0] + w2 * v2->color[0]);
-            float g = (w0 * v0->color[1] + w1 * v1->color[1] + w2 * v2->color[1]);
-            float b = (w0 * v0->color[2] + w1 * v1->color[2] + w2 * v2->color[2]);
-            float a = (w0 * v0->color[3] + w1 * v1->color[3] + w2 * v2->color[3]);
-
-            /* Interpolate texture coordinates with perspective correction */
-            if (tex) {
-                float s = (w0 * (v0->tex[0] * v0->inv_w) + w1 * (v1->tex[0] * v1->inv_w) + w2 * (v2->tex[0] * v2->inv_w)) * w_frag;
-                float t = (w0 * (v0->tex[1] * v0->inv_w) + w1 * (v1->tex[1] * v1->inv_w) + w2 * (v2->tex[1] * v2->inv_w)) * w_frag;
-                uint32_t tcol = sample_tex2d(tex, s, t);
-
-                float tr = ((tcol >> 16) & 0xFF) / 255.0f;
-                float tg = ((tcol >> 8)  & 0xFF) / 255.0f;
-                float tb = (tcol         & 0xFF) / 255.0f;
-                float ta = ((tcol >> 24) & 0xFF) / 255.0f;
-
-                if (ctx->tex_env_mode == GL_MODULATE) {
-                    r *= tr; g *= tg; b *= tb; a *= ta;
-                } else if (ctx->tex_env_mode == GL_DECAL) {
-                    r = tr; g = tg; b = tb;
-                } else if (ctx->tex_env_mode == GL_REPLACE) {
-                    r = tr; g = tg; b = tb; a = ta;
+            if (w0 >= -0.001f && w1 >= -0.001f && w2 >= -0.001f) {
+                had_inside = true;
+                if (iwc != 0.0f) {
+                    float zn = zc;
+                    if (zn < 0.0f) zn = 0.0f; else if (zn > 1.0f) zn = 1.0f;
+                    uint16_t z_val = (uint16_t)(zn * 65535.0f);
+                    float r = rc, g = gc, b = bc, a = ac;
+                    if (tex) {
+                        float w_frag = 1.0f / iwc;
+                        uint32_t tcol = sample_tex2d(tex, swc * w_frag, twc * w_frag);
+                        float tr = ((tcol >> 16) & 0xFF) * (1.0f / 255.0f);
+                        float tg = ((tcol >> 8)  & 0xFF) * (1.0f / 255.0f);
+                        float tb = (tcol         & 0xFF) * (1.0f / 255.0f);
+                        float ta = ((tcol >> 24) & 0xFF) * (1.0f / 255.0f);
+                        if (ctx->tex_env_mode == GL_MODULATE) {
+                            r *= tr; g *= tg; b *= tb; a *= ta;
+                        } else if (ctx->tex_env_mode == GL_DECAL) {
+                            r = tr; g = tg; b = tb;
+                        } else if (ctx->tex_env_mode == GL_REPLACE) {
+                            r = tr; g = tg; b = tb; a = ta;
+                        }
+                    }
+                    write_fragment(ctx, px, py, z_val, r, g, b, a, ezc);
                 }
+            } else if (had_inside) {
+                break;
             }
-
-            float eye_z = (w0 * v0->eye[2] + w1 * v1->eye[2] + w2 * v2->eye[2]);
-            write_fragment(ctx, px, py, z_val, r, g, b, a, eye_z);
+            w0 += dw0_dx; w1 += dw1_dx;
+            zc += dz_dx; rc += dr_dx; gc += dg_dx; bc += db_dx; ac += da_dx;
+            ezc += dez_dx; iwc += diw_dx; swc += dsw_dx; twc += dtw_dx;
         }
     }
 }

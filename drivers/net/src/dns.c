@@ -1,4 +1,5 @@
 #include <net/dns.h>
+#include <net/net_lock.h>
 #include <net/udp.h>
 #include <net/dyn_buf.h>
 #include <net/net_state.h>
@@ -230,8 +231,7 @@ bool dns_resolve_ex(const char *hostname, ip4_addr_t *out_ip, uint32_t timeout_m
             retries_sent++;
         }
 
-        ipo_syscall(IPO_SYSCALL_PROCESS_YIELD, 0, NULL);
-        io_wait();
+        net_lock_yield_sleep();
     }
 
     dyn_buf_free(&qbuf);

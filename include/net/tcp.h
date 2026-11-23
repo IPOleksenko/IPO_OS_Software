@@ -106,6 +106,14 @@ typedef struct tcp_tcb {
     /* Associated high-level socket descriptor reference */
     struct socket  *sock;
 
+    struct {
+        bool     valid;
+        uint32_t seq;
+        uint16_t len;
+        uint8_t *data;
+    } *ooo;
+    size_t ooo_cap;
+
     struct tcp_tcb *next;         /* Global linked list of active TCBs */
 } tcp_tcb_t;
 

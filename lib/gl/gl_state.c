@@ -12,7 +12,9 @@ GLenum glGetError(void) {
 const GLubyte *glGetString(GLenum name) {
     switch (name) {
         case GL_VENDOR:     return (const GLubyte *)"IPO_OS Project";
-        case GL_RENDERER:   return (const GLubyte *)"IPO-GL 1.2 Software Rasterizer";
+        case GL_RENDERER:   return (const GLubyte *)(gl_gpu_is_active()
+                                ? "IPO-GL VirGL 3D Hardware GPU"
+                                : "IPO-GL 1.2 Software Rasterizer");
         case GL_VERSION:    return (const GLubyte *)"1.2";
         case GL_EXTENSIONS: return (const GLubyte *)"GL_EXT_bgra GL_EXT_packed_pixels";
         default:            return (const GLubyte *)"";
@@ -83,7 +85,9 @@ void glFlush(void) {
         return;
     }
 
-    /* The software rasterizer executes every command synchronously. */
+    if (ctx->gpu_ctx_id && ctx->gpu_frame_active && ctx->gpu_batch.cmd_count > 0u) {
+        gl_gpu_flush(ctx);
+    }
     __sync_synchronize();
 }
 
@@ -95,6 +99,8 @@ void glFinish(void) {
         return;
     }
 
-    /* Rendering is immediate; the full barrier makes framebuffer writes visible. */
+    if (ctx->gpu_ctx_id && ctx->gpu_frame_active) {
+        gl_gpu_sync_readback(ctx);
+    }
     __sync_synchronize();
 }

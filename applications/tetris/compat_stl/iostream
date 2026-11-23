@@ -1,0 +1,51 @@
+#pragma once
+#include <cstdio>
+#include <string>
+
+namespace std {
+
+struct _Endl {};
+inline constexpr _Endl endl{};
+
+class ostream {
+    bool m_err = false;
+public:
+    explicit constexpr ostream(bool err = false) : m_err(err) {}
+    ostream& operator<<(const char* s) {
+        ::fputs(s ? s : "(null)", m_err ? stderr : stdout);
+        return *this;
+    }
+    ostream& operator<<(const string& s) {
+        ::fputs(s.c_str(), m_err ? stderr : stdout);
+        return *this;
+    }
+    ostream& operator<<(char c) {
+        ::fputc(c, m_err ? stderr : stdout);
+        return *this;
+    }
+    ostream& operator<<(int v) {
+        ::fprintf(m_err ? stderr : stdout, "%d", v);
+        return *this;
+    }
+    ostream& operator<<(unsigned int v) {
+        ::fprintf(m_err ? stderr : stdout, "%u", v);
+        return *this;
+    }
+    ostream& operator<<(long v) {
+        ::fprintf(m_err ? stderr : stdout, "%ld", v);
+        return *this;
+    }
+    ostream& operator<<(double v) {
+        ::fprintf(m_err ? stderr : stdout, "%g", v);
+        return *this;
+    }
+    ostream& operator<<(_Endl) {
+        ::fputc('\n', m_err ? stderr : stdout);
+        return *this;
+    }
+};
+
+inline ostream cout{false};
+inline ostream cerr{true};
+
+} // namespace std

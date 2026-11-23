@@ -2,3 +2,40 @@
 	path = third_party/SENSE-The-Game
 	url = https://github.com/IPOleksenko/SENSE-The-Game
 
+[submodule "third_party/git"]
+	path = third_party/git
+	url = https://github.com/git/git
+	
+[submodule "third_party/pacman.c"]
+	path = third_party/pacman.c
+	url = https://github.com/floooh/pacman.c
+[submodule "third_party/donkey_kong_arcade"]
+	path = third_party/donkey_kong_arcade
+	url = https://github.com/ianmurfinxyz/donkey_kong_arcade
+[submodule "third_party/open-pokered"]
+	path = third_party/open-pokered
+	url = https://github.com/liuyanghejerry/open-pokered
+[submodule "third_party/Tetris-game"]
+	path = third_party/Tetris-game
+	url = https://github.com/NicolasSerranoGarcia/Tetris-game.git
+[submodule "third_party/gi_zeppieri_donkey_kong"]
+	path = third_party/gi_zeppieri_donkey_kong
+	url = https://github.com/gi-zeppieri/donkey_kong
+[submodule "third_party/uMario_Jakowski"]
+	path = third_party/uMario_Jakowski
+	url = https://github.com/jakowskidev/uMario_Jakowski
+[submodule "third_party/Cpp-Zelda-2019"]
+	path = third_party/Cpp-Zelda-2019
+	url = https://github.com/grommithub/Cpp-Zelda-2019
+[submodule "third_party/Spacewar"]
+	path = third_party/Spacewar
+	url = https://github.com/philspil66/Spacewar
+[submodule "third_party/invaders"]
+	path = third_party/invaders
+	url = https://github.com/valleyco/invaders
+[submodule "third_party/Chocolate-Wolfenstein-3D"]
+	path = third_party/Chocolate-Wolfenstein-3D
+	url = https://github.com/fabiensanglard/Chocolate-Wolfenstein-3D.git
+[submodule "third_party/Quake"]
+	path = third_party/Quake
+	url = https://github.com/id-Software/Quake.git

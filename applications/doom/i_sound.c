@@ -18,8 +18,18 @@
 #include "z_zone.h"
 
 #include <driver/audio_core.h>
+#include <ipo/audio.h>
 
-#define NUM_CHANNELS 4
+static bool doom_stream_active(audio_stream_t *st) {
+    if (!st) return false;
+    ipo_audio_clock_t clk;
+    memset(&clk, 0, sizeof(clk));
+    clk.struct_size = (uint32_t)sizeof(clk);
+    if (ipo_audio_get_stream_clock(st, &clk) != IPO_AUDIO_OK) {
+        return false;
+    }
+    return clk.paused == 0u;
+}
 
 typedef struct {
     int16_t  *samples;
@@ -33,11 +43,12 @@ typedef struct {
     int vol;
 } doom_channel_t;
 
-static cached_sfx_t   s_cached_sfx[NUMSFX];
-static int16_t       *s_sfx_pool = NULL;
-static doom_channel_t s_channels[NUM_CHANNELS];
-static int            s_next_handle = 1;
-static boolean        s_sound_inited = false;
+static cached_sfx_t    s_cached_sfx[NUMSFX];
+static int16_t        *s_sfx_pool = NULL;
+static doom_channel_t *s_channels = NULL;
+static int             s_channels_cap = 0;
+static int             s_next_handle = 1;
+static boolean         s_sound_inited = false;
 
 typedef struct {
     int      lumpnum;
@@ -188,7 +199,10 @@ void I_InitSound(void) {
         free(s_sfx_pool);
         s_sfx_pool = NULL;
     }
-    for (i = 0; i < NUM_CHANNELS; i++) {
+    for (i = 0; i < s_channels_cap; i++) {
+        if (s_channels[i].stream) {
+            audio_stream_destroy(s_channels[i].stream);
+        }
         s_channels[i].stream = NULL;
         s_channels[i].handle = 0;
         s_channels[i].sfx_id = 0;
@@ -205,8 +219,8 @@ void I_UpdateSound(void) {
     if (!s_sound_inited) return;
 
     /* Clean up idle streams so audio_core's stream list never accumulates dead streams */
-    for (i = 0; i < NUM_CHANNELS; i++) {
-        if (s_channels[i].stream && !s_channels[i].stream->is_playing) {
+    for (i = 0; i < s_channels_cap; i++) {
+        if (s_channels[i].stream && !doom_stream_active(s_channels[i].stream)) {
             audio_stream_destroy(s_channels[i].stream);
             s_channels[i].stream = NULL;
             s_channels[i].handle = 0;
@@ -224,20 +238,23 @@ static float doom_vol_to_frac(int vol) {
 }
 
 void I_SubmitSound(void) {
-    /* Kernel IRQ0 drives audio_poll() at 1000 Hz; avoid extra per-frame syscall overhead. */
+    audio_tick();
 }
 
 void I_ShutdownSound(void) {
     int i;
     if (!s_sound_inited) return;
 
-    for (i = 0; i < NUM_CHANNELS; i++) {
+    for (i = 0; i < s_channels_cap; i++) {
         if (s_channels[i].stream) {
             audio_stream_destroy(s_channels[i].stream);
             s_channels[i].stream = NULL;
             s_channels[i].handle = 0;
         }
     }
+    free(s_channels);
+    s_channels = NULL;
+    s_channels_cap = 0;
 
     if (s_sfx_pool) {
         free(s_sfx_pool);
@@ -246,7 +263,6 @@ void I_ShutdownSound(void) {
     memset(s_cached_sfx, 0, sizeof(s_cached_sfx));
 
     audio_stop_all();
-    sb16_stop();
     s_sound_inited = false;
 }
 
@@ -254,11 +270,16 @@ void I_SetChannels(void) {
 }
 
 int I_GetSfxLumpNum(sfxinfo_t *sfx) {
-    char namebuf[16];
+    size_t nlen = (sfx && sfx->name) ? strlen(sfx->name) : 0u;
+    char *namebuf = (char *)malloc(nlen + 3u);
     int lump;
 
-    sprintf(namebuf, "ds%s", sfx->name);
+    if (!namebuf) return -1;
+    memcpy(namebuf, "ds", 2u);
+    if (nlen > 0u) memcpy(namebuf + 2u, sfx->name, nlen);
+    namebuf[2u + nlen] = '\0';
     lump = W_CheckNumForName(namebuf);
+    free(namebuf);
     if (lump < 0) {
         lump = W_CheckNumForName("dspistol");
     }
@@ -284,16 +305,31 @@ int I_StartSound(int id, int vol, int sep, int pitch, int priority) {
         return -1;
     }
 
-    /* Find an idle channel or reuse the oldest */
+    /* Find an idle channel, or grow the dynamic channel table */
     free_chan = -1;
-    for (i = 0; i < NUM_CHANNELS; i++) {
-        if (!s_channels[i].stream || !s_channels[i].stream->is_playing) {
+    for (i = 0; i < s_channels_cap; i++) {
+        if (!s_channels[i].stream || !doom_stream_active(s_channels[i].stream)) {
             free_chan = i;
             break;
         }
     }
     if (free_chan < 0) {
-        free_chan = 0;
+        int new_cap = s_channels_cap > 0 ? s_channels_cap * 2 : 4;
+        if (new_cap > s_channels_cap && (size_t)new_cap <= SIZE_MAX / sizeof(doom_channel_t)) {
+            doom_channel_t *grown = (doom_channel_t *)realloc(
+                s_channels, (size_t)new_cap * sizeof(doom_channel_t));
+            if (grown) {
+                memset(grown + s_channels_cap, 0,
+                       (size_t)(new_cap - s_channels_cap) * sizeof(doom_channel_t));
+                free_chan = s_channels_cap;
+                s_channels = grown;
+                s_channels_cap = new_cap;
+            }
+        }
+        if (free_chan < 0) {
+            if (!s_channels || s_channels_cap <= 0) return -1;
+            free_chan = 0;
+        }
     }
 
     if (s_channels[free_chan].stream) {
@@ -327,7 +363,7 @@ int I_StartSound(int id, int vol, int sep, int pitch, int priority) {
 
 void I_StopSound(int handle) {
     int i;
-    for (i = 0; i < NUM_CHANNELS; i++) {
+    for (i = 0; i < s_channels_cap; i++) {
         if (s_channels[i].handle == handle && s_channels[i].stream) {
             audio_stream_stop(s_channels[i].stream);
             audio_stream_destroy(s_channels[i].stream);
@@ -340,9 +376,9 @@ void I_StopSound(int handle) {
 
 int I_SoundIsPlaying(int handle) {
     int i;
-    for (i = 0; i < NUM_CHANNELS; i++) {
+    for (i = 0; i < s_channels_cap; i++) {
         if (s_channels[i].handle == handle && s_channels[i].stream) {
-            return s_channels[i].stream->is_playing ? 1 : 0;
+            return doom_stream_active(s_channels[i].stream) ? 1 : 0;
         }
     }
     return 0;
@@ -352,7 +388,7 @@ void I_UpdateSoundParams(int handle, int vol, int sep, int pitch) {
     int i;
     (void)sep;
     (void)pitch;
-    for (i = 0; i < NUM_CHANNELS; i++) {
+    for (i = 0; i < s_channels_cap; i++) {
         if (s_channels[i].handle == handle && s_channels[i].stream) {
             if (s_channels[i].vol != vol) {
                 s_channels[i].vol = vol;

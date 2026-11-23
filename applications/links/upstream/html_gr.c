@@ -12,6 +12,39 @@
 
 static int g_nobreak;
 
+#ifdef IPO_OS
+typedef struct {
+	ipo_css_box_layer_t box;
+	int16_t margin_bot;
+	int16_t pad_bot;
+	uint8_t border_bot;
+	uint32_t border_col;
+} ipo_css_box_stack_entry_t;
+
+static ipo_css_box_stack_entry_t *s_css_box_stack = NULL;
+static int s_css_box_stack_cap = 0;
+
+static int ensure_css_box_slot(int depth)
+{
+	if (depth < 0) return -1;
+	if (depth < s_css_box_stack_cap) return 0;
+	int new_cap = s_css_box_stack_cap ? (s_css_box_stack_cap * 2) : 8;
+	while (new_cap <= depth) {
+		if (new_cap > INT_MAX / 2) return -1;
+		new_cap *= 2;
+	}
+	if ((size_t)new_cap > SIZE_MAX / sizeof(ipo_css_box_stack_entry_t)) return -1;
+	ipo_css_box_stack_entry_t *ns = (ipo_css_box_stack_entry_t *)realloc(
+		s_css_box_stack, (size_t)new_cap * sizeof(ipo_css_box_stack_entry_t));
+	if (!ns) return -1;
+	memset(ns + s_css_box_stack_cap, 0,
+	       (size_t)(new_cap - s_css_box_stack_cap) * sizeof(ipo_css_box_stack_entry_t));
+	s_css_box_stack = ns;
+	s_css_box_stack_cap = new_cap;
+	return 0;
+}
+#endif
+
 static int get_real_font_size(int size)
 {
 	int fs=d_opt->font_size;
@@ -211,13 +244,22 @@ void flush_pending_line_to_obj(struct g_part *p, int minheight)
 	a->lines[a->n_lines++] = l;
 #ifdef IPO_OS
 	if (par_format.css_box_depth > 0 && !l->css_box) {
-		ipo_css_line_box_t *cb = (ipo_css_line_box_t *)calloc(1, sizeof(ipo_css_line_box_t));
-		if (cb) {
-			int d = par_format.css_box_depth;
-			if (d > IPO_CSS_MAX_BOX_LAYERS) d = IPO_CSS_MAX_BOX_LAYERS;
-			cb->n_layers = (uint8_t)d;
-			memcpy(cb->layers, par_format.css_boxes, (size_t)d * sizeof(ipo_css_box_layer_t));
-			l->css_box = cb;
+		int d = par_format.css_box_depth;
+		if (d > s_css_box_stack_cap) d = s_css_box_stack_cap;
+		if (d > 0 && s_css_box_stack) {
+			ipo_css_line_box_t *cb = (ipo_css_line_box_t *)calloc(1, sizeof(ipo_css_line_box_t));
+			if (cb) {
+				cb->layers = (ipo_css_box_layer_t *)malloc((size_t)d * sizeof(ipo_css_box_layer_t));
+				if (cb->layers) {
+					cb->n_layers = (uint32_t)d;
+					for (int bi = 0; bi < d; bi++) {
+						cb->layers[bi] = s_css_box_stack[bi].box;
+					}
+					l->css_box = cb;
+				} else {
+					free(cb);
+				}
+			}
 		}
 	}
 #endif
@@ -828,9 +870,9 @@ static void *g_html_special(void *p_, int c, ...)
 
 			d = par_format.css_box_depth;
 			need_layer = prm->has_bg || bw_t || bw_r || bw_b || bw_l || pb > 0 || prm->margin_bottom > 0;
-			if (need_layer && d < IPO_CSS_MAX_BOX_LAYERS) {
+			if (need_layer && ensure_css_box_slot(d) == 0) {
 				if (bw_t > 0) {
-					ipo_css_box_layer_t *ly = &par_format.css_boxes[d];
+					ipo_css_box_layer_t *ly = &s_css_box_stack[d].box;
 					ly->x1 = (int16_t)bx1; ly->x2 = (int16_t)bx2;
 					ly->has_bg = 1; ly->bg_rgb = prm->border_rgb;
 					ly->b_left_w = 0; ly->b_right_w = 0;
@@ -839,16 +881,16 @@ static void *g_html_special(void *p_, int c, ...)
 					css_emit_spacer_line(p, bw_t);
 				}
 				{
-					ipo_css_box_layer_t *ly = &par_format.css_boxes[d];
+					ipo_css_box_layer_t *ly = &s_css_box_stack[d].box;
 					ly->x1 = (int16_t)bx1; ly->x2 = (int16_t)bx2;
 					ly->has_bg = prm->has_bg; ly->bg_rgb = prm->bg_rgb;
 					ly->b_left_w = (uint8_t)bw_l; ly->b_right_w = (uint8_t)bw_r;
 					ly->border_rgb = prm->border_rgb;
 					par_format.css_box_depth = d + 1;
-					par_format.css_margin_bot[d] = (int16_t)(prm->margin_bottom < 0 ? 0 : (prm->margin_bottom > 32 ? 32 : prm->margin_bottom));
-					par_format.css_pad_bot[d] = (int16_t)pb;
-					par_format.css_border_bot[d] = (uint8_t)bw_b;
-					par_format.css_border_col[d] = prm->border_rgb;
+					s_css_box_stack[d].margin_bot = (int16_t)(prm->margin_bottom < 0 ? 0 : (prm->margin_bottom > 32 ? 32 : prm->margin_bottom));
+					s_css_box_stack[d].pad_bot = (int16_t)pb;
+					s_css_box_stack[d].border_bot = (uint8_t)bw_b;
+					s_css_box_stack[d].border_col = prm->border_rgb;
 				}
 				if (pt > 0) css_emit_spacer_line(p, pt);
 			} else if (pt > 0) {
@@ -862,7 +904,7 @@ static void *g_html_special(void *p_, int c, ...)
 				par_format.bgcolor.b = format_.bg.b = prm->bg_rgb & 0xff;
 				html_format_changed = 1;
 			}
-			return (void *)(my_intptr_t)(need_layer && d < IPO_CSS_MAX_BOX_LAYERS ? 1 : 0);
+			return (void *)(my_intptr_t)(need_layer && par_format.css_box_depth > d ? 1 : 0);
 		}
 		case SP_CSS_BOX_POP: {
 			va_end(l);
@@ -874,20 +916,24 @@ static void *g_html_special(void *p_, int c, ...)
 			p->cx_w = 0;
 			if (par_format.css_box_depth > 0) {
 				int idx = par_format.css_box_depth - 1;
-				int pb = par_format.css_pad_bot[idx];
-				int bb = par_format.css_border_bot[idx];
-				int mb = par_format.css_margin_bot[idx];
-				uint32_t bcol = par_format.css_border_col[idx];
-				if (pb > 0) css_emit_spacer_line(p, pb);
-				if (bb > 0) {
-					par_format.css_boxes[idx].has_bg = 1;
-					par_format.css_boxes[idx].bg_rgb = bcol;
-					par_format.css_boxes[idx].b_left_w = 0;
-					par_format.css_boxes[idx].b_right_w = 0;
-					css_emit_spacer_line(p, bb);
+				if (idx < s_css_box_stack_cap && s_css_box_stack) {
+					int pb = s_css_box_stack[idx].pad_bot;
+					int bb = s_css_box_stack[idx].border_bot;
+					int mb = s_css_box_stack[idx].margin_bot;
+					uint32_t bcol = s_css_box_stack[idx].border_col;
+					if (pb > 0) css_emit_spacer_line(p, pb);
+					if (bb > 0) {
+						s_css_box_stack[idx].box.has_bg = 1;
+						s_css_box_stack[idx].box.bg_rgb = bcol;
+						s_css_box_stack[idx].box.b_left_w = 0;
+						s_css_box_stack[idx].box.b_right_w = 0;
+						css_emit_spacer_line(p, bb);
+					}
+					par_format.css_box_depth = idx;
+					if (mb > 0) css_emit_spacer_line(p, mb);
+				} else {
+					par_format.css_box_depth = idx;
 				}
-				par_format.css_box_depth = idx;
-				if (mb > 0) css_emit_spacer_line(p, mb);
 			}
 			break;
 		}
@@ -1206,6 +1252,13 @@ struct g_part *g_format_html_part(unsigned char *start, unsigned char *end, int 
 	/*debug("WIDTH: obj (%d, %d), p (%d %d)", p->root->xw, p->root->yw, p->x, p->y);*/
 
 	kill_html_stack_item(&html_top);
+#ifdef IPO_OS
+	if (par_format.css_box_depth == 0 && s_css_box_stack) {
+		free(s_css_box_stack);
+		s_css_box_stack = NULL;
+		s_css_box_stack_cap = 0;
+	}
+#endif
 	if (!f_d) g_release_part(p), p->root = NULL;
 	if (cached_font_face && cached_font_face != to_je_ale_prasarna) mem_free(cached_font_face);
 	cached_font_face = to_je_ale_prasarna;

@@ -1,0 +1,34 @@
+#pragma once
+#include <exception>
+#include <string>
+#include <cstdio>
+
+namespace std {
+
+class runtime_error : public exception {
+    string m_msg;
+public:
+    explicit runtime_error(const string& msg) : m_msg(msg) {}
+    explicit runtime_error(const char* msg) : m_msg(msg ? msg : "") {}
+    const char* what() const noexcept override { return m_msg.c_str(); }
+};
+
+class out_of_range : public exception {
+    string m_msg;
+public:
+    explicit out_of_range(const string& msg) : m_msg(msg) {}
+    explicit out_of_range(const char* msg) : m_msg(msg ? msg : "") {}
+    const char* what() const noexcept override { return m_msg.c_str(); }
+};
+
+inline string to_string(double v) {
+    char buf[48];
+    snprintf(buf, sizeof(buf), "%.6f", v);
+    return string(buf);
+}
+
+inline string to_string(float v) {
+    return to_string(static_cast<double>(v));
+}
+
+} // namespace std

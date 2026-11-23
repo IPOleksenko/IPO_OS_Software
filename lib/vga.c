@@ -136,7 +136,6 @@ void vga_gfx_flip_scaled_buffer(const uint8_t *buf, int width, int height) {
 
 bool vga_gfx_set_resolution(int width, int height) {
     if (width <= 0 || height <= 0) return false;
-    if (width > 65535 || height > 65535) return false;
     uint32_t args[3] = { 4u, (uint32_t)width, (uint32_t)height };
     bool ok = ipo_syscall(IPO_SYSCALL_VGA_SET_MODE, 3u, args) != 0;
     s_gfx_screen_probed = false;
@@ -157,7 +156,9 @@ void vga_gfx_probe_screen_size(void) {
 }
 
 void vga_gfx_get_screen_bounds(int *out_w, int *out_h) {
-    vga_gfx_probe_screen_size();
+    if (!s_gfx_screen_probed) {
+        vga_gfx_probe_screen_size();
+    }
     if (out_w) *out_w = s_gfx_screen_width;
     if (out_h) *out_h = s_gfx_screen_height;
 }
@@ -301,17 +302,58 @@ const uint8_t* vga_font_get_cached_glyph(uint8_t char_code) {
     return vga_default_font_get_glyph(char_code);
 }
 
-/* VBE BGA userland stubs */
-bool vbe_bga_is_available(void) { return false; }
-int vbe_bga_get_bpp(void) { return 0; }
-void *vbe_bga_get_framebuffer(void) { return NULL; }
-bool vbe_bga_is_enabled(void) { return false; }
-uint32_t vbe_bga_get_lfb_address(void) { return 0; }
-bool vbe_bga_set_mode(int width, int height, int bpp) { (void)width; (void)height; (void)bpp; return false; }
-void vbe_bga_restore_text_mode(void) {}
-int vbe_bga_get_width(void) { return 0; }
-int vbe_bga_get_height(void) { return 0; }
-bool vbe_bga_probe(vbe_bga_info_t *out_info) { (void)out_info; return false; }
+/* VBE BGA userland syscall bindings */
+#include <ipo/gfx.h>
+
+bool vbe_bga_is_available(void) {
+    uint32_t a[1] = { IPO_BGA_OP_IS_AVAILABLE };
+    return ipo_syscall(IPO_SYSCALL_GFX_BGA_OP, 1u, a) != 0;
+}
+
+int vbe_bga_get_bpp(void) {
+    uint32_t a[1] = { IPO_BGA_OP_GET_BPP };
+    return ipo_syscall(IPO_SYSCALL_GFX_BGA_OP, 1u, a);
+}
+
+void *vbe_bga_get_framebuffer(void) {
+    return (void *)(uintptr_t)vbe_bga_get_lfb_address();
+}
+
+bool vbe_bga_is_enabled(void) {
+    uint32_t a[1] = { IPO_BGA_OP_IS_ENABLED };
+    return ipo_syscall(IPO_SYSCALL_GFX_BGA_OP, 1u, a) != 0;
+}
+
+uint64_t vbe_bga_get_lfb_address(void) {
+    uint32_t a[1] = { IPO_BGA_OP_GET_LFB_ADDR };
+    return (uint64_t)(uint32_t)ipo_syscall(IPO_SYSCALL_GFX_BGA_OP, 1u, a);
+}
+
+bool vbe_bga_set_mode(int width, int height, int bpp) {
+    uint32_t a[4] = { IPO_BGA_OP_SET_MODE, (uint32_t)width, (uint32_t)height, (uint32_t)bpp };
+    s_gfx_screen_probed = false;
+    return ipo_syscall(IPO_SYSCALL_GFX_BGA_OP, 4u, a) != 0;
+}
+
+void vbe_bga_restore_text_mode(void) {
+    uint32_t a[1] = { IPO_BGA_OP_RESTORE_TEXT };
+    ipo_syscall(IPO_SYSCALL_GFX_BGA_OP, 1u, a);
+}
+
+int vbe_bga_get_width(void) {
+    uint32_t a[1] = { IPO_BGA_OP_GET_WIDTH };
+    return ipo_syscall(IPO_SYSCALL_GFX_BGA_OP, 1u, a);
+}
+
+int vbe_bga_get_height(void) {
+    uint32_t a[1] = { IPO_BGA_OP_GET_HEIGHT };
+    return ipo_syscall(IPO_SYSCALL_GFX_BGA_OP, 1u, a);
+}
+
+bool vbe_bga_probe(vbe_bga_info_t *out_info) {
+    uint32_t a[2] = { IPO_BGA_OP_PROBE, (uint32_t)(uintptr_t)out_info };
+    return ipo_syscall(IPO_SYSCALL_GFX_BGA_OP, out_info ? 2u : 1u, a) != 0;
+}
 
 /* Userland 2D buffer and VRAM drawing primitives */
 

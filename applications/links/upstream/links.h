@@ -4599,11 +4599,6 @@ struct par_attrib {
 	int css_left_px;
 	int css_right_px;
 	int css_box_depth;
-	ipo_css_box_layer_t css_boxes[IPO_CSS_MAX_BOX_LAYERS];
-	int16_t css_margin_bot[IPO_CSS_MAX_BOX_LAYERS];
-	int16_t css_pad_bot[IPO_CSS_MAX_BOX_LAYERS];
-	uint8_t css_border_bot[IPO_CSS_MAX_BOX_LAYERS];
-	uint32_t css_border_col[IPO_CSS_MAX_BOX_LAYERS];
 	unsigned char css_list_none;
 #endif
 };
@@ -4624,9 +4619,9 @@ struct html_element {
 	int dontkill;
 	struct frameset_desc *frameset;
 #ifdef IPO_OS
-	char css_tag[20];
-	char css_id[48];
-	char css_classes[96];
+	char *css_tag;
+	char *css_id;
+	char *css_classes;
 	int css_font_px;
 	uint32_t css_bg_rgb;
 	unsigned char css_has_bg;

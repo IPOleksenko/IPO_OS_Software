@@ -1,10 +1,10 @@
 .code32
 .global _start
-.global environ
-.global __progname
 
 .extern main
 .extern __libc_start_main
+.extern environ
+.extern __progname
 .weak __bss_start
 .weak __bss_end
 
@@ -41,8 +41,13 @@ _start:
     movl 12(%ebp), %edx  /* argv */
     movl 16(%ebp), %ecx  /* envp */
 
-    /* Save environ and __progname */
+    /* Preserve non-empty environment and set __progname */
+    testl %ecx, %ecx
+    jz .no_env
+    cmpl $0, (%ecx)
+    jz .no_env
     movl %ecx, environ
+.no_env:
     testl %edx, %edx
     jz .no_progname
     movl (%edx), %esi
@@ -60,17 +65,6 @@ _start:
     call __libc_start_main
     addl $16, %esp
 
-    /* eax and edx contain the return value from main.
-     * Clean up stack frame and return directly to process_trampoline!
-     */
     movl %ebp, %esp
     popl %ebp
     ret
-
-.section .data
-.align 4
-environ:
-    .long 0
-__progname:
-    .long 0
-

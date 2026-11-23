@@ -96,6 +96,7 @@ struct ipo_js_obj {
 		} arr;
 		struct {
 			ipo_js_ast_t *func_ast;
+			ipo_js_ast_t *cls_ast;
 			ipo_js_env_t *closure;
 			ipo_js_str_t *name;
 			int is_arrow;
@@ -184,6 +185,7 @@ int ipo_js_eval(ipo_js_vm_t *vm, const char *code, size_t len, const char *filen
                 ipo_js_val_t *out_val);
 int ipo_js_call(ipo_js_vm_t *vm, ipo_js_val_t fn, ipo_js_val_t this_val,
                 int argc, const ipo_js_val_t *argv, ipo_js_val_t *out_val);
+void ipo_js_vm_queue_microtask(ipo_js_vm_t *vm, ipo_js_val_t fn);
 void ipo_js_throw(ipo_js_vm_t *vm, ipo_js_val_t err);
 void ipo_js_throw_msg(ipo_js_vm_t *vm, const char *err_type, const char *fmt, ...);
 int  ipo_js_has_exception(ipo_js_vm_t *vm);
@@ -211,7 +213,7 @@ void ipo_js_vm_set_console_hook(ipo_js_vm_t *vm, ipo_js_console_fn fn);
 
 /* Bridge helpers exposed between ipo_js.c and ipo_gui.c */
 int ipo_gui_run_js_dialog(int kind, const char *title, const char *message,
-                          const char *default_text, char *out_buf, size_t out_cap);
+                          const char *default_text, char **out_alloc);
 void ipo_gui_notify_js_console(const char *msg);
 int  ipo_gui_dom_dirty_hint(void);
 

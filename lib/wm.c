@@ -183,7 +183,18 @@ void wm_focus_prev(void) {
 }
 
 void wm_get_screen_bounds(int *out_w, int *out_h) {
-    vga_gfx_get_screen_bounds(out_w, out_h);
+    int w = 0, h = 0;
+    uint32_t args[2] = {
+        (uint32_t)(uintptr_t)&w,
+        (uint32_t)(uintptr_t)&h
+    };
+    if (ipo_syscall(IPO_SYSCALL_WM_GET_SCREEN_BOUNDS, 2u, args) != 0u && w > 0 && h > 0) {
+        if (out_w) *out_w = w;
+        if (out_h) *out_h = h;
+        return;
+    }
+    if (out_w) *out_w = VGA_GFX_WIDTH;
+    if (out_h) *out_h = VGA_GFX_HEIGHT;
 }
 
 void wm_invalidate(wm_window_t *win) {
@@ -260,6 +271,20 @@ bool wm_get_cursor_visible(const wm_window_t *win) {
     if (!win) return true;
     uint32_t args[1] = { (uint32_t)(uintptr_t)win };
     return ipo_syscall(IPO_SYSCALL_WM_GET_CURSOR_VISIBLE, 1u, args) != 0;
+}
+
+bool wm_set_cursor_scale(int width, int height) {
+    if (width < 1 || height < 1) return false;
+    uint32_t args[2] = { (uint32_t)width, (uint32_t)height };
+    return ipo_syscall(IPO_SYSCALL_WM_SET_CURSOR_SCALE, 2u, args) != 0u;
+}
+
+void wm_get_cursor_scale(int *out_width, int *out_height) {
+    int w = 11, h = 16;
+    uint32_t args[2] = { (uint32_t)(uintptr_t)&w, (uint32_t)(uintptr_t)&h };
+    ipo_syscall(IPO_SYSCALL_WM_GET_CURSOR_SCALE, 2u, args);
+    if (out_width) *out_width = w;
+    if (out_height) *out_height = h;
 }
 
 bool wm_poll_event(wm_window_t *win, wm_event_t *out) {

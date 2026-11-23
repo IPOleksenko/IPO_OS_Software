@@ -4,17 +4,21 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <driver/audio_fp.h>
 
 #define AUDIO_FORMAT_U8               1
 #define AUDIO_FORMAT_S16              2
 #define AUDIO_FORMAT_S24              3
 #define AUDIO_FORMAT_S32              4
 #define AUDIO_FORMAT_F32              5
+#define AUDIO_FORMAT_F64              6
 
 #define AUDIO_BACKEND_NONE            0
 #define AUDIO_BACKEND_PC_SPEAKER      1
 #define AUDIO_BACKEND_SB16            2
 #define AUDIO_BACKEND_AC97            3
+#define AUDIO_BACKEND_HDA             4
+#define AUDIO_BACKEND_VIRTIO_SND      5
 
 typedef struct audio_stream {
     int          format;         /* AUDIO_FORMAT_* */
@@ -30,6 +34,7 @@ typedef struct audio_stream {
     size_t       ring_size;      /* 0 = linear buffer, >0 = circular ring buffer in samples */
     size_t       buffered_samples;/* Total samples decoded/written so far */
     bool         is_eof;         /* True when streaming decoder reached end of file */
+    void        *owner;          /* owning process */
     struct audio_stream *next;
 } audio_stream_t;
 
@@ -51,8 +56,28 @@ void            audio_stream_set_volume(audio_stream_t *stream, float volume);
 void            audio_stream_seek(audio_stream_t *stream, double progress_fraction);
 double          audio_stream_get_progress(audio_stream_t *stream);
 
+typedef struct audio_stats {
+    uint32_t irq_count;
+    uint32_t refill_count;
+    uint32_t timer_poll_calls;
+    uint32_t underrun_count;
+    uint32_t overrun_count;
+    uint32_t ring_frames;
+    uint32_t period_frames;
+    uint32_t last_fill_frames;
+    uint32_t queued_frames;
+    uint32_t sample_rate;
+    uint8_t  running;
+    uint8_t  pending_work;
+    uint8_t  backend;
+    uint8_t  reserved;
+} audio_stats_t;
+
 /* Resamples, mixes all active streams and outputs audio to hardware */
 void            audio_tick(void);
+bool            audio_set_fp_config(const audio_fp_config_t *cfg);
+bool            audio_get_fp_config(audio_fp_config_t *out_cfg);
+bool            audio_get_stats(audio_stats_t *out_stats);
 
 /* Stops Sound Blaster 16 DMA output immediately */
 void            sb16_stop(void);

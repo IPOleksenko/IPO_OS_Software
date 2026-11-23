@@ -40,7 +40,7 @@ CRT1_O        := $(LIB_BUILD_DIR)/crt1.o
 LIBGCC_A      := $(LIB_BUILD_DIR)/libgcc.a
 
 # Compiler Flags
-APPS_CFLAGS := -m32 -O2 \
+APPS_CFLAGS := -m32 -O2 -msse2 -mfpmath=sse \
 	-ffreestanding \
 	-fno-pic -fno-pie \
 	-fno-builtin \

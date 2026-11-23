@@ -62,6 +62,10 @@ static inline bool spin_trylock(spinlock_t *sl) {
     return !__atomic_test_and_set(&sl->lock, __ATOMIC_ACQUIRE);
 }
 
+static inline bool spin_is_locked(const spinlock_t *sl) {
+    return sl ? (__atomic_load_n(&sl->lock, __ATOMIC_RELAXED) != 0u) : false;
+}
+
 #define SMP_CPU_ANY              0xFFFFFFFFu
 
 #define SMP_ERR_OK               0
@@ -92,14 +96,14 @@ typedef struct {
 } smp_task_result_t;
 
 void smp_init(void);
-void smp_sync_paging(uint32_t kernel_cr3);
+void smp_sync_paging(uint64_t kernel_cr3);
 uint32_t smp_get_cpu_count(void);
 uint32_t smp_get_active_cpu_count(void);
 const cpu_info_t *smp_get_cpu_info(uint32_t cpu_id);
 uint32_t smp_get_current_cpu_id(void);
 uint32_t smp_get_hw_lapic_id(void);
 const smp_architecture_status_t *smp_get_architecture_status(void);
-uint32_t smp_get_lapic_base(void);
+uint64_t smp_get_lapic_base(void);
 void smp_print_summary(void);
 
 void smp_send_ipi(uint32_t target_lapic_id, uint8_t vector);

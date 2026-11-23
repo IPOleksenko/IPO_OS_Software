@@ -5,7 +5,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 
-#define RTL8139_RX_BUFFER_SIZE_DEFAULT (8192 + 16 + 1500) // 8K + 16 bytes header + wrap margin
+#define RTL8139_RX_BUFFER_SIZE_DEFAULT (65536 + 16 + 2048) // 64K ring + 16B header + wrap margin
 #define RTL8139_TX_BUFFER_SIZE_DEFAULT 1536
 
 size_t rtl8139_get_rx_buffer_size(void);

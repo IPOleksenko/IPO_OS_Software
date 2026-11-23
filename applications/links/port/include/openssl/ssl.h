@@ -34,17 +34,24 @@
 #define TLS1_2_VERSION             0x0303
 #define TLS1_3_VERSION             0x0304
 
-#define X509_V_OK                  0
+#define X509_V_OK                               0
+#define X509_V_ERR_CERT_HAS_EXPIRED             10
+#define X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT_LOCALLY 20
+#define X509_V_ERR_CERT_UNTRUSTED               27
+#define X509_V_ERR_APPLICATION_VERIFICATION     50
+
+#define SSL_VERIFY_NONE                         0
+#define SSL_VERIFY_PEER                         1
 
 struct ssl_ctx_st;
 struct ssl_st;
 struct ssl_method_st { int dummy; };
 struct ssl_session_st { int dummy; };
-struct x509_st { int dummy; };
-struct x509_store_st { int dummy; };
-struct x509_name_st { int dummy; };
+struct x509_st;
+struct x509_store_st;
+struct x509_name_st;
 struct x509_name_entry_st { int dummy; };
-struct bio_st { int dummy; };
+struct bio_st;
 struct asn1_string_st { int dummy; };
 
 typedef struct ssl_ctx_st SSL_CTX;
@@ -75,6 +82,7 @@ int SSL_CTX_set_min_proto_version(SSL_CTX *ctx, int version);
 int SSL_CTX_set_default_verify_paths(SSL_CTX *ctx);
 int SSL_CTX_load_verify_locations(SSL_CTX *ctx, const char *cafile, const char *capath);
 X509_STORE *SSL_CTX_get_cert_store(const SSL_CTX *ctx);
+void SSL_CTX_set_verify(SSL_CTX *ctx, int mode, int (*verify_callback)(int, void *));
 void SSL_CTX_set_default_passwd_cb(SSL_CTX *ctx, int (*cb)(char *, int, int, void *));
 
 SSL *SSL_new(SSL_CTX *ctx);

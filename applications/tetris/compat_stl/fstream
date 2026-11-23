@@ -1,0 +1,156 @@
+#pragma once
+#include <cstdio>
+#include <cstring>
+#include <iomanip>
+#include <string>
+
+extern "C" {
+    bool tetris_fs_read_cached(const char *path, const char **out_buf, size_t *out_len);
+    void tetris_fs_invalidate(const char *path);
+}
+
+namespace std {
+
+class ifstream {
+    const char* m_buf = nullptr;
+    size_t m_len = 0;
+    size_t m_pos = 0;
+    bool m_open = false;
+    bool m_eof = false;
+
+public:
+    ifstream() = default;
+    explicit ifstream(const string& path, ios::openmode mode = ios::in) { open(path, mode); }
+    explicit ifstream(const char* path, ios::openmode mode = ios::in) { open(path, mode); }
+    ifstream(const ifstream&) = delete;
+    ifstream& operator=(const ifstream&) = delete;
+    ~ifstream() { close(); }
+
+    void open(const string& path, ios::openmode mode = ios::in) {
+        open(path.c_str(), mode);
+    }
+
+    void open(const char* path, ios::openmode mode = ios::in) {
+        (void)mode;
+        close();
+        if (path && tetris_fs_read_cached(path, &m_buf, &m_len)) {
+            m_open = true;
+            m_pos = 0;
+            m_eof = false;
+        }
+    }
+
+    bool is_open() const noexcept { return m_open; }
+    explicit operator bool() const noexcept { return m_open && !m_eof; }
+    void close() {
+        m_buf = nullptr;
+        m_len = 0;
+        m_pos = 0;
+        m_open = false;
+        m_eof = false;
+    }
+
+    ifstream& seekg(long offset, int origin = SEEK_SET) {
+        if (m_open) {
+            long target = 0;
+            if (origin == SEEK_SET) target = offset;
+            else if (origin == SEEK_CUR) target = static_cast<long>(m_pos) + offset;
+            else if (origin == SEEK_END) target = static_cast<long>(m_len) + offset;
+            if (target < 0) target = 0;
+            if (static_cast<size_t>(target) > m_len) target = static_cast<long>(m_len);
+            m_pos = static_cast<size_t>(target);
+            m_eof = false;
+        }
+        return *this;
+    }
+
+    bool _getline(string& out, char delim) {
+        out.clear();
+        if (!m_open || m_pos >= m_len) {
+            m_eof = true;
+            return false;
+        }
+        while (m_pos < m_len) {
+            char ch = m_buf[m_pos++];
+            if (ch == delim) break;
+            if (ch == '\r' && delim == '\n') continue;
+            out.push_back(ch);
+        }
+        return true;
+    }
+};
+
+class ofstream {
+    FILE* m_fp = nullptr;
+    bool m_fail = false;
+
+public:
+    ofstream() = default;
+    explicit ofstream(const string& path, ios::openmode mode = ios::out | ios::trunc) {
+        open(path, mode);
+    }
+    explicit ofstream(const char* path, ios::openmode mode = ios::out | ios::trunc) {
+        open(path, mode);
+    }
+    ofstream(const ofstream&) = delete;
+    ofstream& operator=(const ofstream&) = delete;
+    ~ofstream() { close(); }
+
+    void open(const string& path, ios::openmode mode = ios::out | ios::trunc) {
+        open(path.c_str(), mode);
+    }
+
+    void open(const char* path, ios::openmode mode = ios::out | ios::trunc) {
+        close();
+        if (path) tetris_fs_invalidate(path);
+        const char* fmode = (mode & ios::app) ? "a" : "w";
+        if (mode & ios::binary) {
+            fmode = (mode & ios::app) ? "ab" : "wb";
+        }
+        m_fp = path ? fopen(path, fmode) : nullptr;
+        m_fail = (m_fp == nullptr);
+    }
+
+    bool is_open() const noexcept { return m_fp != nullptr; }
+    explicit operator bool() const noexcept { return m_fp != nullptr && !m_fail; }
+
+    void close() {
+        if (m_fp) {
+            fflush(m_fp);
+            fclose(m_fp);
+            m_fp = nullptr;
+        }
+    }
+
+    ofstream& operator<<(const string& s) {
+        if (m_fp && !s.empty()) {
+            if (fwrite(s.data(), 1, s.size(), m_fp) != s.size()) m_fail = true;
+        }
+        return *this;
+    }
+    ofstream& operator<<(const char* s) {
+        if (m_fp && s) {
+            size_t len = strlen(s);
+            if (len && fwrite(s, 1, len, m_fp) != len) m_fail = true;
+        }
+        return *this;
+    }
+    ofstream& operator<<(char c) {
+        if (m_fp && fwrite(&c, 1, 1, m_fp) != 1) m_fail = true;
+        return *this;
+    }
+    ofstream& operator<<(int v) {
+        if (m_fp && fprintf(m_fp, "%d", v) < 0) m_fail = true;
+        return *this;
+    }
+    ofstream& operator<<(unsigned int v) {
+        if (m_fp && fprintf(m_fp, "%u", v) < 0) m_fail = true;
+        return *this;
+    }
+};
+
+inline bool getline(ifstream& in, string& out, char delim = '\n') {
+    return in._getline(out, delim);
+}
+
+} // namespace std

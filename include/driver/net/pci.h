@@ -48,6 +48,10 @@ void     pci_write_byte(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset,
 bool pci_find_device(uint16_t vendor_id, uint16_t device_id, pci_device_t *out_dev);
 bool pci_find_class(uint8_t class_code, uint8_t subclass, pci_device_t *out_dev);
 void pci_enable_bus_mastering(const pci_device_t *dev);
+bool pci_bar_is_io(const pci_device_t *dev, uint8_t bar_idx);
+bool pci_bar_is_64bit(const pci_device_t *dev, uint8_t bar_idx);
+uint64_t pci_get_bar_addr(const pci_device_t *dev, uint8_t bar_idx);
+void *pci_map_bar(uint64_t phys_addr, size_t size);
 
 /* Full PCI Bus Scanning */
 uint32_t pci_scan_all(void (*callback)(const pci_device_t *dev, void *user_data), void *user_data);

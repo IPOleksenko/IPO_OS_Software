@@ -5,7 +5,8 @@
 extern "C" {
 #endif
 
-extern int errno;
+extern int *__errno_location(void);
+#define errno (*__errno_location())
 
 #define EPERM    1
 #define ENOENT   2
@@ -41,7 +42,15 @@ extern int errno;
 #define EDOM    33
 #define ERANGE  34
 #define EDEADLK 35
+#define ENAMETOOLONG 36
+#define ENOLCK  37
 #define ENOSYS  38
+#define ENOTEMPTY 39
+#define ELOOP   40
+#define ENOMSG  42
+#define EOVERFLOW 75
+#define EILSEQ  84
+#define ECANCELED 125
 
 #define EWOULDBLOCK     EAGAIN
 #define EINPROGRESS     115

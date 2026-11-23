@@ -34,7 +34,11 @@ int atexit(void (*function)(void));
 
 char *getenv(const char *name);
 int setenv(const char *name, const char *value, int overwrite);
+int putenv(char *string);
 int unsetenv(const char *name);
+int clearenv(void);
+int posix_memalign(void **memptr, size_t alignment, size_t size);
+void *aligned_alloc(size_t alignment, size_t size);
 int system(const char *command);
 
 int atoi(const char *nptr);
@@ -56,6 +60,7 @@ div_t div(int numer, int denom);
 ldiv_t ldiv(long numer, long denom);
 
 int rand(void);
+int rand_r(unsigned int *seedp);
 void srand(unsigned int seed);
 
 void qsort(void *base, size_t nmemb, size_t size, int (*compar)(const void *, const void *));

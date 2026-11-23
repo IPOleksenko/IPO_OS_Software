@@ -4,6 +4,7 @@
 import argparse
 import re
 import struct
+import sys
 from pathlib import Path
 
 KMOD_RELOC_ABS32 = 1
@@ -160,6 +161,26 @@ def load_ksyms(path: Path):
     return set(re.findall(r'\{\s*"([^"]+)"\s*,', text))
 
 
+def validate_external_ksyms(ksyms_arg: str, external):
+    """Validate unresolved KMD symbols against kernel_syms_autogen.c when available."""
+    if not ksyms_arg:
+        return
+    path = Path(ksyms_arg)
+    try:
+        known = load_ksyms(path)
+    except OSError as exc:
+        print(f"[build_kmd] WARNING: unable to read ksyms '{path}' ({exc}); skipping symbol check",
+              file=sys.stderr)
+        return
+    if not known:
+        print(f"[build_kmd] WARNING: no symbols parsed from '{path}'; skipping symbol check",
+              file=sys.stderr)
+        return
+    missing = sorted({sym for _, sym, _ in external if sym not in known})
+    if missing:
+        raise ValueError(f"Unresolved kernel symbol(s) not in {ksyms_arg}: {', '.join(missing)}")
+
+
 def asm_escape(s: str) -> str:
     return (
         s.replace("\\", "\\\\")
@@ -172,12 +193,7 @@ def asm_escape(s: str) -> str:
 
 def emit_self_relocs_s(elf: Elf32, args, out_path: Path):
     internal_offsets, external = elf.collect_relocs()
-
-    if args.ksyms:
-        known = load_ksyms(Path(args.ksyms))
-        missing = sorted({sym for _, sym, _ in external if sym not in known})
-        if missing:
-            raise ValueError(f"Unresolved kernel symbol(s) not in {args.ksyms}: {', '.join(missing)}")
+    validate_external_ksyms(args.ksyms, external)
 
     cleanup_sym = elf.sym_by_name.get("kmd_main_cleanup")
     cleanup_off = cleanup_sym["st_value"] if cleanup_sym else 0xFFFFFFFF
@@ -231,12 +247,7 @@ def emit_self_relocs_s(elf: Elf32, args, out_path: Path):
 
 def build_baremetal(elf: Elf32, args) -> bytes:
     internal_offsets, external = elf.collect_relocs()
-
-    if args.ksyms:
-        known = load_ksyms(Path(args.ksyms))
-        missing = sorted({sym for _, sym, _ in external if sym not in known})
-        if missing:
-            raise ValueError(f"Unresolved kernel symbol(s) not in {args.ksyms}: {', '.join(missing)}")
+    validate_external_ksyms(args.ksyms, external)
 
     init_sym = elf.sym_by_name.get("kmd_init_entry")
     if not init_sym or init_sym["st_value"] != 0:

@@ -7,6 +7,10 @@
 void glBegin(GLenum mode) {
     GLContext *ctx = gl_get_current_context();
     if (!ctx) return;
+    if (ctx->is_compiling_list) {
+        gl_list_record_cmd(ctx, GL_DL_CMD_BEGIN, mode, NULL, 0);
+        if (ctx->list_compile_mode == GL_COMPILE) return;
+    }
     ctx->prim_mode = mode;
     ctx->in_begin  = true;
     ctx->vert_buf.count = 0;
@@ -15,10 +19,10 @@ void glBegin(GLenum mode) {
 static void evaluate_vertex_lighting(GLContext *ctx, gl_vertex_t *v) {
     if (!ctx->lighting_enabled) return;
 
-    float r = ctx->front_material.ambient[0];
-    float g = ctx->front_material.ambient[1];
-    float b = ctx->front_material.ambient[2];
-    float a = ctx->cur_color[3];
+    float r = ctx->front_material.emission[0] + ctx->front_material.ambient[0] * 0.2f;
+    float g = ctx->front_material.emission[1] + ctx->front_material.ambient[1] * 0.2f;
+    float b = ctx->front_material.emission[2] + ctx->front_material.ambient[2] * 0.2f;
+    float a = ctx->front_material.diffuse[3] * ctx->cur_color[3];
 
     float nx = v->norm[0], ny = v->norm[1], nz = v->norm[2];
     if (ctx->normalize_normals) {
@@ -26,7 +30,13 @@ static void evaluate_vertex_lighting(GLContext *ctx, gl_vertex_t *v) {
         if (len > 0.0f) { nx /= len; ny /= len; nz /= len; }
     }
 
-    for (int i = 0; i < 8; i++) {
+    /* View direction (eye at origin) */
+    float vx = -v->eye[0], vy = -v->eye[1], vz = -v->eye[2];
+    float vlen = gl_sqrtf(vx * vx + vy * vy + vz * vz);
+    if (vlen > 1e-6f) { vx /= vlen; vy /= vlen; vz /= vlen; }
+    else { vx = 0.0f; vy = 0.0f; vz = 1.0f; }
+
+    for (int i = 0; i < ctx->light_capacity; i++) {
         gl_light_t *l = &ctx->lights[i];
         if (!l->enabled) continue;
 
@@ -34,22 +44,53 @@ static void evaluate_vertex_lighting(GLContext *ctx, gl_vertex_t *v) {
         float ly = l->position[1];
         float lz = l->position[2];
         float lw = l->position[3];
+        float att = 1.0f;
 
         if (lw != 0.0f) {
             lx -= v->eye[0];
             ly -= v->eye[1];
             lz -= v->eye[2];
-            float dist = gl_sqrtf(lx * lx + ly * ly + lz * lz);
-            if (dist > 0.0f) { lx /= dist; ly /= dist; lz /= dist; }
+            float d2 = lx * lx + ly * ly + lz * lz;
+            float dist = gl_sqrtf(d2);
+            if (dist > 1e-6f) { lx /= dist; ly /= dist; lz /= dist; }
+            float denom = l->constant_attenuation + l->linear_attenuation * dist + l->quadratic_attenuation * d2;
+            if (denom > 1.0f) att = 1.0f / denom;
+        } else {
+            float d = gl_sqrtf(lx * lx + ly * ly + lz * lz);
+            if (d > 1e-6f) { lx /= d; ly /= d; lz /= d; }
         }
 
-        /* Lambertian diffuse: dot(N, L) */
         float n_dot_l = nx * lx + ny * ly + nz * lz;
         if (n_dot_l < 0.0f) n_dot_l = 0.0f;
 
-        r += l->ambient[0] * ctx->front_material.ambient[0] + l->diffuse[0] * ctx->front_material.diffuse[0] * n_dot_l;
-        g += l->ambient[1] * ctx->front_material.ambient[1] + l->diffuse[1] * ctx->front_material.diffuse[1] * n_dot_l;
-        b += l->ambient[2] * ctx->front_material.ambient[2] + l->diffuse[2] * ctx->front_material.diffuse[2] * n_dot_l;
+        r += att * (l->ambient[0] * ctx->front_material.ambient[0] + l->diffuse[0] * ctx->front_material.diffuse[0] * n_dot_l);
+        g += att * (l->ambient[1] * ctx->front_material.ambient[1] + l->diffuse[1] * ctx->front_material.diffuse[1] * n_dot_l);
+        b += att * (l->ambient[2] * ctx->front_material.ambient[2] + l->diffuse[2] * ctx->front_material.diffuse[2] * n_dot_l);
+
+        if (n_dot_l > 0.0f && ctx->front_material.shininess > 0.0f) {
+            float hx = lx + vx, hy = ly + vy, hz = lz + vz;
+            float hlen = gl_sqrtf(hx * hx + hy * hy + hz * hz);
+            if (hlen > 1e-6f) {
+                hx /= hlen; hy /= hlen; hz /= hlen;
+                float n_dot_h = nx * hx + ny * hy + nz * hz;
+                if (n_dot_h > 0.0f) {
+                    float spec = 1.0f;
+                    int sh = (int)ctx->front_material.shininess;
+                    if (sh > 128) sh = 128;
+                    /* Fast binary exponentiation */
+                    float base = n_dot_h;
+                    int e = sh;
+                    while (e > 0) {
+                        if (e & 1) spec *= base;
+                        base *= base;
+                        e >>= 1;
+                    }
+                    r += att * l->specular[0] * ctx->front_material.specular[0] * spec;
+                    g += att * l->specular[1] * ctx->front_material.specular[1] * spec;
+                    b += att * l->specular[2] * ctx->front_material.specular[2] * spec;
+                }
+            }
+        }
     }
 
     if (r > 1.0f) r = 1.0f;
@@ -58,39 +99,21 @@ static void evaluate_vertex_lighting(GLContext *ctx, gl_vertex_t *v) {
     v->color[0] = r; v->color[1] = g; v->color[2] = b; v->color[3] = a;
 }
 
-void glVertex4f(GLfloat x, GLfloat y, GLfloat z, GLfloat w) {
-    GLContext *ctx = gl_get_current_context();
-    if (!ctx || !ctx->in_begin) return;
-
-    /* Expand vertex buffer dynamically without limits */
-    if (ctx->vert_buf.count >= ctx->vert_buf.capacity) {
-        int new_cap = ctx->vert_buf.capacity * 2;
-        gl_vertex_t *new_data = krealloc(ctx->vert_buf.data, (size_t)new_cap * sizeof(gl_vertex_t));
-        if (!new_data) return;
-        ctx->vert_buf.data = new_data;
-        ctx->vert_buf.capacity = new_cap;
-    }
-
-    gl_vertex_t *v = &ctx->vert_buf.data[ctx->vert_buf.count++];
-    v->obj[0] = x; v->obj[1] = y; v->obj[2] = z; v->obj[3] = w;
-
-    memcpy(v->color, ctx->cur_color, 4 * sizeof(GLfloat));
-    memcpy(v->tex,   ctx->cur_texcoord, 4 * sizeof(GLfloat));
-
-    /* Transform normal by ModelView */
+static void gl_transform_vertex_cpu(GLContext *ctx, gl_vertex_t *v) {
+    GLfloat nx = v->norm[0], ny = v->norm[1], nz = v->norm[2];
+    /* Transform normal and position by ModelView */
     GLfloat *mv = gl_matrix_current(&ctx->modelview_stack);
     if (mv) {
-        v->norm[0] = mv[0] * ctx->cur_normal[0] + mv[4] * ctx->cur_normal[1] + mv[8]  * ctx->cur_normal[2];
-        v->norm[1] = mv[1] * ctx->cur_normal[0] + mv[5] * ctx->cur_normal[1] + mv[9]  * ctx->cur_normal[2];
-        v->norm[2] = mv[2] * ctx->cur_normal[0] + mv[6] * ctx->cur_normal[1] + mv[10] * ctx->cur_normal[2];
+        v->norm[0] = mv[0] * nx + mv[4] * ny + mv[8]  * nz;
+        v->norm[1] = mv[1] * nx + mv[5] * ny + mv[9]  * nz;
+        v->norm[2] = mv[2] * nx + mv[6] * ny + mv[10] * nz;
 
         /* eye = ModelView * obj */
-        v->eye[0] = mv[0] * x + mv[4] * y + mv[8]  * z + mv[12] * w;
-        v->eye[1] = mv[1] * x + mv[5] * y + mv[9]  * z + mv[13] * w;
-        v->eye[2] = mv[2] * x + mv[6] * y + mv[10] * z + mv[14] * w;
-        v->eye[3] = mv[3] * x + mv[7] * y + mv[11] * z + mv[15] * w;
+        v->eye[0] = mv[0] * v->obj[0] + mv[4] * v->obj[1] + mv[8]  * v->obj[2] + mv[12] * v->obj[3];
+        v->eye[1] = mv[1] * v->obj[0] + mv[5] * v->obj[1] + mv[9]  * v->obj[2] + mv[13] * v->obj[3];
+        v->eye[2] = mv[2] * v->obj[0] + mv[6] * v->obj[1] + mv[10] * v->obj[2] + mv[14] * v->obj[3];
+        v->eye[3] = mv[3] * v->obj[0] + mv[7] * v->obj[1] + mv[11] * v->obj[2] + mv[15] * v->obj[3];
     } else {
-        memcpy(v->norm, ctx->cur_normal, 3 * sizeof(GLfloat));
         memcpy(v->eye, v->obj, 4 * sizeof(GLfloat));
     }
 
@@ -108,6 +131,39 @@ void glVertex4f(GLfloat x, GLfloat y, GLfloat z, GLfloat w) {
     }
 }
 
+void glVertex4f(GLfloat x, GLfloat y, GLfloat z, GLfloat w) {
+    GLContext *ctx = gl_get_current_context();
+    if (!ctx) return;
+    if (ctx->is_compiling_list) {
+        GLfloat v4[4] = { x, y, z, w };
+        gl_list_record_cmd(ctx, GL_DL_CMD_VERTEX4F, 0, v4, 4);
+        if (ctx->list_compile_mode == GL_COMPILE) return;
+    }
+    if (!ctx->in_begin) return;
+
+    /* Expand vertex buffer dynamically without limits */
+    if (ctx->vert_buf.count >= ctx->vert_buf.capacity) {
+        int new_cap = ctx->vert_buf.capacity * 2;
+        gl_vertex_t *new_data = krealloc(ctx->vert_buf.data, (size_t)new_cap * sizeof(gl_vertex_t));
+        if (!new_data) return;
+        ctx->vert_buf.data = new_data;
+        ctx->vert_buf.capacity = new_cap;
+    }
+
+    gl_vertex_t *v = &ctx->vert_buf.data[ctx->vert_buf.count++];
+    v->obj[0] = x; v->obj[1] = y; v->obj[2] = z; v->obj[3] = w;
+
+    memcpy(v->color, ctx->cur_color, 4 * sizeof(GLfloat));
+    memcpy(v->tex,   ctx->cur_texcoord, 4 * sizeof(GLfloat));
+    memcpy(v->norm,  ctx->cur_normal, 3 * sizeof(GLfloat));
+
+    if (ctx->gpu_frame_active) {
+        return;
+    }
+
+    gl_transform_vertex_cpu(ctx, v);
+}
+
 void glVertex3f(GLfloat x, GLfloat y, GLfloat z) {
     glVertex4f(x, y, z, 1.0f);
 }
@@ -123,6 +179,11 @@ void glVertex3fv(const GLfloat *v) {
 void glColor4f(GLfloat red, GLfloat green, GLfloat blue, GLfloat alpha) {
     GLContext *ctx = gl_get_current_context();
     if (!ctx) return;
+    if (ctx->is_compiling_list) {
+        GLfloat v4[4] = { red, green, blue, alpha };
+        gl_list_record_cmd(ctx, GL_DL_CMD_COLOR4F, 0, v4, 4);
+        if (ctx->list_compile_mode == GL_COMPILE) return;
+    }
     ctx->cur_color[0] = red;
     ctx->cur_color[1] = green;
     ctx->cur_color[2] = blue;
@@ -144,6 +205,11 @@ void glColor3ub(GLubyte red, GLubyte green, GLubyte blue) {
 void glNormal3f(GLfloat nx, GLfloat ny, GLfloat nz) {
     GLContext *ctx = gl_get_current_context();
     if (!ctx) return;
+    if (ctx->is_compiling_list) {
+        GLfloat v3[3] = { nx, ny, nz };
+        gl_list_record_cmd(ctx, GL_DL_CMD_NORMAL3F, 0, v3, 3);
+        if (ctx->list_compile_mode == GL_COMPILE) return;
+    }
     ctx->cur_normal[0] = nx;
     ctx->cur_normal[1] = ny;
     ctx->cur_normal[2] = nz;
@@ -156,6 +222,11 @@ void glNormal3fv(const GLfloat *v) {
 void glTexCoord4f(GLfloat s, GLfloat t, GLfloat r, GLfloat q) {
     GLContext *ctx = gl_get_current_context();
     if (!ctx) return;
+    if (ctx->is_compiling_list) {
+        GLfloat v4[4] = { s, t, r, q };
+        gl_list_record_cmd(ctx, GL_DL_CMD_TEXCOORD4F, 0, v4, 4);
+        if (ctx->list_compile_mode == GL_COMPILE) return;
+    }
     ctx->cur_texcoord[0] = s;
     ctx->cur_texcoord[1] = t;
     ctx->cur_texcoord[2] = r;
@@ -180,8 +251,24 @@ void glTexCoord2fv(const GLfloat *v) {
 
 void glEnd(void) {
     GLContext *ctx = gl_get_current_context();
-    if (!ctx || !ctx->in_begin) return;
+    if (!ctx) return;
+    if (ctx->is_compiling_list) {
+        gl_list_record_cmd(ctx, GL_DL_CMD_END, 0, NULL, 0);
+        if (ctx->list_compile_mode == GL_COMPILE) return;
+    }
+    if (!ctx->in_begin) return;
     ctx->in_begin = false;
+
+    if (gl_gpu_try_draw_primitive(ctx)) {
+        return;
+    }
+    if (ctx->gpu_frame_active) {
+        if (ctx->gpu_dirty_content) gl_gpu_sync_readback(ctx);
+        ctx->gpu_frame_active = false;
+        for (int i = 0; i < ctx->vert_buf.count; i++) {
+            gl_transform_vertex_cpu(ctx, &ctx->vert_buf.data[i]);
+        }
+    }
 
     int n = ctx->vert_buf.count;
     gl_vertex_t *v = ctx->vert_buf.data;
@@ -196,6 +283,12 @@ void glEnd(void) {
         case GL_QUADS:
             for (int i = 0; i + 3 < n; i += 4) {
                 gl_vertex_t quad[4] = { v[i], v[i+1], v[i+2], v[i+3] };
+                gl_clip_and_render_polygon(ctx, quad, 4);
+            }
+            break;
+        case GL_QUAD_STRIP:
+            for (int i = 0; i + 3 < n; i += 2) {
+                gl_vertex_t quad[4] = { v[i], v[i+1], v[i+3], v[i+2] };
                 gl_clip_and_render_polygon(ctx, quad, 4);
             }
             break;

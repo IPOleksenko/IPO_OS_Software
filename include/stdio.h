@@ -8,8 +8,6 @@
 
 #define getc_unlocked(f) fgetc(f)
 #define putc_unlocked(c, f) fputc(c, f)
-#define flockfile(f) ((void)0)
-#define funlockfile(f) ((void)0)
 
 #define EOF (-1)
 #define BUFSIZ 1024
@@ -30,6 +28,17 @@ typedef struct {
     int error;
     int ungotten;
     int has_ungot;
+    volatile uint32_t lock_state;
+    uint32_t lock_owner;
+    uint32_t lock_depth;
+    char *buf;
+    size_t buf_cap;
+    size_t buf_pos;
+    size_t buf_end;
+    int buf_mode;
+    int buf_owned;
+    int buf_writing;
+    char *tmp_unlink_path;
 } FILE;
 
 #ifdef __cplusplus
@@ -68,6 +77,9 @@ int feof(FILE *stream);
 int ferror(FILE *stream);
 void clearerr(FILE *stream);
 int fflush(FILE *stream);
+void flockfile(FILE *stream);
+int ftrylockfile(FILE *stream);
+void funlockfile(FILE *stream);
 int setvbuf(FILE *stream, char *buf, int mode, size_t size);
 void setbuf(FILE *stream, char *buf);
 FILE *tmpfile(void);

@@ -5,6 +5,8 @@
 #include <syscall.h>
 #include <stdio.h>
 #include <stdbool.h>
+#include <pthread.h>
+#include "ipo_libc_internal.h"
 
 /* -------------------------------------------------------------
  * Memory allocator over sbrk
@@ -153,8 +155,7 @@ static void *malloc_locked(size_t size) {
                 fit = curr;
             }
         } else {
-            int max_probe = (b == NUM_BINS - 1u) ? 4096 : 64;
-            while (curr && max_probe-- > 0) {
+            while (curr) {
                 if (curr->magic == BLOCK_MAGIC && curr->is_free && curr->size >= size) {
                     fit = curr;
                     break;
@@ -266,9 +267,38 @@ static void free_locked(void *ptr) {
     bin_insert(block);
 }
 
+typedef struct {
+    void *aligned;
+    void *raw;
+    size_t user_size;
+} std_aligned_entry_t;
+
+static std_aligned_entry_t *s_aligned_tbl = NULL;
+static size_t s_aligned_count = 0u;
+static size_t s_aligned_cap = 0u;
+
+static int find_aligned_locked(const void *ptr) {
+    if (!ptr || s_aligned_count == 0u || !s_aligned_tbl) return -1;
+    for (size_t i = 0u; i < s_aligned_cap; i++) {
+        if (s_aligned_tbl[i].aligned == ptr) return (int)i;
+    }
+    return -1;
+}
+
 void free(void *ptr) {
     if (!ptr) return;
     heap_lock_acquire();
+    int aidx = find_aligned_locked(ptr);
+    if (aidx >= 0) {
+        void *raw = s_aligned_tbl[aidx].raw;
+        s_aligned_tbl[aidx].aligned = NULL;
+        s_aligned_tbl[aidx].raw = NULL;
+        s_aligned_tbl[aidx].user_size = 0u;
+        s_aligned_count--;
+        free_locked(raw);
+        heap_lock_release();
+        return;
+    }
     free_locked(ptr);
     heap_lock_release();
 }
@@ -297,6 +327,26 @@ void *realloc(void *ptr, size_t new_size) {
     size_t aligned_new = ALIGN8(new_size);
 
     heap_lock_acquire();
+    int aidx = find_aligned_locked(ptr);
+    if (aidx >= 0) {
+        size_t old_sz = s_aligned_tbl[aidx].user_size;
+        void *new_ptr = malloc_locked(aligned_new);
+        if (!new_ptr) {
+            heap_lock_release();
+            return NULL;
+        }
+        size_t copy_sz = old_sz < new_size ? old_sz : new_size;
+        if (copy_sz > 0u) memcpy(new_ptr, ptr, copy_sz);
+        void *raw = s_aligned_tbl[aidx].raw;
+        s_aligned_tbl[aidx].aligned = NULL;
+        s_aligned_tbl[aidx].raw = NULL;
+        s_aligned_tbl[aidx].user_size = 0u;
+        s_aligned_count--;
+        free_locked(raw);
+        heap_lock_release();
+        return new_ptr;
+    }
+
     block_hdr_t *block = (block_hdr_t *)((uint8_t *)ptr - HDR_SIZE);
     if (block->magic != BLOCK_MAGIC || block->is_free) {
         heap_lock_release();
@@ -335,6 +385,72 @@ void *realloc(void *ptr, size_t new_size) {
     return new_ptr;
 }
 
+int posix_memalign(void **memptr, size_t alignment, size_t size) {
+    if (!memptr) return EINVAL;
+    if (alignment < sizeof(void *) || (alignment & (alignment - 1u)) != 0u) {
+        return EINVAL;
+    }
+    if (alignment <= 8u) {
+        void *p = malloc(size ? size : 1u);
+        if (!p) return ENOMEM;
+        *memptr = p;
+        return 0;
+    }
+    size_t alloc_sz = size ? size : 1u;
+    if (alignment > SIZE_MAX - alloc_sz) return ENOMEM;
+
+    heap_lock_acquire();
+    void *raw = malloc_locked(alloc_sz + alignment);
+    if (!raw) {
+        heap_lock_release();
+        return ENOMEM;
+    }
+    size_t mask = alignment - 1u;
+    void *aligned = (void *)(((uintptr_t)raw + mask) & ~mask);
+    int slot = -1;
+    for (size_t i = 0u; i < s_aligned_cap; i++) {
+        if (!s_aligned_tbl[i].aligned) {
+            slot = (int)i;
+            break;
+        }
+    }
+    if (slot < 0) {
+        size_t ncap = s_aligned_cap ? (s_aligned_cap * 2u) : 32u;
+        std_aligned_entry_t *ntbl = (std_aligned_entry_t *)malloc_locked(ncap * sizeof(std_aligned_entry_t));
+        if (!ntbl) {
+            free_locked(raw);
+            heap_lock_release();
+            return ENOMEM;
+        }
+        if (s_aligned_tbl && s_aligned_cap > 0u) {
+            memcpy(ntbl, s_aligned_tbl, s_aligned_cap * sizeof(std_aligned_entry_t));
+            free_locked(s_aligned_tbl);
+        }
+        memset(ntbl + s_aligned_cap, 0, (ncap - s_aligned_cap) * sizeof(std_aligned_entry_t));
+        s_aligned_tbl = ntbl;
+        slot = (int)s_aligned_cap;
+        s_aligned_cap = ncap;
+    }
+    s_aligned_tbl[slot].aligned = aligned;
+    s_aligned_tbl[slot].raw = raw;
+    s_aligned_tbl[slot].user_size = size;
+    s_aligned_count++;
+    heap_lock_release();
+    *memptr = aligned;
+    return 0;
+}
+
+void *aligned_alloc(size_t alignment, size_t size) {
+    if (alignment < sizeof(void *)) alignment = sizeof(void *);
+    void *p = NULL;
+    int err = posix_memalign(&p, alignment, size);
+    if (err != 0) {
+        errno = err;
+        return NULL;
+    }
+    return p;
+}
+
 /* -------------------------------------------------------------
  * Process Lifecycle & atexit
  * ------------------------------------------------------------- */
@@ -342,36 +458,51 @@ void *realloc(void *ptr, size_t new_size) {
 static void (**atexit_handlers)(void) = NULL;
 static size_t atexit_count = 0;
 static size_t atexit_cap = 0;
+static pthread_mutex_t s_atexit_lock = PTHREAD_MUTEX_INITIALIZER;
 
 int atexit(void (*func)(void)) {
     if (!func) return -1;
+    pthread_mutex_lock(&s_atexit_lock);
     if (atexit_count >= atexit_cap) {
         size_t new_cap = (atexit_cap == 0) ? 16 : atexit_cap * 2;
         void (**new_handlers)(void) = (void (**)(void))realloc(atexit_handlers, new_cap * sizeof(void (*)(void)));
-        if (!new_handlers) return -1;
+        if (!new_handlers) {
+            pthread_mutex_unlock(&s_atexit_lock);
+            return -1;
+        }
         atexit_handlers = new_handlers;
         atexit_cap = new_cap;
     }
     atexit_handlers[atexit_count++] = func;
+    pthread_mutex_unlock(&s_atexit_lock);
     return 0;
 }
 
 void __libc_fini_array(void);
 
-void exit(int status) {
-    /* Run atexit handlers in LIFO order */
-    for (int i = (int)atexit_count - 1; i >= 0; i--) {
-        if (atexit_handlers[i]) {
-            atexit_handlers[i]();
+void ipo_libc_run_atexit_and_fini(void) {
+    /* Run atexit handlers in LIFO order safely even if handlers append more */
+    for (;;) {
+        pthread_mutex_lock(&s_atexit_lock);
+        if (atexit_count == 0) {
+            if (atexit_handlers) {
+                free(atexit_handlers);
+                atexit_handlers = NULL;
+                atexit_cap = 0;
+            }
+            pthread_mutex_unlock(&s_atexit_lock);
+            break;
         }
+        void (*fn)(void) = atexit_handlers[--atexit_count];
+        pthread_mutex_unlock(&s_atexit_lock);
+        if (fn) fn();
     }
-    if (atexit_handlers) {
-        free(atexit_handlers);
-        atexit_handlers = NULL;
-        atexit_count = atexit_cap = 0;
-    }
-    /* Run global destructors */
+    /* Run global destructors and __cxa_finalize */
     __libc_fini_array();
+}
+
+void exit(int status) {
+    ipo_libc_run_atexit_and_fini();
     /* Flush stdio streams */
     fflush(NULL);
     /* Set return value in kernel */
@@ -408,21 +539,57 @@ void __assert_fail(const char *assertion, const char *file, unsigned int line, c
 static char *env[] = {
     NULL
 };
-__attribute__((weak)) char **environ = NULL;
+__attribute__((weak)) char **environ = env;
 
 static bool env_is_allocated = false;
 static size_t env_cap = 0;
+static pthread_mutex_t s_env_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static int ensure_heap_env_locked(void) {
+    char **cur_env = environ ? environ : env;
+    size_t count = 0;
+    while (cur_env[count] != NULL) {
+        count++;
+    }
+    if (env_is_allocated && environ == cur_env) {
+        return 0;
+    }
+    size_t new_cap = count + 8;
+    char **new_env = (char **)malloc(new_cap * sizeof(char *));
+    if (!new_env) {
+        errno = ENOMEM;
+        return -1;
+    }
+    for (size_t i = 0; i < count; i++) {
+        new_env[i] = strdup(cur_env[i]);
+        if (!new_env[i]) {
+            for (size_t k = 0; k < i; k++) free(new_env[k]);
+            free(new_env);
+            errno = ENOMEM;
+            return -1;
+        }
+    }
+    new_env[count] = NULL;
+    environ = new_env;
+    env_is_allocated = true;
+    env_cap = new_cap;
+    return 0;
+}
 
 char *getenv(const char *name) {
     if (!name || !*name) return NULL;
-    char **cur_env = environ ? environ : env;
     size_t nlen = strlen(name);
+    pthread_mutex_lock(&s_env_lock);
+    char **cur_env = environ ? environ : env;
+    char *res = NULL;
     for (char **ep = cur_env; *ep != NULL; ep++) {
         if (strncmp(*ep, name, nlen) == 0 && (*ep)[nlen] == '=') {
-            return *ep + nlen + 1;
+            res = *ep + nlen + 1;
+            break;
         }
     }
-    return NULL;
+    pthread_mutex_unlock(&s_env_lock);
+    return res;
 }
 
 int setenv(const char *name, const char *value, int overwrite) {
@@ -436,41 +603,6 @@ int setenv(const char *name, const char *value, int overwrite) {
     size_t vlen = strlen(value);
     size_t entry_len = nlen + 1 + vlen + 1;
 
-    char **cur_env = environ ? environ : env;
-    size_t count = 0;
-    int found_idx = -1;
-
-    while (cur_env[count] != NULL) {
-        if (strncmp(cur_env[count], name, nlen) == 0 && cur_env[count][nlen] == '=') {
-            found_idx = (int)count;
-        }
-        count++;
-    }
-
-    /* If variable exists and we are not allowed to overwrite, return success */
-    if (found_idx >= 0 && !overwrite) {
-        return 0;
-    }
-
-    /* If variable exists and we can overwrite */
-    if (found_idx >= 0) {
-        char *new_entry = (char *)malloc(entry_len);
-        if (!new_entry) {
-            errno = ENOMEM;
-            return -1;
-        }
-        memcpy(new_entry, name, nlen);
-        new_entry[nlen] = '=';
-        memcpy(new_entry + nlen + 1, value, vlen + 1);
-
-        if (env_is_allocated) {
-            free(cur_env[found_idx]);
-        }
-        cur_env[found_idx] = new_entry;
-        return 0;
-    }
-
-    /* Variable does not exist: need to append */
     char *new_entry = (char *)malloc(entry_len);
     if (!new_entry) {
         errno = ENOMEM;
@@ -480,38 +612,50 @@ int setenv(const char *name, const char *value, int overwrite) {
     new_entry[nlen] = '=';
     memcpy(new_entry + nlen + 1, value, vlen + 1);
 
-    if (!env_is_allocated) {
-        size_t new_cap = count + 8;
-        char **new_env = (char **)malloc(new_cap * sizeof(char *));
+    pthread_mutex_lock(&s_env_lock);
+    if (ensure_heap_env_locked() != 0) {
+        pthread_mutex_unlock(&s_env_lock);
+        free(new_entry);
+        return -1;
+    }
+
+    size_t count = 0;
+    int found_idx = -1;
+    while (environ[count] != NULL) {
+        if (strncmp(environ[count], name, nlen) == 0 && environ[count][nlen] == '=') {
+            found_idx = (int)count;
+        }
+        count++;
+    }
+
+    if (found_idx >= 0 && !overwrite) {
+        pthread_mutex_unlock(&s_env_lock);
+        free(new_entry);
+        return 0;
+    }
+
+    if (found_idx >= 0) {
+        free(environ[found_idx]);
+        environ[found_idx] = new_entry;
+        pthread_mutex_unlock(&s_env_lock);
+        return 0;
+    }
+
+    if (count + 2 > env_cap) {
+        size_t new_cap = env_cap ? env_cap * 2 : (count + 8);
+        char **new_env = (char **)realloc(environ, new_cap * sizeof(char *));
         if (!new_env) {
+            pthread_mutex_unlock(&s_env_lock);
             free(new_entry);
             errno = ENOMEM;
             return -1;
         }
-        for (size_t i = 0; i < count; i++) {
-            new_env[i] = cur_env[i];
-        }
-        new_env[count] = new_entry;
-        new_env[count + 1] = NULL;
         environ = new_env;
-        env_is_allocated = true;
         env_cap = new_cap;
-    } else {
-        if (count + 2 > env_cap) {
-            size_t new_cap = env_cap ? env_cap * 2 : (count + 8);
-            char **new_env = (char **)realloc(environ, new_cap * sizeof(char *));
-            if (!new_env) {
-                free(new_entry);
-                errno = ENOMEM;
-                return -1;
-            }
-            environ = new_env;
-            env_cap = new_cap;
-        }
-        environ[count] = new_entry;
-        environ[count + 1] = NULL;
     }
-
+    environ[count] = new_entry;
+    environ[count + 1] = NULL;
+    pthread_mutex_unlock(&s_env_lock);
     return 0;
 }
 
@@ -543,41 +687,45 @@ int unsetenv(const char *name) {
         return -1;
     }
 
-    char **cur_env = environ ? environ : env;
+    pthread_mutex_lock(&s_env_lock);
+    if (ensure_heap_env_locked() != 0) {
+        pthread_mutex_unlock(&s_env_lock);
+        return -1;
+    }
+
     size_t nlen = strlen(name);
     size_t i = 0;
 
-    while (cur_env[i] != NULL) {
-        if (strncmp(cur_env[i], name, nlen) == 0 && cur_env[i][nlen] == '=') {
-            if (env_is_allocated) {
-                free(cur_env[i]);
-            }
-            /* Shift remaining entries down */
+    while (environ[i] != NULL) {
+        if (strncmp(environ[i], name, nlen) == 0 && environ[i][nlen] == '=') {
+            free(environ[i]);
             size_t j = i;
-            while (cur_env[j] != NULL) {
-                cur_env[j] = cur_env[j + 1];
+            while (environ[j] != NULL) {
+                environ[j] = environ[j + 1];
                 j++;
             }
-            /* Don't increment i; check the shifted element at index i */
             continue;
         }
         i++;
     }
-
+    pthread_mutex_unlock(&s_env_lock);
     return 0;
 }
 
 int clearenv(void) {
-    char **cur_env = environ ? environ : env;
-    if (env_is_allocated) {
-        for (size_t i = 0; cur_env[i] != NULL; i++) {
-            free(cur_env[i]);
-            cur_env[i] = NULL;
+    pthread_mutex_lock(&s_env_lock);
+    if (env_is_allocated && environ) {
+        for (size_t i = 0; environ[i] != NULL; i++) {
+            free(environ[i]);
+            environ[i] = NULL;
+        }
+    } else if (ensure_heap_env_locked() == 0 && environ) {
+        for (size_t i = 0; environ[i] != NULL; i++) {
+            free(environ[i]);
+            environ[i] = NULL;
         }
     }
-    if (environ) {
-        environ[0] = NULL;
-    }
+    pthread_mutex_unlock(&s_env_lock);
     return 0;
 }
 
@@ -846,14 +994,26 @@ ldiv_t ldiv(long numer, long denom) {
     return r;
 }
 
-static unsigned long rand_next = 1;
+static uint32_t rand_next = 1u;
+
+int rand_r(unsigned int *seedp) {
+    if (!seedp) return 0;
+    *seedp = *seedp * 1103515245u + 12345u;
+    return (int)((*seedp / 65536u) % 32768u);
+}
+
 int rand(void) {
-    rand_next = rand_next * 1103515245 + 12345;
-    return (unsigned int)(rand_next / 65536) % 32768;
+    uint32_t old_val, next_val;
+    do {
+        old_val = __atomic_load_n(&rand_next, __ATOMIC_RELAXED);
+        next_val = old_val * 1103515245u + 12345u;
+    } while (!__atomic_compare_exchange_n(&rand_next, &old_val, next_val, false,
+                                          __ATOMIC_RELAXED, __ATOMIC_RELAXED));
+    return (int)((next_val / 65536u) % 32768u);
 }
 
 void srand(unsigned int seed) {
-    rand_next = seed;
+    __atomic_store_n(&rand_next, (uint32_t)seed, __ATOMIC_RELAXED);
 }
 
 static void qsort_swap(char *a, char *b, size_t size) {

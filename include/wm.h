@@ -62,8 +62,15 @@ typedef enum {
 #define WM_EVENT_CLOSE      0x00000100u
 #define WM_EVENT_RESIZE     0x00000200u
 #define WM_EVENT_MOVE       0x00000400u
-#define WM_EVENT_CLICK      0x00001000u  /* left mouse button down inside window */
-#define WM_EVENT_SHORTCUT   0x00002000u  /* custom registered shortcut fired (data = tag) */
+#define WM_EVENT_CLICK            0x00001000u  /* left mouse button down inside window */
+#define WM_EVENT_SHORTCUT         0x00002000u  /* custom registered shortcut fired (data = tag) */
+#define WM_EVENT_MOUSE_MOVE       0x00004000u  /* high 16 bits = x, low 16 bits = y (matches WM_EVENT_CLICK) */
+#define WM_EVENT_MOUSE_UP         0x00008000u  /* left mouse button up inside window */
+#define WM_EVENT_MOUSE_RIGHT_DOWN 0x00010000u
+#define WM_EVENT_MOUSE_RIGHT_UP   0x00020000u
+#define WM_EVENT_MOUSE_MIDDLE_DOWN 0x00040000u
+#define WM_EVENT_MOUSE_MIDDLE_UP  0x00080000u
+#define WM_EVENT_MOUSE_WHEEL       0x00100000u  /* data = (uint32_t)(int32_t)dz */
 
 /* =========================================================================
  * Forward declaration
@@ -262,5 +269,12 @@ void wm_set_cursor_visible(wm_window_t *win, bool visible);
  * Query whether this window leaves the WM system cursor visible when focused.
  */
 bool wm_get_cursor_visible(const wm_window_t *win);
+
+/**
+ * Set or query the global WM cursor size in pixels (independent of screen resolution).
+ * Both width and height must be positive integers (>= 1).
+ */
+bool wm_set_cursor_scale(int width, int height);
+void wm_get_cursor_scale(int *out_width, int *out_height);
 
 #endif /* LIB_WM_H */

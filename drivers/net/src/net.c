@@ -1,6 +1,7 @@
 #include <net/net.h>
 #include <net/net_state.h>
 #include <driver/net/rtl8139.h>
+#include <driver/net/nic_ops.h>
 #include <net/ethernet.h>
 #include <net/arp.h>
 #include <net/icmp.h>
@@ -234,7 +235,7 @@ bool net_init(void) {
         mac_set(&ctx->default_if.mac, mac, hw_mac_len);
         ctx->default_if.link_up = true;
         char *mac_str = mac_format_dyn(&ctx->default_if.mac);
-        printf("[net] RTL8139 init SUCCESS, MAC: %s\n", mac_str ? mac_str : "unknown");
+        printf("[net] %s init SUCCESS, MAC: %s\n", nic_get_driver_name(), mac_str ? mac_str : "unknown");
         if (mac_str) kfree(mac_str);
 
         printf("[net] Discovering network configuration via DHCP...\n");
@@ -265,7 +266,7 @@ bool net_init(void) {
         }
     } else {
         ctx->default_if.link_up = false;
-        printf("[net] RTL8139 init FAILED, link is down\n");
+        printf("[net] NIC init FAILED, link is down\n");
     }
 
     return true;

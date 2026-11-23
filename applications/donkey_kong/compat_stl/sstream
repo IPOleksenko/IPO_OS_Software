@@ -1,0 +1,112 @@
+#pragma once
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <iomanip>
+#include <string>
+
+namespace std {
+
+class _DKStringStreamBase {
+protected:
+    string m_buf;
+    size_t m_pos = 0;
+    int m_width = 0;
+    char m_fill = ' ';
+    int m_prec = 6;
+    bool m_fixed = false;
+    bool m_eof = false;
+    bool m_fail = false;
+
+    void append_padded(const char* s, size_t len) {
+        if (m_width > static_cast<int>(len)) {
+            size_t pad = static_cast<size_t>(m_width) - len;
+            for (size_t i = 0; i < pad; ++i) m_buf.push_back(m_fill);
+        }
+        m_buf.append(s, len);
+        m_width = 0;
+    }
+
+public:
+    explicit operator bool() const noexcept { return !m_fail; }
+    bool eof() const noexcept { return m_eof; }
+    bool fail() const noexcept { return m_fail; }
+    int precision(int n) noexcept { int old = m_prec; m_prec = n; return old; }
+
+    string str() const { return m_buf; }
+    void str(const string& s) {
+        m_buf = s;
+        m_pos = 0;
+        m_eof = false;
+        m_fail = false;
+    }
+};
+
+class ostringstream : public _DKStringStreamBase {
+public:
+    ostringstream() = default;
+    explicit ostringstream(const string& s) { m_buf = s; }
+
+    ostringstream& operator<<(_Setw w) { m_width = w.n; return *this; }
+    ostringstream& operator<<(_Setfill f) { m_fill = f.c; return *this; }
+    ostringstream& operator<<(_Setprecision p) { m_prec = p.n; return *this; }
+    ostringstream& operator<<(_Ios_Manip) { m_fixed = true; return *this; }
+
+    ostringstream& operator<<(const char* s) {
+        const char* p = s ? s : "";
+        append_padded(p, strlen(p));
+        return *this;
+    }
+    ostringstream& operator<<(const string& s) {
+        append_padded(s.data(), s.size());
+        return *this;
+    }
+    ostringstream& operator<<(char c) {
+        append_padded(&c, 1);
+        return *this;
+    }
+    ostringstream& operator<<(int v) {
+        char tmp[32];
+        int n = snprintf(tmp, sizeof(tmp), "%d", v);
+        if (n > 0) append_padded(tmp, static_cast<size_t>(n));
+        return *this;
+    }
+    ostringstream& operator<<(unsigned int v) {
+        char tmp[32];
+        int n = snprintf(tmp, sizeof(tmp), "%u", v);
+        if (n > 0) append_padded(tmp, static_cast<size_t>(n));
+        return *this;
+    }
+    ostringstream& operator<<(long v) {
+        char tmp[32];
+        int n = snprintf(tmp, sizeof(tmp), "%ld", v);
+        if (n > 0) append_padded(tmp, static_cast<size_t>(n));
+        return *this;
+    }
+    ostringstream& operator<<(double v) {
+        char tmp[64];
+        int n = snprintf(tmp, sizeof(tmp), m_fixed ? "%.*f" : "%.*g", m_prec, v);
+        if (n > 0) append_padded(tmp, static_cast<size_t>(n));
+        return *this;
+    }
+};
+
+class stringstream : public ostringstream {
+public:
+    stringstream() = default;
+    explicit stringstream(const string& s) : ostringstream(s) {}
+    void swap(stringstream& other) noexcept {
+        string tmp = m_buf; m_buf = other.m_buf; other.m_buf = tmp;
+        size_t p = m_pos; m_pos = other.m_pos; other.m_pos = p;
+        int w = m_width; m_width = other.m_width; other.m_width = w;
+        char f = m_fill; m_fill = other.m_fill; other.m_fill = f;
+        int pr = m_prec; m_prec = other.m_prec; other.m_prec = pr;
+        bool fx = m_fixed; m_fixed = other.m_fixed; other.m_fixed = fx;
+        bool eo = m_eof; m_eof = other.m_eof; other.m_eof = eo;
+        bool fa = m_fail; m_fail = other.m_fail; other.m_fail = fa;
+    }
+};
+
+using istringstream = ostringstream;
+
+} // namespace std

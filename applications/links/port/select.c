@@ -74,7 +74,7 @@ int select(int nfds, fd_set *readfds, fd_set *writefds, fd_set *exceptfds,
                     r_ready = 1;
                 } else if (ipo_pipe_has_data(fd)) {
                     r_ready = 1;
-                } else if (fd >= 128 && socket_readable(fd)) {
+                } else if (fd >= 64 && socket_readable(fd)) {
                     r_ready = 1;
                 }
             }
@@ -82,7 +82,7 @@ int select(int nfds, fd_set *readfds, fd_set *writefds, fd_set *exceptfds,
             if (writefds && FD_ISSET(fd, &requested_write)) {
                 if (ipo_pipe_has_space(fd)) {
                     w_ready = 1;
-                } else if (fd >= 128 && ipo_links_socket_connected(fd)) {
+                } else if (fd >= 64 && ipo_links_socket_connected(fd)) {
                     w_ready = 1;
                 }
             }

@@ -56,21 +56,27 @@ def is_disk_formatted(disk_path: Path) -> bool:
 def main():
     parser = argparse.ArgumentParser(description="Format virtual disk using IPO_OS native kernel in QEMU.")
     repo_root = Path(__file__).resolve().parent.parent
-    parser.add_argument("--disk", type=Path, default=repo_root / "build" / "disk.img", help="Target disk image")
+    parser.add_argument("--disk", type=Path, default=repo_root / "build" / "disks" / "disk.img", help="Target disk image")
+    parser.add_argument("--os-image", type=Path, default=None, help="Unified OS bootable binary (IPO_OS.bin)")
     parser.add_argument("--boot", type=Path, default=repo_root / "build" / "boot" / "boot.bin", help="Bootloader binary")
     parser.add_argument("--kernel", type=Path, default=repo_root / "build" / "kernel" / "kernel.bin", help="Kernel binary")
-    parser.add_argument("--qemu", type=str, default="qemu-system-i386", help="QEMU executable")
+    parser.add_argument("--qemu", type=str, default="qemu-system-x86_64", help="QEMU executable")
     parser.add_argument("--size-mb", type=int, default=128, help="Disk size in megabytes")
     parser.add_argument("--force", action="store_true", help="Force reformat even if already formatted")
     parser.add_argument("--timeout", type=float, default=20.0, help="Maximum timeout in seconds to wait for OS mount")
     args = parser.parse_args()
 
     disk_path = args.disk.resolve()
+    os_image = args.os_image.resolve() if args.os_image else None
     boot_bin = args.boot.resolve()
     kernel_bin = args.kernel.resolve()
 
-    if not boot_bin.exists() or not kernel_bin.exists():
-        print(f"Error: {boot_bin} or {kernel_bin} not found. Build kernel & bootloader first.", file=sys.stderr)
+    if os_image is not None:
+        if not os_image.exists():
+            print(f"Error: {os_image} not found.", file=sys.stderr)
+            return 1
+    elif not boot_bin.exists() or not kernel_bin.exists():
+        print(f"Error: {boot_bin} or {kernel_bin} not found. Specify --os-image IPO_OS.bin or build boot/kernel first.", file=sys.stderr)
         return 1
 
     # Check if disk is already formatted
@@ -105,10 +111,13 @@ def main():
             f.seek(0)
             f.write(updated_mbr)
 
-    # Build pure kernel boot image (drive 0) without any filesystem partition
+    # Build or use pure kernel boot image (drive 0) without any filesystem partition
     boot_kernel_img = repo_root / "build" / "boot_kernel.img"
-    with open(boot_bin, "rb") as fb, open(kernel_bin, "rb") as fk:
-        boot_kernel_data = fb.read() + fk.read()
+    if os_image is not None:
+        boot_kernel_data = os_image.read_bytes()
+    else:
+        with open(boot_bin, "rb") as fb, open(kernel_bin, "rb") as fk:
+            boot_kernel_data = fb.read() + fk.read()
     pad = (len(boot_kernel_data) + 511) // 512 * 512
     boot_kernel_data = boot_kernel_data.ljust(pad, b"\x00")
     with open(boot_kernel_img, "wb") as fbk:

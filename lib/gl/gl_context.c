@@ -1,6 +1,7 @@
 #include <GL/gl.h>
 #include <GL/ipo_gl.h>
 #include <driver/vbe_bga.h>
+#include <ipo/gfx.h>
 #include <wm.h>
 #include <vga_gfx.h>
 #include <memory/kmalloc.h>
@@ -110,7 +111,14 @@ GLContext *gl_create_context(int width, int height, void *win) {
     ctx->front_material.specular[2] = 0.0f; ctx->front_material.specular[3] = 1.0f;
     ctx->front_material.shininess = 0.0f;
 
-    /* Light 0 default position */
+    /* Light 0 default position (dynamically expandable light array) */
+    ctx->light_capacity = 8;
+    ctx->lights = kmalloc((size_t)ctx->light_capacity * sizeof(gl_light_t));
+    if (!ctx->lights) {
+        gl_destroy_context(ctx);
+        return NULL;
+    }
+    memset(ctx->lights, 0, (size_t)ctx->light_capacity * sizeof(gl_light_t));
     ctx->lights[0].diffuse[0] = 1.0f; ctx->lights[0].diffuse[1] = 1.0f;
     ctx->lights[0].diffuse[2] = 1.0f; ctx->lights[0].diffuse[3] = 1.0f;
     ctx->lights[0].position[2] = 1.0f;
@@ -161,6 +169,7 @@ void gl_destroy_context(GLContext *ctx) {
     if (ctx->color_buffer)   kfree(ctx->color_buffer);
     if (ctx->z_buffer)       kfree(ctx->z_buffer);
     if (ctx->stencil_buffer) kfree(ctx->stencil_buffer);
+    if (ctx->mode13h_frame)  kfree(ctx->mode13h_frame);
 
     gl_matrix_free_stack(&ctx->modelview_stack);
     gl_matrix_free_stack(&ctx->projection_stack);
@@ -172,12 +181,14 @@ void gl_destroy_context(GLContext *ctx) {
     if (ctx->textures) {
         for (int i = 0; i < ctx->texture_count; i++) {
             if (ctx->textures[i]) {
+                gl_gpu_destroy_texture(NULL, ctx->textures[i]);
                 if (ctx->textures[i]->pixels) kfree(ctx->textures[i]->pixels);
                 kfree(ctx->textures[i]);
             }
         }
         kfree(ctx->textures);
     }
+    gl_gpu_destroy_context_res(ctx);
 
     if (ctx->display_lists) {
         for (int i = 0; i < ctx->list_count; i++) {
@@ -189,7 +200,25 @@ void gl_destroy_context(GLContext *ctx) {
         kfree(ctx->display_lists);
     }
 
+    if (ctx->lights) kfree(ctx->lights);
     kfree(ctx);
+}
+
+bool gl_ensure_light_capacity(GLContext *ctx, int min_count) {
+    if (!ctx || min_count <= 0) return false;
+    if (ctx->lights && min_count <= ctx->light_capacity) return true;
+    int new_cap = ctx->light_capacity > 0 ? ctx->light_capacity : 8;
+    while (new_cap < min_count) {
+        if (new_cap > INT32_MAX / 2) { new_cap = min_count; break; }
+        new_cap *= 2;
+    }
+    if ((size_t)new_cap > SIZE_MAX / sizeof(gl_light_t)) return false;
+    gl_light_t *nl = (gl_light_t *)krealloc(ctx->lights, (size_t)new_cap * sizeof(gl_light_t));
+    if (!nl) return false;
+    memset(&nl[ctx->light_capacity], 0, (size_t)(new_cap - ctx->light_capacity) * sizeof(gl_light_t));
+    ctx->lights = nl;
+    ctx->light_capacity = new_cap;
+    return true;
 }
 
 bool gl_resize_context(GLContext *ctx, int new_w, int new_h) {
@@ -224,6 +253,7 @@ bool gl_resize_context(GLContext *ctx, int new_w, int new_h) {
     ctx->height = new_h;
     ctx->vp_w = new_w;
     ctx->vp_h = new_h;
+    gl_gpu_invalidate_rt(ctx);
 
     return true;
 }
@@ -240,45 +270,59 @@ void gl_swap_buffers(GLContext *ctx, void *win_ptr) {
     if (!ctx) ctx = g_current_context;
     if (!ctx || !ctx->color_buffer) return;
 
+    if (gl_gpu_try_swap_buffers(ctx, win_ptr)) return;
+
     wm_window_t *win = (wm_window_t *)(win_ptr ? win_ptr : ctx->win);
+
+    int hw_bpp = 8;
+    ipo_gfx_caps_t caps;
+    if (ipo_gfx_get_caps(&caps) == 0 && caps.active_hw_bpp > 0u) {
+        hw_bpp = (int)caps.active_hw_bpp;
+    }
+
+    if (hw_bpp >= 15) {
+        ipo_gfx_surface_desc_t surf;
+        memset(&surf, 0, sizeof(surf));
+        surf.struct_size = sizeof(surf);
+        surf.width = (uint32_t)ctx->width;
+        surf.height = (uint32_t)ctx->height;
+        surf.stride_bytes = (uint32_t)ctx->width * (uint32_t)sizeof(uint32_t);
+        surf.format_id = IPO_COLOR_FMT_XRGB8888;
+        surf.tonemap_op = IPO_TONEMAP_NONE;
+        surf.exposure = 1.0;
+        surf.pixels = ctx->color_buffer;
+        if (win != NULL && wm_is_window_valid(win)) {
+            if (ipo_gfx_present_window(win, &surf) == 0) return;
+        } else {
+            if (ipo_gfx_present_screen(&surf) == 0) return;
+        }
+    }
 
     if (win != NULL && win->framebuf != NULL && wm_is_window_valid(win)) {
         /*
-         * Multi-window startwm mode (VGA Mode 13h or TrueColor window):
+         * Legacy 8bpp Mode 13h fallback:
          * Strided quantization so window resizing or dimensions never shear or misalign scanlines.
          */
         int w = ctx->width  < (int)win->w ? ctx->width  : (int)win->w;
         int h = ctx->height < (int)win->h ? ctx->height : (int)win->h;
         gl_quantize_argb_to_palette_strided(ctx->color_buffer, ctx->width, win->framebuf, win->w, w, h);
         wm_invalidate(win);
-    } else if (vbe_bga_is_available() && vbe_bga_get_bpp() == 32) {
-        /*
-         * Bare Metal / QEMU TrueColor LFB mode: direct 32-bit copy
-         */
-        uint32_t *lfb = (uint32_t *)vbe_bga_get_framebuffer();
-        if (lfb) {
-            size_t sz = (size_t)ctx->width * (size_t)ctx->height * sizeof(uint32_t);
-            memcpy(lfb, ctx->color_buffer, sz);
-        }
     } else {
         /*
-         * Standalone graphics: scale through kernel vga_gfx_flip_scaled_buffer
-         * so it uses the OS-configured resolution and isolates VRAM properly.
+         * Standalone 8bpp graphics: scale through kernel vga_gfx_flip_scaled_buffer
          */
-        static uint8_t *s_mode13h_frame = NULL;
-        static size_t s_mode13h_frame_cap = 0;
         int w = ctx->width;
         int h = ctx->height;
         if (w > 0 && h > 0 && (size_t)w <= SIZE_MAX / (size_t)h) {
             size_t need = (size_t)w * (size_t)h;
-            if (need > s_mode13h_frame_cap) {
-                uint8_t *nf = (uint8_t *)krealloc(s_mode13h_frame, need);
+            if (need > ctx->mode13h_frame_cap) {
+                uint8_t *nf = (uint8_t *)krealloc(ctx->mode13h_frame, need);
                 if (!nf) return;
-                s_mode13h_frame = nf;
-                s_mode13h_frame_cap = need;
+                ctx->mode13h_frame = nf;
+                ctx->mode13h_frame_cap = need;
             }
-            gl_quantize_argb_to_palette_strided(ctx->color_buffer, ctx->width, s_mode13h_frame, w, w, h);
-            vga_gfx_flip_scaled_buffer(s_mode13h_frame, w, h);
+            gl_quantize_argb_to_palette_strided(ctx->color_buffer, ctx->width, ctx->mode13h_frame, w, w, h);
+            vga_gfx_flip_scaled_buffer(ctx->mode13h_frame, w, h);
         }
     }
 }
@@ -308,7 +352,25 @@ void glClear(GLbitfield mask) {
     GLContext *ctx = gl_get_current_context();
     if (!ctx || ctx->width <= 0 || ctx->height <= 0) return;
 
-    size_t total = (size_t)ctx->width * (size_t)ctx->height;
+    if (gl_gpu_try_clear(ctx, mask)) {
+        return;
+    }
+
+    int cx0 = 0, cy0 = 0, cx1 = ctx->width, cy1 = ctx->height;
+    bool use_scissor = ctx->scissor_enabled &&
+        !(ctx->scissor_x == 0 && ctx->scissor_y == 0 &&
+          ctx->scissor_w >= ctx->width && ctx->scissor_h >= ctx->height);
+    if (use_scissor) {
+        cx0 = ctx->scissor_x;
+        cy0 = ctx->height - (ctx->scissor_y + ctx->scissor_h);
+        cx1 = cx0 + ctx->scissor_w;
+        cy1 = cy0 + ctx->scissor_h;
+        if (cx0 < 0) cx0 = 0;
+        if (cy0 < 0) cy0 = 0;
+        if (cx1 > ctx->width) cx1 = ctx->width;
+        if (cy1 > ctx->height) cy1 = ctx->height;
+        if (cx1 <= cx0 || cy1 <= cy0) return;
+    }
 
     if (mask & GL_COLOR_BUFFER_BIT) {
         uint32_t r = (uint32_t)(ctx->clear_color[0] * 255.0f);
@@ -321,21 +383,30 @@ void glClear(GLbitfield mask) {
         if (a > 255) a = 255;
         uint32_t pixel = (a << 24) | (r << 16) | (g << 8) | b;
 
-        for (size_t i = 0; i < total; i++) {
-            ctx->color_buffer[i] = pixel;
+        for (int y = cy0; y < cy1; y++) {
+            uint32_t *row = ctx->color_buffer + (size_t)y * (size_t)ctx->width;
+            for (int x = cx0; x < cx1; x++) {
+                row[x] = pixel;
+            }
         }
     }
 
     if (mask & GL_DEPTH_BUFFER_BIT) {
         uint16_t zval = (uint16_t)(ctx->clear_depth * 65535.0);
-        for (size_t i = 0; i < total; i++) {
-            ctx->z_buffer[i] = zval;
+        for (int y = cy0; y < cy1; y++) {
+            uint16_t *row = ctx->z_buffer + (size_t)y * (size_t)ctx->width;
+            for (int x = cx0; x < cx1; x++) {
+                row[x] = zval;
+            }
         }
     }
 
     if (mask & GL_STENCIL_BUFFER_BIT) {
         uint8_t sval = (uint8_t)(ctx->clear_stencil & 0xFF);
-        memset(ctx->stencil_buffer, sval, total);
+        for (int y = cy0; y < cy1; y++) {
+            uint8_t *row = ctx->stencil_buffer + (size_t)y * (size_t)ctx->width;
+            memset(row + cx0, sval, (size_t)(cx1 - cx0));
+        }
     }
 }
 
@@ -386,8 +457,13 @@ void glEnable(GLenum cap) {
         case GL_COLOR_MATERIAL: ctx->color_material_enabled = GL_TRUE; break;
         case GL_NORMALIZE:      ctx->normalize_normals    = GL_TRUE; break;
         default:
-            if (cap >= GL_LIGHT0 && cap <= GL_LIGHT7) {
-                ctx->lights[cap - GL_LIGHT0].enabled = GL_TRUE;
+            if (cap >= GL_LIGHT0 && (cap - GL_LIGHT0) <= (GLenum)INT32_MAX - 1u) {
+                int idx = (int)(cap - GL_LIGHT0);
+                if (gl_ensure_light_capacity(ctx, idx + 1)) {
+                    ctx->lights[idx].enabled = GL_TRUE;
+                } else {
+                    ctx->error_flag = GL_OUT_OF_MEMORY;
+                }
             } else {
                 ctx->error_flag = GL_INVALID_ENUM;
             }
@@ -413,8 +489,11 @@ void glDisable(GLenum cap) {
         case GL_COLOR_MATERIAL: ctx->color_material_enabled = GL_FALSE; break;
         case GL_NORMALIZE:      ctx->normalize_normals    = GL_FALSE; break;
         default:
-            if (cap >= GL_LIGHT0 && cap <= GL_LIGHT7) {
-                ctx->lights[cap - GL_LIGHT0].enabled = GL_FALSE;
+            if (cap >= GL_LIGHT0 && (cap - GL_LIGHT0) <= (GLenum)INT32_MAX - 1u) {
+                int idx = (int)(cap - GL_LIGHT0);
+                if (idx < ctx->light_capacity && ctx->lights) {
+                    ctx->lights[idx].enabled = GL_FALSE;
+                }
             } else {
                 ctx->error_flag = GL_INVALID_ENUM;
             }
@@ -438,8 +517,11 @@ GLboolean glIsEnabled(GLenum cap) {
         case GL_TEXTURE_2D:     return ctx->texture_2d_enabled;
         case GL_TEXTURE_3D:     return ctx->texture_3d_enabled;
         default:
-            if (cap >= GL_LIGHT0 && cap <= GL_LIGHT7) {
-                return ctx->lights[cap - GL_LIGHT0].enabled;
+            if (cap >= GL_LIGHT0) {
+                int idx = (int)(cap - GL_LIGHT0);
+                if (idx >= 0 && idx < ctx->light_capacity && ctx->lights) {
+                    return ctx->lights[idx].enabled;
+                }
             }
             return GL_FALSE;
     }

@@ -72,13 +72,13 @@ typedef struct {
     uint8_t    pci_class;
     uint8_t    pci_subclass;
     uint8_t    pci_progif;
-    uint32_t   *bar;
+    uint64_t   *bar;
     size_t     bar_count;
     size_t     bar_cap;
     uint16_t   io_base;
     uint16_t   io_size;
-    uint32_t   mmio_base;
-    uint32_t   mmio_size;
+    uint64_t   mmio_base;
+    size_t     mmio_size;
     uint8_t    irq;
     uint64_t   size_bytes;           /* Capacity for storage/memory */
 } device_resources_t;
@@ -115,8 +115,7 @@ typedef struct device_node {
 /* Lifecycle helpers for dynamic device resources */
 void device_resources_init(device_resources_t *res);
 void device_resources_free(device_resources_t *res);
-int  device_resources_add_bar(device_resources_t *res, uint32_t bar);
-int  device_resources_set_bar(device_resources_t *res, size_t index, uint32_t bar);
+int  device_resources_add_bar(device_resources_t *res, uint64_t bar);
 int  device_resources_copy(device_resources_t *dst, const device_resources_t *src);
 
 /* Lifecycle helpers for dynamic device nodes */

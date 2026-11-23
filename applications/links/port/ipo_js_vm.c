@@ -237,7 +237,7 @@ typedef struct js_class_elem {
 	ipo_js_ast_t *key_ast;
 	ipo_js_ast_t *fn_ast;
 	int is_static;
-	int kind; /* 0=method, 1=get, 2=set */
+	int kind; /* 0=method, 1=get, 2=set, 3=static_block, 4=field */
 } js_class_elem_t;
 
 struct ipo_js_ast {
@@ -435,6 +435,16 @@ static int js_strict_eq(ipo_js_val_t a, ipo_js_val_t b);
 static int js_loose_eq(ipo_js_vm_t *vm, ipo_js_val_t a, ipo_js_val_t b);
 static ipo_js_obj_t *vm_new_regexp(ipo_js_vm_t *vm, const char *pat, size_t plen, uint8_t flags);
 static void vm_drain_microtasks(ipo_js_vm_t *vm);
+static ipo_js_obj_t *js_collect_iterable(ipo_js_vm_t *vm, ipo_js_val_t rhs);
+static const char *js_val_to_prop_key(ipo_js_vm_t *vm, ipo_js_val_t v);
+
+enum {
+	JS_HTAG_MAP  = 101,
+	JS_HTAG_SET  = 102,
+	JS_HTAG_ABUF = 103,
+	JS_HTAG_TA   = 104,
+	JS_HTAG_SYM  = 105
+};
 
 /* =========================================================================
  * Value Constructors & GC Implementation
@@ -1364,12 +1374,18 @@ void ipo_js_throw(ipo_js_vm_t *vm, ipo_js_val_t err) {
 }
 
 void ipo_js_throw_msg(ipo_js_vm_t *vm, const char *err_type, const char *fmt, ...) {
-	char buf[512];
-	va_list ap;
+	va_list ap, ap2;
 	va_start(ap, fmt);
-	vsnprintf(buf, sizeof(buf), fmt, ap);
+	va_copy(ap2, ap);
+	int n = vsnprintf(NULL, 0, fmt, ap);
 	va_end(ap);
-	ipo_js_obj_t *e = ipo_js_new_error(vm, err_type ? err_type : "Error", buf);
+	char *buf = (n >= 0) ? (char *)malloc((size_t)n + 1u) : NULL;
+	if (buf) {
+		vsnprintf(buf, (size_t)n + 1u, fmt, ap2);
+	}
+	va_end(ap2);
+	ipo_js_obj_t *e = ipo_js_new_error(vm, err_type ? err_type : "Error", buf ? buf : "");
+	free(buf);
 	ipo_js_throw(vm, ipo_js_obj_val(e));
 }
 
@@ -1762,16 +1778,40 @@ static void re_free(re_prog_t *prog) {
 	free(prog);
 }
 
-#define RE_MAX_GROUPS 32
 typedef struct re_state {
 	const char *s;
 	size_t slen;
 	uint8_t flags;
-	int cap_start[RE_MAX_GROUPS];
-	int cap_end[RE_MAX_GROUPS];
+	int *cap_start;
+	int *cap_end;
+	int cap_count;
 	int steps;
 	int depth;
 } re_state_t;
+
+static int re_state_init(re_state_t *st, int cap_count) {
+	memset(st, 0, sizeof(*st));
+	if (cap_count < 1) cap_count = 1;
+	if ((size_t)cap_count > SIZE_MAX / (2u * sizeof(int))) return 0;
+	int *buf = (int *)malloc((size_t)cap_count * 2u * sizeof(int));
+	if (!buf) return 0;
+	st->cap_start = buf;
+	st->cap_end = buf + cap_count;
+	st->cap_count = cap_count;
+	for (int i = 0; i < cap_count; i++) {
+		st->cap_start[i] = -1;
+		st->cap_end[i] = -1;
+	}
+	return 1;
+}
+
+static void re_state_free(re_state_t *st) {
+	if (!st) return;
+	free(st->cap_start);
+	st->cap_start = NULL;
+	st->cap_end = NULL;
+	st->cap_count = 0;
+}
 
 typedef struct re_cont {
 	const re_seq_t *seq;
@@ -1855,17 +1895,26 @@ static int re_match_repeat_inner(re_state_t *st, const re_node_t *rep, int count
 
 	/* General repeat for groups/alternations */
 	size_t step_end = 0;
-	int saved_s[RE_MAX_GROUPS], saved_e[RE_MAX_GROUPS];
-	memcpy(saved_s, st->cap_start, sizeof(saved_s));
-	memcpy(saved_e, st->cap_end, sizeof(saved_e));
+	int *saved = (st->cap_count > 0) ? (int *)malloc((size_t)st->cap_count * 2u * sizeof(int)) : NULL;
+	if (st->cap_count > 0 && !saved) return 0;
+	if (saved) {
+		memcpy(saved, st->cap_start, (size_t)st->cap_count * sizeof(int));
+		memcpy(saved + st->cap_count, st->cap_end, (size_t)st->cap_count * sizeof(int));
+	}
 
 	if (re_match_node(st, c, pos, NULL, &step_end)) {
 		if (step_end > pos || count < rep->min_rep) {
-			if (re_match_repeat(st, rep, count + 1, step_end, step_end, cont, out_end)) return 1;
+			if (re_match_repeat(st, rep, count + 1, step_end, step_end, cont, out_end)) {
+				free(saved);
+				return 1;
+			}
 		}
 	}
-	memcpy(st->cap_start, saved_s, sizeof(saved_s));
-	memcpy(st->cap_end, saved_e, sizeof(saved_e));
+	if (saved) {
+		memcpy(st->cap_start, saved, (size_t)st->cap_count * sizeof(int));
+		memcpy(st->cap_end, saved + st->cap_count, (size_t)st->cap_count * sizeof(int));
+		free(saved);
+	}
 	if (count >= rep->min_rep && !rep->lazy) {
 		return re_run_cont(st, pos, cont, out_end);
 	}
@@ -1930,27 +1979,27 @@ static int re_match_node_inner(re_state_t *st, const re_node_t *n, size_t pos,
 	}
 	case RE_GROUP_START: {
 		int old = -1;
-		if (n->group_idx < RE_MAX_GROUPS) {
+		if (n->group_idx >= 0 && n->group_idx < st->cap_count) {
 			old = st->cap_start[n->group_idx];
 			st->cap_start[n->group_idx] = (int)pos;
 		}
 		if (re_run_cont(st, pos, cont, out_end)) return 1;
-		if (n->group_idx < RE_MAX_GROUPS) st->cap_start[n->group_idx] = old;
+		if (n->group_idx >= 0 && n->group_idx < st->cap_count) st->cap_start[n->group_idx] = old;
 		return 0;
 	}
 	case RE_GROUP_END: {
 		int old = -1;
-		if (n->group_idx < RE_MAX_GROUPS) {
+		if (n->group_idx >= 0 && n->group_idx < st->cap_count) {
 			old = st->cap_end[n->group_idx];
 			st->cap_end[n->group_idx] = (int)pos;
 		}
 		if (re_run_cont(st, pos, cont, out_end)) return 1;
-		if (n->group_idx < RE_MAX_GROUPS) st->cap_end[n->group_idx] = old;
+		if (n->group_idx >= 0 && n->group_idx < st->cap_count) st->cap_end[n->group_idx] = old;
 		return 0;
 	}
 	case RE_BACKREF: {
 		int gi = n->group_idx;
-		if (gi >= RE_MAX_GROUPS || st->cap_start[gi] < 0 || st->cap_end[gi] < 0)
+		if (gi < 0 || gi >= st->cap_count || st->cap_start[gi] < 0 || st->cap_end[gi] < 0)
 			return re_run_cont(st, pos, cont, out_end);
 		int glen = st->cap_end[gi] - st->cap_start[gi];
 		if (pos + (size_t)glen > st->slen) return 0;
@@ -1969,15 +2018,24 @@ static int re_match_node_inner(re_state_t *st, const re_node_t *n, size_t pos,
 		return re_run_cont(st, pos, cont, out_end);
 	}
 	case RE_ALT: {
-		int saved_s[RE_MAX_GROUPS], saved_e[RE_MAX_GROUPS];
-		memcpy(saved_s, st->cap_start, sizeof(saved_s));
-		memcpy(saved_e, st->cap_end, sizeof(saved_e));
+		int *saved = (st->cap_count > 0) ? (int *)malloc((size_t)st->cap_count * 2u * sizeof(int)) : NULL;
+		if (st->cap_count > 0 && !saved) return 0;
+		if (saved) {
+			memcpy(saved, st->cap_start, (size_t)st->cap_count * sizeof(int));
+			memcpy(saved + st->cap_count, st->cap_end, (size_t)st->cap_count * sizeof(int));
+		}
 		for (size_t i = 0; i < n->branch_len; i++) {
 			re_cont_t sub = { &n->branches[i], 0, cont };
-			if (re_run_cont(st, pos, &sub, out_end)) return 1;
-			memcpy(st->cap_start, saved_s, sizeof(saved_s));
-			memcpy(st->cap_end, saved_e, sizeof(saved_e));
+			if (re_run_cont(st, pos, &sub, out_end)) {
+				free(saved);
+				return 1;
+			}
+			if (saved) {
+				memcpy(st->cap_start, saved, (size_t)st->cap_count * sizeof(int));
+				memcpy(st->cap_end, saved + st->cap_count, (size_t)st->cap_count * sizeof(int));
+			}
 		}
+		free(saved);
 		return 0;
 	}
 	case RE_REPEAT:
@@ -1988,22 +2046,27 @@ static int re_match_node_inner(re_state_t *st, const re_node_t *n, size_t pos,
 
 static int re_exec_at(re_prog_t *prog, const char *s, size_t slen, size_t start_pos,
                       re_state_t *st_out, size_t *match_start, size_t *match_end) {
-	re_state_t st;
-	st.s = s;
-	st.slen = slen;
-	st.flags = prog->flags;
-	st.steps = 0;
+	re_state_t local_st;
+	re_state_t *st = st_out ? st_out : &local_st;
+	if (!st_out && !re_state_init(st, prog->num_groups + 1)) return 0;
+	st->s = s;
+	st->slen = slen;
+	st->flags = prog->flags;
+	st->steps = 0;
+	st->depth = 0;
+	int found = 0;
 	for (size_t p = start_pos; p <= slen; p++) {
-		for (int i = 0; i < RE_MAX_GROUPS; i++) { st.cap_start[i] = -1; st.cap_end[i] = -1; }
+		for (int i = 0; i < st->cap_count; i++) { st->cap_start[i] = -1; st->cap_end[i] = -1; }
 		size_t end_p = 0;
-		if (re_match_node(&st, prog->root, p, NULL, &end_p)) {
+		if (re_match_node(st, prog->root, p, NULL, &end_p)) {
 			*match_start = p;
 			*match_end = end_p;
-			if (st_out) *st_out = st;
-			return 1;
+			found = 1;
+			break;
 		}
 	}
-	return 0;
+	if (!st_out) re_state_free(&local_st);
+	return found;
 }
 
 static uint8_t parse_re_flags(const char *fs) {
@@ -2091,11 +2154,12 @@ typedef struct {
 	js_tok_t cur;
 	js_tok_kind_t prev_kind;
 	int had_error;
-	char err_msg[256];
+	char *err_msg;
 
 	/* Track template brace nesting depths so `}` inside ${ ... } resumes template string */
-	int tmpl_depths[32];
+	int *tmpl_depths;
 	int tmpl_top;
+	int tmpl_cap;
 	int brace_depth;
 	int parse_depth;
 
@@ -2119,13 +2183,26 @@ static ipo_js_ast_t *ast_new(js_parser_t *ps, js_ast_kind_t k, int line, int col
 static void parse_error(js_parser_t *ps, const char *fmt, ...) {
 	if (ps->had_error) return;
 	ps->had_error = 1;
-	va_list ap;
-	char msg[192];
+	va_list ap, ap2;
 	va_start(ap, fmt);
-	vsnprintf(msg, sizeof(msg), fmt, ap);
+	va_copy(ap2, ap);
+	int mlen = vsnprintf(NULL, 0, fmt, ap);
 	va_end(ap);
-	snprintf(ps->err_msg, sizeof(ps->err_msg), "%s:%d:%d: %s",
-	         ps->filename ? ps->filename : "<script>", ps->cur.line, ps->cur.col, msg);
+	char *msg = (mlen >= 0) ? (char *)malloc((size_t)mlen + 1u) : NULL;
+	if (msg) vsnprintf(msg, (size_t)mlen + 1u, fmt, ap2);
+	va_end(ap2);
+	const char *fname = ps->filename ? ps->filename : "<script>";
+	const char *mtxt = msg ? msg : "";
+	int total = snprintf(NULL, 0, "%s:%d:%d: %s", fname, ps->cur.line, ps->cur.col, mtxt);
+	if (total >= 0) {
+		free(ps->err_msg);
+		ps->err_msg = (char *)malloc((size_t)total + 1u);
+		if (ps->err_msg) {
+			snprintf(ps->err_msg, (size_t)total + 1u, "%s:%d:%d: %s",
+			         fname, ps->cur.line, ps->cur.col, mtxt);
+		}
+	}
+	free(msg);
 }
 
 static int lex_allows_regex(js_tok_kind_t pk) {
@@ -2290,7 +2367,17 @@ static void lex_scan_template(js_parser_t *ps, int is_head) {
 			ps->cur.kind = is_head ? TOK_TMPL_HEAD : TOK_TMPL_MID;
 			ps->cur.text = b.data ? b.data : xstrdup_n("", 0);
 			ps->cur.text_len = b.len;
-			if (ps->tmpl_top < 32) ps->tmpl_depths[ps->tmpl_top++] = ps->brace_depth;
+			if (ps->tmpl_top >= ps->tmpl_cap) {
+				int ncap = ps->tmpl_cap ? ps->tmpl_cap * 2 : 32;
+				if (ncap > ps->tmpl_cap) {
+					int *arr = (int *)realloc(ps->tmpl_depths, (size_t)ncap * sizeof(int));
+					if (arr) {
+						ps->tmpl_depths = arr;
+						ps->tmpl_cap = ncap;
+					}
+				}
+			}
+			if (ps->tmpl_top < ps->tmpl_cap) ps->tmpl_depths[ps->tmpl_top++] = ps->brace_depth;
 			ps->brace_depth++;
 			return;
 		}
@@ -2396,7 +2483,7 @@ static void lex_next(js_parser_t *ps) {
 	char c = *ps->p;
 
 	/* Template literal middle/tail continuation after '}' */
-	if (c == '}' && ps->tmpl_top > 0 && ps->brace_depth - 1 == ps->tmpl_depths[ps->tmpl_top - 1]) {
+	if (c == '}' && ps->tmpl_top > 0 && ps->tmpl_cap > 0 && ps->brace_depth - 1 == ps->tmpl_depths[ps->tmpl_top - 1]) {
 		ps->p++;
 		ps->brace_depth--;
 		ps->tmpl_top--;
@@ -2450,6 +2537,7 @@ static void lex_next(js_parser_t *ps) {
 				val = val * (uint64_t)base + (uint64_t)dv;
 				ps->p++;
 			}
+			if (ps->p < ps->end && *ps->p == 'n') ps->p++;
 			ps->cur.kind = TOK_NUM;
 			ps->cur.num = (double)val;
 			return;
@@ -2460,7 +2548,9 @@ static void lex_next(js_parser_t *ps) {
 			if (*ps->p != '_') jbuf_append_ch(&nb, *ps->p);
 			ps->p++;
 		}
+		int is_int_lit = 1;
 		if (ps->p < ps->end && *ps->p == '.') {
+			is_int_lit = 0;
 			jbuf_append_ch(&nb, '.');
 			ps->p++;
 			while (ps->p < ps->end && (isdigit((unsigned char)*ps->p) || *ps->p == '_')) {
@@ -2469,6 +2559,7 @@ static void lex_next(js_parser_t *ps) {
 			}
 		}
 		if (ps->p < ps->end && (*ps->p == 'e' || *ps->p == 'E')) {
+			is_int_lit = 0;
 			jbuf_append_ch(&nb, 'e');
 			ps->p++;
 			if (ps->p < ps->end && (*ps->p == '+' || *ps->p == '-')) jbuf_append_ch(&nb, *ps->p++);
@@ -2477,6 +2568,7 @@ static void lex_next(js_parser_t *ps) {
 				ps->p++;
 			}
 		}
+		if (is_int_lit && ps->p < ps->end && *ps->p == 'n') ps->p++;
 		ps->cur.kind = TOK_NUM;
 		ps->cur.num = nb.data ? strtod(nb.data, NULL) : 0.0;
 		jbuf_free(&nb);
@@ -2515,15 +2607,32 @@ static void lex_next(js_parser_t *ps) {
 		return;
 	}
 
-	/* Identifier or keyword */
-	if (is_ident_start((unsigned char)c)) {
-		const char *start = ps->p;
-		ps->p++;
-		while (ps->p < ps->end && is_ident_cont((unsigned char)*ps->p)) ps->p++;
-		size_t ilen = (size_t)(ps->p - start);
-		ps->cur.kind = check_keyword(start, ilen);
-		ps->cur.text = xstrdup_n(start, ilen);
-		ps->cur.text_len = ilen;
+	/* Private identifier (#name) or Identifier or keyword */
+	if ((c == '#' && ps->p + 1 < ps->end && is_ident_start((unsigned char)ps->p[1])) ||
+	    is_ident_start((unsigned char)c) ||
+	    (c == '\\' && ps->p + 1 < ps->end && ps->p[1] == 'u')) {
+		int is_priv = (c == '#');
+		if (is_priv) ps->p++;
+		js_buf_t ib;
+		jbuf_init(&ib);
+		if (is_priv) jbuf_append_ch(&ib, '#');
+		while (ps->p < ps->end) {
+			unsigned char ch = (unsigned char)*ps->p;
+			if ((ib.len == (size_t)(is_priv ? 1 : 0)) ? is_ident_start(ch) : is_ident_cont(ch)) {
+				jbuf_append_ch(&ib, (char)ch);
+				ps->p++;
+			} else if (ch == '\\' && ps->p + 1 < ps->end && ps->p[1] == 'u') {
+				ps->p++;
+				lex_scan_escape_clean(ps, &ib);
+			} else {
+				break;
+			}
+		}
+		const char *itxt = ib.data ? ib.data : "";
+		ps->cur.kind = is_priv ? TOK_IDENT : check_keyword(itxt, ib.len);
+		ps->cur.text = xstrdup_n(itxt, ib.len);
+		ps->cur.text_len = ib.len;
+		jbuf_free(&ib);
 		return;
 	}
 
@@ -2814,24 +2923,45 @@ static void parse_param_list(js_parser_t *ps, js_param_ast_t **out_p, size_t *ou
 	*out_n = len;
 }
 
+static const char *skip_ws_comments_ptr(const char *q, const char *end) {
+	while (q < end) {
+		if (*q == ' ' || *q == '\t' || *q == '\r' || *q == '\n') { q++; continue; }
+		if (q + 1 < end && q[0] == '/' && q[1] == '/') {
+			q += 2;
+			while (q < end && *q != '\n' && *q != '\r') q++;
+			continue;
+		}
+		if (q + 1 < end && q[0] == '/' && q[1] == '*') {
+			q += 2;
+			while (q + 1 < end && !(q[0] == '*' && q[1] == '/')) q++;
+			q = (q + 1 < end) ? (q + 2) : end;
+			continue;
+		}
+		break;
+	}
+	return q;
+}
+
 static int try_is_arrow_params(js_parser_t *ps) {
 	if (ps->cur.kind == TOK_IDENT && ps->p < ps->end) {
-		const char *q = ps->p;
-		while (q < ps->end && (*q == ' ' || *q == '\t')) q++;
+		const char *q = skip_ws_comments_ptr(ps->p, ps->end);
 		return (q + 1 < ps->end && q[0] == '=' && q[1] == '>');
 	}
 	if (ps->cur.kind == TOK_LPAREN) {
 		/* Scan matching ')' to check for '=>' without consuming tokens */
 		const char *q = ps->p;
 		int depth = 1;
+		int can_re = 1;
 		while (q < ps->end && depth > 0) {
 			char ch = *q++;
+			if (ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n') continue;
 			if (ch == '\'' || ch == '"' || ch == '`') {
 				while (q < ps->end && *q != ch) {
 					if (*q == '\\' && q + 1 < ps->end) q++;
 					q++;
 				}
 				if (q < ps->end) q++;
+				can_re = 0;
 				continue;
 			}
 			if (ch == '/' && q < ps->end && *q == '/') {
@@ -2844,11 +2974,29 @@ static int try_is_arrow_params(js_parser_t *ps) {
 				if (q + 1 < ps->end) q += 2;
 				continue;
 			}
-			if (ch == '(') depth++;
-			else if (ch == ')') depth--;
+			if (ch == '/' && can_re) {
+				int in_cls = 0;
+				while (q < ps->end && *q != '\n' && *q != '\r') {
+					char rc = *q++;
+					if (rc == '\\' && q < ps->end) { q++; continue; }
+					if (rc == '[') in_cls = 1;
+					else if (rc == ']') in_cls = 0;
+					else if (rc == '/' && !in_cls) break;
+				}
+				can_re = 0;
+				continue;
+			}
+			if (ch == '(') { depth++; can_re = 1; }
+			else if (ch == ')') { depth--; can_re = 0; }
+			else if (ch == ',' || ch == '=' || ch == '?' || ch == ':' || ch == '!' ||
+			         ch == '&' || ch == '|' || ch == '[' || ch == '{') {
+				can_re = 1;
+			} else {
+				can_re = 0;
+			}
 		}
 		if (depth != 0) return 0;
-		while (q < ps->end && (*q == ' ' || *q == '\t' || *q == '\r' || *q == '\n')) q++;
+		q = skip_ws_comments_ptr(q, ps->end);
 		return (q + 1 < ps->end && q[0] == '=' && q[1] == '>');
 	}
 	return 0;
@@ -3148,13 +3296,16 @@ static ipo_js_ast_t *parse_postfix_call(js_parser_t *ps, int allow_call) {
 		int ln = ps->cur.line, cl = ps->cur.col;
 		lex_next(ps);
 		if (ps->cur.kind == TOK_DOT) {
-			/* new.target not needed as full syntax; fallback */
+			lex_next(ps);
+			if (tok_is_ident_or_kw(ps->cur.kind)) lex_next(ps);
+			expr = ast_new(ps, AST_UNDEF, ln, cl);
+		} else {
+			ipo_js_ast_t *ctor = parse_postfix_call(ps, 0);
+			ipo_js_ast_t *nw = ast_new(ps, AST_NEW, ln, cl);
+			nw->u.call.callee = ctor;
+			if (ps->cur.kind == TOK_LPAREN) parse_arg_list(ps, &nw->u.call.args);
+			expr = nw;
 		}
-		ipo_js_ast_t *ctor = parse_postfix_call(ps, 0);
-		ipo_js_ast_t *nw = ast_new(ps, AST_NEW, ln, cl);
-		nw->u.call.callee = ctor;
-		if (ps->cur.kind == TOK_LPAREN) parse_arg_list(ps, &nw->u.call.args);
-		expr = nw;
 	} else {
 		expr = parse_primary(ps);
 	}
@@ -3507,27 +3658,29 @@ static ipo_js_ast_t *parse_class(js_parser_t *ps, int is_decl) {
 		js_class_elem_t *el = &cls->u.cls.elems[cls->u.cls.elem_len++];
 		memset(el, 0, sizeof(*el));
 		if (ps->cur.kind == TOK_IDENT && strcmp(ps->cur.text, "static") == 0) {
-			const char *q = ps->p;
-			while (q < ps->end && (*q == ' ' || *q == '\t')) q++;
-			if (*q != '(' && *q != '=') {
+			const char *q = skip_ws_comments_ptr(ps->p, ps->end);
+			if (q < ps->end && *q != '(' && *q != '=' && *q != ';' && *q != '}') {
 				el->is_static = 1;
 				lex_next(ps);
+				if (ps->cur.kind == TOK_LBRACE) {
+					el->kind = 3;
+					el->fn_ast = parse_block(ps);
+					continue;
+				}
 			}
 		}
 		int is_async_m = 0;
 		if (ps->cur.kind == TOK_ASYNC) {
-			const char *q = ps->p;
-			while (q < ps->end && (*q == ' ' || *q == '\t')) q++;
-			if (*q != '(') {
+			const char *q = skip_ws_comments_ptr(ps->p, ps->end);
+			if (q < ps->end && *q != '(' && *q != '=' && *q != ';' && *q != '}') {
 				is_async_m = 1;
 				lex_next(ps);
 			}
 		}
 		if (ps->cur.kind == TOK_IDENT &&
 		    (strcmp(ps->cur.text, "get") == 0 || strcmp(ps->cur.text, "set") == 0)) {
-			const char *q = ps->p;
-			while (q < ps->end && (*q == ' ' || *q == '\t')) q++;
-			if (*q != '(') {
+			const char *q = skip_ws_comments_ptr(ps->p, ps->end);
+			if (q < ps->end && *q != '(' && *q != '=' && *q != ';' && *q != '}') {
 				el->kind = (ps->cur.text[0] == 'g') ? 1 : 2;
 				lex_next(ps);
 			}
@@ -3536,18 +3689,33 @@ static ipo_js_ast_t *parse_class(js_parser_t *ps, int is_decl) {
 			lex_next(ps);
 			el->key_ast = parse_assign(ps);
 			expect(ps, TOK_RBRACK, "']'");
-		} else if (tok_is_ident_or_kw(ps->cur.kind) || ps->cur.kind == TOK_STR) {
-			el->name = xstrdup_n(ps->cur.text, ps->cur.text_len);
+		} else if (tok_is_ident_or_kw(ps->cur.kind) || ps->cur.kind == TOK_STR || ps->cur.kind == TOK_NUM) {
+			if (ps->cur.kind == TOK_NUM) {
+				char nb[32];
+				snprintf(nb, sizeof(nb), "%.15g", ps->cur.num);
+				el->name = xstrdup_n(nb, strlen(nb));
+			} else {
+				el->name = xstrdup_n(ps->cur.text, ps->cur.text_len);
+			}
 			lex_next(ps);
 		} else {
 			parse_error(ps, "Expected class member name");
 			break;
 		}
-		ipo_js_ast_t *fn = ast_new(ps, AST_FUNC, ps->cur.line, ps->cur.col);
-		fn->u.fn.is_async = is_async_m;
-		parse_param_list(ps, &fn->u.fn.params, &fn->u.fn.param_len);
-		fn->u.fn.body = parse_block(ps);
-		el->fn_ast = fn;
+		if (ps->cur.kind == TOK_LPAREN) {
+			ipo_js_ast_t *fn = ast_new(ps, AST_FUNC, ps->cur.line, ps->cur.col);
+			fn->u.fn.is_async = is_async_m;
+			parse_param_list(ps, &fn->u.fn.params, &fn->u.fn.param_len);
+			fn->u.fn.body = parse_block(ps);
+			el->fn_ast = fn;
+		} else {
+			el->kind = 4; /* instance/static class field */
+			if (ps->cur.kind == TOK_ASSIGN) {
+				lex_next(ps);
+				el->fn_ast = parse_assign(ps);
+			}
+			if (ps->cur.kind == TOK_SEMI) lex_next(ps);
+		}
 	}
 	expect(ps, TOK_RBRACE, "'}'");
 	return cls;
@@ -3863,11 +4031,15 @@ static js_ast_pool_t *parse_program(ipo_js_vm_t *vm, const char *code, size_t le
 	free(ps.cur.extra);
 
 	if (ps.had_error) {
-		ipo_js_throw_msg(vm, "SyntaxError", "%s", ps.err_msg);
+		ipo_js_throw_msg(vm, "SyntaxError", "%s", ps.err_msg ? ps.err_msg : "Syntax error");
+		free(ps.err_msg);
+		free(ps.tmpl_depths);
 		free_ast_pool(ps.pool);
 		*out_root = NULL;
 		return NULL;
 	}
+	free(ps.err_msg);
+	free(ps.tmpl_depths);
 	*out_root = prog;
 	return ps.pool;
 }
@@ -4068,7 +4240,7 @@ static void bind_or_assign_pattern(ipo_js_vm_t *vm, ipo_js_env_t *env, ipo_js_as
 		if (pat->u.mem.computed) {
 			ipo_js_val_t kv = vm_eval_expr(vm, env, pat->u.mem.prop_expr);
 			if (vm->sig != SIG_NONE) { ipo_js_gc_pop_roots(vm, top); return; }
-			const char *k = ipo_js_cstr(vm, kv, NULL);
+			const char *k = js_val_to_prop_key(vm, kv);
 			vm_set_prop_val(vm, obj, k, val);
 		} else {
 			vm_set_prop_val(vm, obj, pat->u.mem.prop_name, val);
@@ -4171,7 +4343,7 @@ static ipo_js_val_t read_lvalue(ipo_js_vm_t *vm, ipo_js_env_t *env, ipo_js_ast_t
 		if (lhs->u.mem.computed) {
 			ipo_js_val_t kv = vm_eval_expr(vm, env, lhs->u.mem.prop_expr);
 			if (vm->sig != SIG_NONE) return ipo_js_undef();
-			k = ipo_js_cstr(vm, kv, NULL);
+			k = js_val_to_prop_key(vm, kv);
 		}
 		ipo_js_val_t out = ipo_js_undef();
 		vm_get_prop_val(vm, obj, k, &out);
@@ -4278,12 +4450,11 @@ static void eval_arg_list(ipo_js_vm_t *vm, ipo_js_env_t *env, const js_ast_list_
 		if (a->kind == AST_SPREAD) {
 			ipo_js_val_t sv = vm_eval_expr(vm, env, a->u.spread.arg);
 			if (vm->sig != SIG_NONE) { free(argv); *out_argv = NULL; *out_argc = 0; return; }
-			if (sv.type == JS_T_OBJECT && sv.u.obj && sv.u.obj->kind == JS_OBJ_ARRAY) {
-				for (size_t j = 0; j < sv.u.obj->u.arr.len; j++) {
-					if (argc >= cap) { cap *= 2; argv = (ipo_js_val_t *)xrealloc(argv, (size_t)cap * sizeof(ipo_js_val_t)); }
-					argv[argc++] = sv.u.obj->u.arr.items[j];
-					ipo_js_gc_push_root(vm, argv[argc - 1]);
-				}
+			ipo_js_obj_t *col = js_collect_iterable(vm, sv);
+			for (size_t j = 0; j < col->u.arr.len; j++) {
+				if (argc >= cap) { cap *= 2; argv = (ipo_js_val_t *)xrealloc(argv, (size_t)cap * sizeof(ipo_js_val_t)); }
+				argv[argc++] = col->u.arr.items[j];
+				ipo_js_gc_push_root(vm, argv[argc - 1]);
 			}
 		} else {
 			ipo_js_val_t v = vm_eval_expr(vm, env, a);
@@ -4426,6 +4597,43 @@ static ipo_js_val_t vm_call_obj(ipo_js_vm_t *vm, ipo_js_val_t callee, ipo_js_val
 	return ret;
 }
 
+static void vm_init_class_fields(ipo_js_vm_t *vm, ipo_js_obj_t *inst, ipo_js_obj_t *ctor) {
+	ipo_js_obj_t **chain = NULL;
+	int depth = 0, cap = 0;
+	for (ipo_js_obj_t *c = ctor; c && c->kind == JS_OBJ_FUNCTION; c = c->proto) {
+		if (c->u.fn.cls_ast) {
+			if (depth >= cap) {
+				int ncap = cap ? cap * 2 : 16;
+				if (ncap <= cap) break;
+				chain = (ipo_js_obj_t **)xrealloc(chain, (size_t)ncap * sizeof(ipo_js_obj_t *));
+				cap = ncap;
+			}
+			chain[depth++] = c;
+		}
+	}
+	for (int d = depth - 1; d >= 0; d--) {
+		ipo_js_ast_t *cls = chain[d]->u.fn.cls_ast;
+		ipo_js_env_t *fenv = vm_alloc_env(vm, chain[d]->u.fn.closure ? chain[d]->u.fn.closure : vm->global_env);
+		fenv->has_this = 1;
+		fenv->this_val = ipo_js_obj_val(inst);
+		for (size_t i = 0; i < cls->u.cls.elem_len; i++) {
+			js_class_elem_t *el = &cls->u.cls.elems[i];
+			if (el->is_static || el->kind != 4) continue;
+			const char *kname = el->name;
+			if (!kname && el->key_ast) {
+				ipo_js_val_t kv = vm_eval_expr(vm, fenv, el->key_ast);
+				if (vm->sig != SIG_NONE) { free(chain); return; }
+				kname = ipo_js_cstr(vm, kv, NULL);
+			}
+			if (!kname) continue;
+			ipo_js_val_t fv = el->fn_ast ? vm_eval_expr(vm, fenv, el->fn_ast) : ipo_js_undef();
+			if (vm->sig != SIG_NONE) { free(chain); return; }
+			ipo_js_set_prop(vm, inst, kname, fv);
+		}
+	}
+	free(chain);
+}
+
 static ipo_js_val_t vm_construct_obj(ipo_js_vm_t *vm, ipo_js_val_t ctor,
                                      int argc, const ipo_js_val_t *argv) {
 	if (!ipo_js_is_callable(ctor)) {
@@ -4448,6 +4656,8 @@ static ipo_js_val_t vm_construct_obj(ipo_js_vm_t *vm, ipo_js_val_t ctor,
 	ipo_js_obj_t *proto = (pv.type == JS_T_OBJECT && pv.u.obj) ? pv.u.obj : vm->obj_proto;
 	ipo_js_obj_t *inst = ipo_js_new_object(vm, proto);
 	size_t top = ipo_js_gc_push_root(vm, ipo_js_obj_val(inst));
+	vm_init_class_fields(vm, inst, fn);
+	if (vm->sig != SIG_NONE) { ipo_js_gc_pop_roots(vm, top); return ipo_js_undef(); }
 	ipo_js_val_t r = vm_call_obj(vm, ctor, ipo_js_obj_val(inst), argc, argv, proto->proto);
 	ipo_js_gc_pop_roots(vm, top);
 	if (vm->sig != SIG_NONE) return ipo_js_undef();
@@ -4505,14 +4715,28 @@ static ipo_js_val_t eval_class_node(ipo_js_vm_t *vm, ipo_js_env_t *env, ipo_js_a
 		ctor_obj->u.fn.name = vm_alloc_str(vm, cls->u.cls.name ? cls->u.cls.name : "",
 		                                   cls->u.cls.name ? strlen(cls->u.cls.name) : 0);
 	}
+	ctor_obj->u.fn.cls_ast = cls;
 	if (super_ctor) ctor_obj->proto = super_ctor;
 	ipo_js_set_prop(vm, ctor_obj, "prototype", ipo_js_obj_val(proto));
 	ipo_js_set_prop(vm, proto, "constructor", ipo_js_obj_val(ctor_obj));
 	ipo_js_gc_push_root(vm, ipo_js_obj_val(ctor_obj));
+	if (cls->u.cls.is_decl && cls->u.cls.name) {
+		env_def(vm, env, cls->u.cls.name, ipo_js_obj_val(ctor_obj), 0);
+	}
 
 	for (size_t i = 0; i < cls->u.cls.elem_len; i++) {
 		js_class_elem_t *el = &cls->u.cls.elems[i];
 		if (!el->is_static && el->kind == 0 && el->name && strcmp(el->name, "constructor") == 0) continue;
+		if (el->kind == 3) {
+			ipo_js_env_t *sb_env = vm_alloc_env(vm, env);
+			sb_env->is_func_scope = 1;
+			sb_env->has_this = 1;
+			sb_env->this_val = ipo_js_obj_val(ctor_obj);
+			vm_exec_stmt(vm, sb_env, el->fn_ast);
+			if (vm->sig != SIG_NONE) break;
+			continue;
+		}
+		if (el->kind == 4 && !el->is_static) continue;
 		const char *kname = el->name;
 		if (!kname && el->key_ast) {
 			ipo_js_val_t kv = vm_eval_expr(vm, env, el->key_ast);
@@ -4520,6 +4744,15 @@ static ipo_js_val_t eval_class_node(ipo_js_vm_t *vm, ipo_js_env_t *env, ipo_js_a
 			kname = ipo_js_cstr(vm, kv, NULL);
 		}
 		if (!kname) continue;
+		if (el->kind == 4) {
+			ipo_js_env_t *sf_env = vm_alloc_env(vm, env);
+			sf_env->has_this = 1;
+			sf_env->this_val = ipo_js_obj_val(ctor_obj);
+			ipo_js_val_t fv = el->fn_ast ? vm_eval_expr(vm, sf_env, el->fn_ast) : ipo_js_undef();
+			if (vm->sig != SIG_NONE) break;
+			ipo_js_set_prop(vm, ctor_obj, kname, fv);
+			continue;
+		}
 		ipo_js_obj_t *mfn = vm_new_js_fn(vm, el->fn_ast, env);
 		ipo_js_obj_t *dst = el->is_static ? ctor_obj : proto;
 		if (el->kind == 1) obj_define_accessor(vm, dst, kname, mfn, NULL);
@@ -4527,9 +4760,6 @@ static ipo_js_val_t eval_class_node(ipo_js_vm_t *vm, ipo_js_env_t *env, ipo_js_a
 		else ipo_js_set_prop(vm, dst, kname, ipo_js_obj_val(mfn));
 	}
 
-	if (cls->u.cls.is_decl && cls->u.cls.name) {
-		env_def(vm, env, cls->u.cls.name, ipo_js_obj_val(ctor_obj), 0);
-	}
 	ipo_js_gc_pop_roots(vm, top);
 	return ipo_js_obj_val(ctor_obj);
 }
@@ -4610,10 +4840,10 @@ static ipo_js_val_t vm_eval_expr_inner(ipo_js_vm_t *vm, ipo_js_env_t *env, ipo_j
 			if (item->kind == AST_SPREAD) {
 				ipo_js_val_t sv = vm_eval_expr(vm, env, item->u.spread.arg);
 				if (vm->sig != SIG_NONE) break;
-				if (sv.type == JS_T_OBJECT && sv.u.obj && sv.u.obj->kind == JS_OBJ_ARRAY) {
-					for (size_t j = 0; j < sv.u.obj->u.arr.len; j++)
-						ipo_js_arr_push(vm, arr, sv.u.obj->u.arr.items[j]);
-				}
+				ipo_js_obj_t *col = js_collect_iterable(vm, sv);
+				ipo_js_gc_push_root(vm, ipo_js_obj_val(col));
+				for (size_t j = 0; j < col->u.arr.len; j++)
+					ipo_js_arr_push(vm, arr, col->u.arr.items[j]);
 			} else {
 				ipo_js_val_t v = vm_eval_expr(vm, env, item);
 				if (vm->sig != SIG_NONE) break;
@@ -4645,7 +4875,7 @@ static ipo_js_val_t vm_eval_expr_inner(ipo_js_vm_t *vm, ipo_js_env_t *env, ipo_j
 				kroot = vm_eval_expr(vm, env, pr->key_ast);
 				if (vm->sig != SIG_NONE) break;
 				ipo_js_gc_push_root(vm, kroot);
-				kname = ipo_js_cstr(vm, kroot, NULL);
+				kname = js_val_to_prop_key(vm, kroot);
 			}
 			ipo_js_val_t val = vm_eval_expr(vm, env, pr->val);
 			if (vm->sig != SIG_NONE) break;
@@ -4671,7 +4901,7 @@ static ipo_js_val_t vm_eval_expr_inner(ipo_js_vm_t *vm, ipo_js_env_t *env, ipo_j
 		if (ast->u.mem.computed) {
 			ipo_js_val_t kv = vm_eval_expr(vm, env, ast->u.mem.prop_expr);
 			if (vm->sig != SIG_NONE) return ipo_js_undef();
-			k = ipo_js_cstr(vm, kv, NULL);
+			k = js_val_to_prop_key(vm, kv);
 		}
 		ipo_js_val_t out = ipo_js_undef();
 		vm_get_prop_val(vm, obj, k, &out);
@@ -4712,7 +4942,7 @@ static ipo_js_val_t vm_eval_expr_inner(ipo_js_vm_t *vm, ipo_js_env_t *env, ipo_j
 				if (m->u.mem.computed) {
 					ipo_js_val_t kv = vm_eval_expr(vm, env, m->u.mem.prop_expr);
 					if (vm->sig != SIG_NONE) { ipo_js_gc_pop_roots(vm, top); return ipo_js_undef(); }
-					k = ipo_js_cstr(vm, kv, NULL);
+					k = js_val_to_prop_key(vm, kv);
 				}
 				vm_get_prop_val(vm, this_val, k, &callee);
 			}
@@ -4760,7 +4990,7 @@ static ipo_js_val_t vm_eval_expr_inner(ipo_js_vm_t *vm, ipo_js_env_t *env, ipo_j
 				case JS_T_BOOL:      return ipo_js_str_cstr(vm, "boolean");
 				case JS_T_NUMBER:    return ipo_js_str_cstr(vm, "number");
 				case JS_T_STRING:    return ipo_js_str_cstr(vm, "string");
-				case JS_T_OBJECT:    return ipo_js_str_cstr(vm, ipo_js_is_callable(v) ? "function" : "object");
+				case JS_T_OBJECT:    return ipo_js_str_cstr(vm, (v.u.obj && v.u.obj->host_tag == JS_HTAG_SYM) ? "symbol" : (ipo_js_is_callable(v) ? "function" : "object"));
 				}
 			}
 			ipo_js_val_t v = vm_eval_expr(vm, env, ast->u.unary.arg);
@@ -4771,7 +5001,7 @@ static ipo_js_val_t vm_eval_expr_inner(ipo_js_vm_t *vm, ipo_js_env_t *env, ipo_j
 			case JS_T_BOOL:      return ipo_js_str_cstr(vm, "boolean");
 			case JS_T_NUMBER:    return ipo_js_str_cstr(vm, "number");
 			case JS_T_STRING:    return ipo_js_str_cstr(vm, "string");
-			case JS_T_OBJECT:    return ipo_js_str_cstr(vm, ipo_js_is_callable(v) ? "function" : "object");
+			case JS_T_OBJECT:    return ipo_js_str_cstr(vm, (v.u.obj && v.u.obj->host_tag == JS_HTAG_SYM) ? "symbol" : (ipo_js_is_callable(v) ? "function" : "object"));
 			}
 		}
 		if (op == TOK_DELETE) {
@@ -4839,7 +5069,9 @@ static ipo_js_val_t vm_eval_expr_inner(ipo_js_vm_t *vm, ipo_js_env_t *env, ipo_j
 			return vm_eval_expr(vm, env, ast->u.bin.right);
 		}
 		size_t top = ipo_js_gc_push_root(vm, ipo_js_undef());
-		ipo_js_val_t l = vm_eval_expr(vm, env, ast->u.bin.left);
+		ipo_js_val_t l = (op == TOK_IN && ast->u.bin.left->kind == AST_IDENT && ast->u.bin.left->u.ident.name[0] == '#')
+		                     ? ipo_js_str_cstr(vm, ast->u.bin.left->u.ident.name)
+		                     : vm_eval_expr(vm, env, ast->u.bin.left);
 		if (vm->sig != SIG_NONE) { ipo_js_gc_pop_roots(vm, top); return ipo_js_undef(); }
 		ipo_js_gc_push_root(vm, l);
 		ipo_js_val_t r = vm_eval_expr(vm, env, ast->u.bin.right);
@@ -5072,26 +5304,8 @@ static ipo_js_val_t vm_exec_stmt_inner(ipo_js_vm_t *vm, ipo_js_env_t *env, ipo_j
 				}
 			}
 		} else {
-			if (rhs.type == JS_T_STRING && rhs.u.str) {
-				for (size_t i = 0; i < rhs.u.str->len; i++)
-					ipo_js_arr_push(vm, items, ipo_js_str_new(vm, &rhs.u.str->data[i], 1));
-			} else if (rhs.type == JS_T_OBJECT && rhs.u.obj) {
-				if (rhs.u.obj->kind == JS_OBJ_ARRAY) {
-					for (size_t i = 0; i < rhs.u.obj->u.arr.len; i++)
-						ipo_js_arr_push(vm, items, rhs.u.obj->u.arr.items[i]);
-				} else {
-					ipo_js_val_t lv = ipo_js_undef();
-					if (ipo_js_get_prop(vm, rhs.u.obj, "length", &lv) && lv.type == JS_T_NUMBER) {
-						size_t n = (size_t)lv.u.num;
-						for (size_t i = 0; i < n; i++) {
-							char nb[24]; snprintf(nb, sizeof(nb), "%lu", (unsigned long)i);
-							ipo_js_val_t ev = ipo_js_undef();
-							ipo_js_get_prop(vm, rhs.u.obj, nb, &ev);
-							ipo_js_arr_push(vm, items, ev);
-						}
-					}
-				}
-			}
+			items = js_collect_iterable(vm, rhs);
+			ipo_js_gc_push_root(vm, ipo_js_obj_val(items));
 		}
 
 		for (size_t i = 0; i < items->u.arr.len; i++) {
@@ -5457,7 +5671,6 @@ static void json_escape_str(js_buf_t *b, const char *s, size_t len) {
 
 static void json_stringify_rec(ipo_js_vm_t *vm, js_buf_t *b, ipo_js_val_t v, int indent, int depth,
                                ipo_js_obj_t **seen, int seen_n) {
-	if (depth > 64) { jbuf_append_cstr(b, "null"); return; }
 	switch (v.type) {
 	case JS_T_NULL:      jbuf_append_cstr(b, "null"); return;
 	case JS_T_UNDEFINED: jbuf_append_cstr(b, "null"); return;
@@ -5479,11 +5692,13 @@ static void json_stringify_rec(ipo_js_vm_t *vm, js_buf_t *b, ipo_js_val_t v, int
 		for (int i = 0; i < seen_n; i++) {
 			if (seen[i] == o) { jbuf_append_cstr(b, "null"); return; }
 		}
-		ipo_js_obj_t *nseen[64];
-		if (seen_n < 64) {
-			if (seen_n > 0) memcpy(nseen, seen, (size_t)seen_n * sizeof(ipo_js_obj_t *));
-			nseen[seen_n] = o;
+		if ((size_t)seen_n >= SIZE_MAX / sizeof(ipo_js_obj_t *)) {
+			jbuf_append_cstr(b, "null");
+			return;
 		}
+		ipo_js_obj_t **nseen = (ipo_js_obj_t **)xmalloc((size_t)(seen_n + 1) * sizeof(ipo_js_obj_t *));
+		if (seen_n > 0) memcpy(nseen, seen, (size_t)seen_n * sizeof(ipo_js_obj_t *));
+		nseen[seen_n] = o;
 		if (o->kind == JS_OBJ_ARRAY) {
 			jbuf_append_ch(b, '[');
 			for (size_t i = 0; i < o->u.arr.len; i++) {
@@ -5499,6 +5714,7 @@ static void json_stringify_rec(ipo_js_vm_t *vm, js_buf_t *b, ipo_js_val_t v, int
 				for (int k = 0; k < depth * indent; k++) jbuf_append_ch(b, ' ');
 			}
 			jbuf_append_ch(b, ']');
+			free(nseen);
 			return;
 		}
 		jbuf_append_ch(b, '{');
@@ -5524,6 +5740,7 @@ static void json_stringify_rec(ipo_js_vm_t *vm, js_buf_t *b, ipo_js_val_t v, int
 			for (int k = 0; k < depth * indent; k++) jbuf_append_ch(b, ' ');
 		}
 		jbuf_append_ch(b, '}');
+		free(nseen);
 		return;
 	}
 	}
@@ -5774,6 +5991,56 @@ static ipo_js_val_t js_obj_keys_vals_entries(ipo_js_vm_t *vm, ipo_js_val_t tv,
 	return ipo_js_obj_val(arr);
 }
 
+static ipo_js_val_t js_obj_from_entries(ipo_js_vm_t *vm, ipo_js_val_t tv, int argc, const ipo_js_val_t *argv, void *ud) {
+	(void)tv; (void)ud;
+	ipo_js_obj_t *out = ipo_js_new_object(vm, vm->obj_proto);
+	if (argc < 1) return ipo_js_obj_val(out);
+	size_t top = ipo_js_gc_push_root(vm, ipo_js_obj_val(out));
+	ipo_js_obj_t *arr = js_collect_iterable(vm, argv[0]);
+	ipo_js_gc_push_root(vm, ipo_js_obj_val(arr));
+	for (size_t i = 0; i < arr->u.arr.len; i++) {
+		ipo_js_val_t pair = arr->u.arr.items[i];
+		if (pair.type == JS_T_OBJECT && pair.u.obj) {
+			ipo_js_val_t k = ipo_js_undef(), v = ipo_js_undef();
+			ipo_js_get_prop(vm, pair.u.obj, "0", &k);
+			ipo_js_get_prop(vm, pair.u.obj, "1", &v);
+			ipo_js_set_prop(vm, out, ipo_js_cstr(vm, k, NULL), v);
+		}
+	}
+	ipo_js_gc_pop_roots(vm, top);
+	return ipo_js_obj_val(out);
+}
+
+static ipo_js_val_t js_obj_get_proto(ipo_js_vm_t *vm, ipo_js_val_t tv, int argc, const ipo_js_val_t *argv, void *ud) {
+	(void)vm; (void)tv; (void)ud;
+	if (argc < 1 || argv[0].type != JS_T_OBJECT || !argv[0].u.obj) return ipo_js_null();
+	return ipo_js_obj_val(argv[0].u.obj->proto);
+}
+
+static ipo_js_val_t js_obj_set_proto(ipo_js_vm_t *vm, ipo_js_val_t tv, int argc, const ipo_js_val_t *argv, void *ud) {
+	(void)vm; (void)tv; (void)ud;
+	if (argc >= 2 && argv[0].type == JS_T_OBJECT && argv[0].u.obj) {
+		argv[0].u.obj->proto = (argv[1].type == JS_T_OBJECT) ? argv[1].u.obj : NULL;
+		return argv[0];
+	}
+	return argc >= 1 ? argv[0] : ipo_js_undef();
+}
+
+static ipo_js_val_t js_obj_freeze_id(ipo_js_vm_t *vm, ipo_js_val_t tv, int argc, const ipo_js_val_t *argv, void *ud) {
+	(void)vm; (void)tv; (void)ud;
+	return argc >= 1 ? argv[0] : ipo_js_undef();
+}
+
+static ipo_js_val_t js_obj_is(ipo_js_vm_t *vm, ipo_js_val_t tv, int argc, const ipo_js_val_t *argv, void *ud) {
+	(void)vm; (void)tv; (void)ud;
+	ipo_js_val_t a = argc >= 1 ? argv[0] : ipo_js_undef();
+	ipo_js_val_t b = argc >= 2 ? argv[1] : ipo_js_undef();
+	if (a.type == JS_T_NUMBER && b.type == JS_T_NUMBER && isnan(a.u.num) && isnan(b.u.num)) return ipo_js_bool(1);
+	if (a.type == JS_T_NUMBER && b.type == JS_T_NUMBER && a.u.num == 0.0 && b.u.num == 0.0)
+		return ipo_js_bool((1.0 / a.u.num) == (1.0 / b.u.num));
+	return ipo_js_bool(js_strict_eq(a, b));
+}
+
 static ipo_js_val_t js_obj_assign(ipo_js_vm_t *vm, ipo_js_val_t tv, int argc, const ipo_js_val_t *argv, void *ud) {
 	(void)tv; (void)ud;
 	if (argc < 1 || argv[0].type != JS_T_OBJECT || !argv[0].u.obj) return ipo_js_undef();
@@ -5840,9 +6107,16 @@ static ipo_js_val_t js_obj_to_str(ipo_js_vm_t *vm, ipo_js_val_t tv, int argc, co
 			ipo_js_val_t n = ipo_js_undef(), m = ipo_js_undef();
 			ipo_js_get_prop(vm, tv.u.obj, "name", &n);
 			ipo_js_get_prop(vm, tv.u.obj, "message", &m);
-			char buf[256];
-			snprintf(buf, sizeof(buf), "%s: %s", ipo_js_cstr(vm, n, NULL), ipo_js_cstr(vm, m, NULL));
-			return ipo_js_str_cstr(vm, buf);
+			size_t nl = 0, ml = 0;
+			const char *ns = ipo_js_cstr(vm, n, &nl);
+			const char *ms = ipo_js_cstr(vm, m, &ml);
+			js_buf_t b; jbuf_init(&b);
+			jbuf_append(&b, ns, nl);
+			jbuf_append_cstr(&b, ": ");
+			jbuf_append(&b, ms, ml);
+			ipo_js_val_t r = ipo_js_str_new(vm, b.data ? b.data : "", b.len);
+			jbuf_free(&b);
+			return r;
 		}
 	}
 	return ipo_js_str_cstr(vm, "[object Object]");
@@ -5871,32 +6145,64 @@ static ipo_js_val_t js_arr_from(ipo_js_vm_t *vm, ipo_js_val_t tv, int argc, cons
 	if (argc < 1) return ipo_js_obj_val(res);
 	ipo_js_val_t map_fn = (argc >= 2 && ipo_js_is_callable(argv[1])) ? argv[1] : ipo_js_undef();
 	size_t top = ipo_js_gc_push_root(vm, ipo_js_obj_val(res));
-	if (argv[0].type == JS_T_STRING && argv[0].u.str) {
-		for (size_t i = 0; i < argv[0].u.str->len; i++) {
-			ipo_js_val_t item = ipo_js_str_new(vm, &argv[0].u.str->data[i], 1);
-			if (!ipo_js_is_callable(map_fn)) ipo_js_arr_push(vm, res, item);
-			else {
-				ipo_js_val_t args[2] = { item, ipo_js_num((double)i) };
-				ipo_js_arr_push(vm, res, vm_call_obj(vm, map_fn, ipo_js_undef(), 2, args, NULL));
-			}
-		}
-	} else if (argv[0].type == JS_T_OBJECT && argv[0].u.obj) {
-		ipo_js_val_t lv = ipo_js_undef();
-		ipo_js_get_prop(vm, argv[0].u.obj, "length", &lv);
-		size_t n = lv.type == JS_T_NUMBER && lv.u.num > 0 ? (size_t)lv.u.num : 0;
-		for (size_t i = 0; i < n; i++) {
-			char nb[24]; snprintf(nb, sizeof(nb), "%lu", (unsigned long)i);
-			ipo_js_val_t item = ipo_js_undef();
-			ipo_js_get_prop(vm, argv[0].u.obj, nb, &item);
-			if (!ipo_js_is_callable(map_fn)) ipo_js_arr_push(vm, res, item);
-			else {
-				ipo_js_val_t args[2] = { item, ipo_js_num((double)i) };
-				ipo_js_arr_push(vm, res, vm_call_obj(vm, map_fn, ipo_js_undef(), 2, args, NULL));
-			}
+	ipo_js_obj_t *src = js_collect_iterable(vm, argv[0]);
+	ipo_js_gc_push_root(vm, ipo_js_obj_val(src));
+	for (size_t i = 0; i < src->u.arr.len; i++) {
+		ipo_js_val_t item = src->u.arr.items[i];
+		if (!ipo_js_is_callable(map_fn)) ipo_js_arr_push(vm, res, item);
+		else {
+			ipo_js_val_t args[2] = { item, ipo_js_num((double)i) };
+			ipo_js_arr_push(vm, res, vm_call_obj(vm, map_fn, ipo_js_undef(), 2, args, NULL));
 		}
 	}
 	ipo_js_gc_pop_roots(vm, top);
 	return ipo_js_obj_val(res);
+}
+
+static ipo_js_val_t js_arr_of(ipo_js_vm_t *vm, ipo_js_val_t tv, int argc, const ipo_js_val_t *argv, void *ud) {
+	(void)tv; (void)ud;
+	ipo_js_obj_t *res = ipo_js_new_array(vm, (size_t)argc);
+	for (int i = 0; i < argc; i++) res->u.arr.items[i] = argv[i];
+	return ipo_js_obj_val(res);
+}
+
+static ipo_js_val_t js_arr_at(ipo_js_vm_t *vm, ipo_js_val_t tv, int argc, const ipo_js_val_t *argv, void *ud) {
+	(void)ud;
+	if (tv.type != JS_T_OBJECT || !tv.u.obj || tv.u.obj->kind != JS_OBJ_ARRAY) return ipo_js_undef();
+	ipo_js_obj_t *a = tv.u.obj;
+	int64_t idx = (argc >= 1) ? (int64_t)ipo_js_to_i32(vm, argv[0]) : 0;
+	if (idx < 0) idx += (int64_t)a->u.arr.len;
+	if (idx < 0 || (size_t)idx >= a->u.arr.len) return ipo_js_undef();
+	return a->u.arr.items[(size_t)idx];
+}
+
+static size_t norm_idx(int32_t idx, size_t len);
+
+static ipo_js_val_t js_arr_fill(ipo_js_vm_t *vm, ipo_js_val_t tv, int argc, const ipo_js_val_t *argv, void *ud) {
+	(void)ud;
+	if (tv.type != JS_T_OBJECT || !tv.u.obj || tv.u.obj->kind != JS_OBJ_ARRAY) return tv;
+	ipo_js_obj_t *a = tv.u.obj;
+	ipo_js_val_t fv = argc >= 1 ? argv[0] : ipo_js_undef();
+	size_t s = (argc >= 2 && argv[1].type != JS_T_UNDEFINED) ? norm_idx(ipo_js_to_i32(vm, argv[1]), a->u.arr.len) : 0;
+	size_t e = (argc >= 3 && argv[2].type != JS_T_UNDEFINED) ? norm_idx(ipo_js_to_i32(vm, argv[2]), a->u.arr.len) : a->u.arr.len;
+	for (size_t i = s; i < e; i++) a->u.arr.items[i] = fv;
+	return tv;
+}
+
+static ipo_js_val_t js_arr_find_last(ipo_js_vm_t *vm, ipo_js_val_t tv, int argc, const ipo_js_val_t *argv, void *ud) {
+	int want_idx = (int)(intptr_t)ud;
+	if (tv.type != JS_T_OBJECT || !tv.u.obj || tv.u.obj->kind != JS_OBJ_ARRAY || argc < 1 || !ipo_js_is_callable(argv[0]))
+		return want_idx ? ipo_js_num(-1) : ipo_js_undef();
+	ipo_js_obj_t *a = tv.u.obj;
+	ipo_js_val_t this_arg = argc >= 2 ? argv[1] : ipo_js_undef();
+	for (size_t i = a->u.arr.len; i > 0; i--) {
+		size_t idx = i - 1;
+		ipo_js_val_t args[3] = { a->u.arr.items[idx], ipo_js_num((double)idx), tv };
+		ipo_js_val_t r = vm_call_obj(vm, argv[0], this_arg, 3, args, NULL);
+		if (vm->sig != SIG_NONE) return want_idx ? ipo_js_num(-1) : ipo_js_undef();
+		if (ipo_js_to_bool(r)) return want_idx ? ipo_js_num((double)idx) : a->u.arr.items[idx];
+	}
+	return want_idx ? ipo_js_num(-1) : ipo_js_undef();
 }
 
 static ipo_js_val_t js_arr_push(ipo_js_vm_t *vm, ipo_js_val_t tv, int argc, const ipo_js_val_t *argv, void *ud) {
@@ -6370,31 +6676,34 @@ static ipo_js_val_t js_str_replace(ipo_js_vm_t *vm, ipo_js_val_t tv, int argc, c
 		int global = rep_all || ((re->u.re.flags & 2) != 0);
 		re_prog_t *prog = re_compile(re->u.re.pattern->data, re->u.re.pattern->len, re->u.re.flags);
 		re_state_t st;
-		size_t pos = 0, ms = 0, me = 0;
-		while (pos <= slen && re_exec_at(prog, s, slen, pos, &st, &ms, &me)) {
-			jbuf_append(&b, s + pos, ms - pos);
-			if (is_fn) {
-				ipo_js_val_t args[4];
-				int ac = 0;
-				args[ac++] = ipo_js_str_new(vm, s + ms, me - ms);
-				for (int g = 1; g <= prog->num_groups && ac < 3; g++) {
-					if (st.cap_start[g] >= 0 && st.cap_end[g] >= st.cap_start[g])
-						args[ac++] = ipo_js_str_new(vm, s + st.cap_start[g], (size_t)(st.cap_end[g] - st.cap_start[g]));
-					else args[ac++] = ipo_js_undef();
+		if (re_state_init(&st, prog ? (prog->num_groups + 1) : 1)) {
+			size_t pos = 0, ms = 0, me = 0;
+			while (pos <= slen && re_exec_at(prog, s, slen, pos, &st, &ms, &me)) {
+				jbuf_append(&b, s + pos, ms - pos);
+				if (is_fn) {
+					ipo_js_val_t args[4];
+					int ac = 0;
+					args[ac++] = ipo_js_str_new(vm, s + ms, me - ms);
+					for (int g = 1; g <= prog->num_groups && g < st.cap_count && ac < 3; g++) {
+						if (st.cap_start[g] >= 0 && st.cap_end[g] >= st.cap_start[g])
+							args[ac++] = ipo_js_str_new(vm, s + st.cap_start[g], (size_t)(st.cap_end[g] - st.cap_start[g]));
+						else args[ac++] = ipo_js_undef();
+					}
+					args[ac++] = ipo_js_num((double)ms);
+					ipo_js_val_t rv = vm_call_obj(vm, argv[1], ipo_js_undef(), ac, args, NULL);
+					size_t flen = 0;
+					const char *fs = ipo_js_cstr(vm, rv, &flen);
+					jbuf_append(&b, fs, flen);
+				} else {
+					jbuf_append(&b, rep, rlen);
 				}
-				args[ac++] = ipo_js_num((double)ms);
-				ipo_js_val_t rv = vm_call_obj(vm, argv[1], ipo_js_undef(), ac, args, NULL);
-				size_t flen = 0;
-				const char *fs = ipo_js_cstr(vm, rv, &flen);
-				jbuf_append(&b, fs, flen);
-			} else {
-				jbuf_append(&b, rep, rlen);
+				pos = (me > ms) ? me : (me + 1);
+				if (me == ms && ms < slen) jbuf_append_ch(&b, s[ms]);
+				if (!global) break;
 			}
-			pos = (me > ms) ? me : (me + 1);
-			if (me == ms && ms < slen) jbuf_append_ch(&b, s[ms]);
-			if (!global) break;
+			if (pos <= slen) jbuf_append(&b, s + pos, slen - pos);
+			re_state_free(&st);
 		}
-		if (pos <= slen) jbuf_append(&b, s + pos, slen - pos);
 		re_free(prog);
 	} else {
 		size_t nlen = 0;
@@ -6443,6 +6752,10 @@ static ipo_js_val_t js_str_match(ipo_js_vm_t *vm, ipo_js_val_t tv, int argc, con
 	}
 	re_prog_t *prog = re_compile(re->u.re.pattern->data, re->u.re.pattern->len, re->u.re.flags);
 	re_state_t st;
+	if (!re_state_init(&st, prog ? (prog->num_groups + 1) : 1)) {
+		re_free(prog);
+		return ipo_js_null();
+	}
 	size_t ms = 0, me = 0;
 	if (re->u.re.flags & 2) {
 		ipo_js_obj_t *arr = ipo_js_new_array(vm, 0);
@@ -6451,18 +6764,20 @@ static ipo_js_val_t js_str_match(ipo_js_vm_t *vm, ipo_js_val_t tv, int argc, con
 			ipo_js_arr_push(vm, arr, ipo_js_str_new(vm, s + ms, me - ms));
 			pos = (me > ms) ? me : (me + 1);
 		}
+		re_state_free(&st);
 		re_free(prog);
 		return arr->u.arr.len ? ipo_js_obj_val(arr) : ipo_js_null();
 	}
-	if (!re_exec_at(prog, s, slen, 0, &st, &ms, &me)) { re_free(prog); return ipo_js_null(); }
+	if (!re_exec_at(prog, s, slen, 0, &st, &ms, &me)) { re_state_free(&st); re_free(prog); return ipo_js_null(); }
 	ipo_js_obj_t *arr = ipo_js_new_array(vm, 0);
 	ipo_js_arr_push(vm, arr, ipo_js_str_new(vm, s + ms, me - ms));
-	for (int g = 1; g <= prog->num_groups; g++) {
+	for (int g = 1; g <= prog->num_groups && g < st.cap_count; g++) {
 		if (st.cap_start[g] >= 0 && st.cap_end[g] >= st.cap_start[g])
 			ipo_js_arr_push(vm, arr, ipo_js_str_new(vm, s + st.cap_start[g], (size_t)(st.cap_end[g] - st.cap_start[g])));
 		else ipo_js_arr_push(vm, arr, ipo_js_undef());
 	}
 	ipo_js_set_prop(vm, arr, "index", ipo_js_num((double)ms));
+	re_state_free(&st);
 	re_free(prog);
 	return ipo_js_obj_val(arr);
 }
@@ -6514,23 +6829,29 @@ static ipo_js_val_t js_re_test_exec(ipo_js_vm_t *vm, ipo_js_val_t tv, int argc, 
 	}
 	re_prog_t *prog = re_compile(re->u.re.pattern->data, re->u.re.pattern->len, re->u.re.flags);
 	re_state_t st;
+	if (!re_state_init(&st, prog ? (prog->num_groups + 1) : 1)) {
+		re_free(prog);
+		return is_exec ? ipo_js_null() : ipo_js_bool(0);
+	}
 	size_t ms = 0, me = 0;
 	int ok = re_exec_at(prog, s, slen, start, &st, &ms, &me);
 	if (!ok) {
 		if (re->u.re.flags & 2) re->u.re.last_index = 0;
+		re_state_free(&st);
 		re_free(prog);
 		return is_exec ? ipo_js_null() : ipo_js_bool(0);
 	}
 	if (re->u.re.flags & 2) re->u.re.last_index = me;
-	if (!is_exec) { re_free(prog); return ipo_js_bool(1); }
+	if (!is_exec) { re_state_free(&st); re_free(prog); return ipo_js_bool(1); }
 	ipo_js_obj_t *arr = ipo_js_new_array(vm, 0);
 	ipo_js_arr_push(vm, arr, ipo_js_str_new(vm, s + ms, me - ms));
-	for (int g = 1; g <= prog->num_groups; g++) {
+	for (int g = 1; g <= prog->num_groups && g < st.cap_count; g++) {
 		if (st.cap_start[g] >= 0 && st.cap_end[g] >= st.cap_start[g])
 			ipo_js_arr_push(vm, arr, ipo_js_str_new(vm, s + st.cap_start[g], (size_t)(st.cap_end[g] - st.cap_start[g])));
 		else ipo_js_arr_push(vm, arr, ipo_js_undef());
 	}
 	ipo_js_set_prop(vm, arr, "index", ipo_js_num((double)ms));
+	re_state_free(&st);
 	re_free(prog);
 	return ipo_js_obj_val(arr);
 }
@@ -6747,6 +7068,842 @@ static ipo_js_val_t js_prom_then(ipo_js_vm_t *vm, ipo_js_val_t tv, int argc, con
 	return ipo_js_obj_val(next);
 }
 
+typedef struct {
+	char *key;
+	char *desc;
+} js_sym_data_t;
+
+static const char *js_val_to_prop_key(ipo_js_vm_t *vm, ipo_js_val_t v) {
+	if (v.type == JS_T_OBJECT && v.u.obj && v.u.obj->host_tag == JS_HTAG_SYM && v.u.obj->host_ptr) {
+		const js_sym_data_t *sd = (const js_sym_data_t *)v.u.obj->host_ptr;
+		return sd->key ? sd->key : "";
+	}
+	return ipo_js_cstr(vm, v, NULL);
+}
+
+static int js_same_value_zero(ipo_js_val_t a, ipo_js_val_t b) {
+	if (a.type != b.type) return 0;
+	switch (a.type) {
+	case JS_T_UNDEFINED:
+	case JS_T_NULL:
+		return 1;
+	case JS_T_BOOL:
+		return a.u.b == b.u.b;
+	case JS_T_NUMBER:
+		if (isnan(a.u.num) && isnan(b.u.num)) return 1;
+		return a.u.num == b.u.num;
+	case JS_T_STRING:
+		if (a.u.str == b.u.str) return 1;
+		if (!a.u.str || !b.u.str || a.u.str->len != b.u.str->len) return 0;
+		return memcmp(a.u.str->data, b.u.str->data, a.u.str->len) == 0;
+	case JS_T_OBJECT:
+		return a.u.obj == b.u.obj;
+	}
+	return 0;
+}
+
+static ipo_js_obj_t *js_get_ctor_proto(ipo_js_vm_t *vm, const char *ctor_name) {
+	ipo_js_val_t cv = ipo_js_undef(), pv = ipo_js_undef();
+	if (ipo_js_get_prop(vm, vm->global_obj, ctor_name, &cv) && cv.type == JS_T_OBJECT && cv.u.obj &&
+	    ipo_js_get_prop(vm, cv.u.obj, "prototype", &pv) && pv.type == JS_T_OBJECT && pv.u.obj) {
+		return pv.u.obj;
+	}
+	return vm->obj_proto;
+}
+
+/* Symbol */
+static void js_sym_finalize(ipo_js_vm_t *vm, ipo_js_obj_t *o) {
+	(void)vm;
+	js_sym_data_t *sd = (js_sym_data_t *)o->host_ptr;
+	if (sd) { free(sd->key); free(sd->desc); free(sd); o->host_ptr = NULL; }
+}
+
+static ipo_js_val_t js_sym_to_str(ipo_js_vm_t *vm, ipo_js_val_t tv, int argc, const ipo_js_val_t *argv, void *ud) {
+	(void)argc; (void)argv; (void)ud;
+	if (tv.type != JS_T_OBJECT || !tv.u.obj || tv.u.obj->host_tag != JS_HTAG_SYM || !tv.u.obj->host_ptr)
+		return ipo_js_str_cstr(vm, "Symbol()");
+	js_sym_data_t *sd = (js_sym_data_t *)tv.u.obj->host_ptr;
+	js_buf_t b; jbuf_init(&b);
+	jbuf_append_cstr(&b, "Symbol(");
+	if (sd->desc) jbuf_append_cstr(&b, sd->desc);
+	jbuf_append_ch(&b, ')');
+	ipo_js_val_t r = ipo_js_str_new(vm, b.data ? b.data : "Symbol()", b.len);
+	jbuf_free(&b);
+	return r;
+}
+
+static uint32_t s_sym_counter = 1;
+static ipo_js_obj_t *js_make_symbol(ipo_js_vm_t *vm, const char *desc) {
+	ipo_js_obj_t *o = vm_alloc_obj(vm, JS_OBJ_PLAIN, js_get_ctor_proto(vm, "Symbol"));
+	js_sym_data_t *sd = (js_sym_data_t *)xcalloc(1, sizeof(js_sym_data_t));
+	uint32_t id = s_sym_counter++;
+	int kn = snprintf(NULL, 0, "@@sym_%u", id);
+	if (kn >= 0) {
+		sd->key = (char *)xmalloc((size_t)kn + 1u);
+		snprintf(sd->key, (size_t)kn + 1u, "@@sym_%u", id);
+	}
+	sd->desc = desc ? xstrdup_n(desc, strlen(desc)) : NULL;
+	o->host_tag = JS_HTAG_SYM;
+	o->host_ptr = sd;
+	o->host_finalize = js_sym_finalize;
+	if (desc) ipo_js_set_prop(vm, o, "description", ipo_js_str_cstr(vm, desc));
+	return o;
+}
+
+static ipo_js_val_t js_sym_ctor(ipo_js_vm_t *vm, ipo_js_val_t tv, int argc, const ipo_js_val_t *argv, void *ud) {
+	(void)tv; (void)ud;
+	const char *desc = (argc >= 1 && argv[0].type != JS_T_UNDEFINED) ? ipo_js_cstr(vm, argv[0], NULL) : NULL;
+	return ipo_js_obj_val(js_make_symbol(vm, desc));
+}
+
+static ipo_js_val_t js_sym_for(ipo_js_vm_t *vm, ipo_js_val_t tv, int argc, const ipo_js_val_t *argv, void *ud) {
+	(void)ud;
+	const char *k = (argc >= 1) ? ipo_js_cstr(vm, argv[0], NULL) : "undefined";
+	ipo_js_obj_t *sym_ctor = (tv.type == JS_T_OBJECT && tv.u.obj) ? tv.u.obj : NULL;
+	ipo_js_val_t reg = ipo_js_undef();
+	if (sym_ctor && (!ipo_js_get_prop(vm, sym_ctor, "_registry", &reg) || reg.type != JS_T_OBJECT || !reg.u.obj)) {
+		reg = ipo_js_obj_val(ipo_js_new_object(vm, NULL));
+		ipo_js_set_prop(vm, sym_ctor, "_registry", reg);
+	}
+	if (reg.type == JS_T_OBJECT && reg.u.obj) {
+		ipo_js_val_t existing = ipo_js_undef();
+		if (ipo_js_has_own_prop(reg.u.obj, k) && ipo_js_get_prop(vm, reg.u.obj, k, &existing)) return existing;
+		ipo_js_val_t ns = ipo_js_obj_val(js_make_symbol(vm, k));
+		ipo_js_set_prop(vm, reg.u.obj, k, ns);
+		return ns;
+	}
+	return ipo_js_obj_val(js_make_symbol(vm, k));
+}
+
+/* Map & WeakMap */
+typedef struct {
+	size_t len, cap;
+	ipo_js_val_t *keys;
+	ipo_js_val_t *vals;
+} js_map_data_t;
+
+static void js_map_mark(ipo_js_vm_t *vm, ipo_js_obj_t *o) {
+	js_map_data_t *m = (js_map_data_t *)o->host_ptr;
+	if (!m) return;
+	for (size_t i = 0; i < m->len; i++) {
+		ipo_js_gc_mark_val(vm, m->keys[i]);
+		ipo_js_gc_mark_val(vm, m->vals[i]);
+	}
+}
+
+static void js_map_finalize(ipo_js_vm_t *vm, ipo_js_obj_t *o) {
+	(void)vm;
+	js_map_data_t *m = (js_map_data_t *)o->host_ptr;
+	if (m) { free(m->keys); free(m->vals); free(m); o->host_ptr = NULL; }
+}
+
+static int js_map_host_get(ipo_js_vm_t *vm, ipo_js_obj_t *o, const char *key, ipo_js_val_t *out) {
+	(void)vm;
+	js_map_data_t *m = (js_map_data_t *)o->host_ptr;
+	if (m && strcmp(key, "size") == 0) { *out = ipo_js_num((double)m->len); return 1; }
+	return 0;
+}
+
+static ipo_js_val_t js_map_ctor(ipo_js_vm_t *vm, ipo_js_val_t tv, int argc, const ipo_js_val_t *argv, void *ud) {
+	(void)tv;
+	int is_weak = (int)(intptr_t)ud;
+	ipo_js_obj_t *o = vm_alloc_obj(vm, JS_OBJ_PLAIN, js_get_ctor_proto(vm, is_weak ? "WeakMap" : "Map"));
+	js_map_data_t *m = (js_map_data_t *)xcalloc(1, sizeof(js_map_data_t));
+	o->host_tag = JS_HTAG_MAP;
+	o->host_ptr = m;
+	o->host_get = js_map_host_get;
+	o->host_mark = js_map_mark;
+	o->host_finalize = js_map_finalize;
+	size_t top = ipo_js_gc_push_root(vm, ipo_js_obj_val(o));
+	if (argc >= 1 && argv[0].type != JS_T_UNDEFINED && argv[0].type != JS_T_NULL) {
+		ipo_js_obj_t *it = js_collect_iterable(vm, argv[0]);
+		ipo_js_gc_push_root(vm, ipo_js_obj_val(it));
+		for (size_t i = 0; i < it->u.arr.len; i++) {
+			ipo_js_val_t pair = it->u.arr.items[i];
+			if (pair.type == JS_T_OBJECT && pair.u.obj) {
+				ipo_js_val_t k = ipo_js_undef(), v = ipo_js_undef();
+				ipo_js_get_prop(vm, pair.u.obj, "0", &k);
+				ipo_js_get_prop(vm, pair.u.obj, "1", &v);
+				if (m->len >= m->cap) {
+					size_t nc = m->cap ? m->cap * 2 : 8;
+					m->keys = (ipo_js_val_t *)xrealloc(m->keys, nc * sizeof(ipo_js_val_t));
+					m->vals = (ipo_js_val_t *)xrealloc(m->vals, nc * sizeof(ipo_js_val_t));
+					m->cap = nc;
+				}
+				m->keys[m->len] = k; m->vals[m->len] = v; m->len++;
+			}
+		}
+	}
+	ipo_js_gc_pop_roots(vm, top);
+	return ipo_js_obj_val(o);
+}
+
+static ipo_js_val_t js_map_op(ipo_js_vm_t *vm, ipo_js_val_t tv, int argc, const ipo_js_val_t *argv, void *ud) {
+	int op = (int)(intptr_t)ud; /* 0=get,1=set,2=has,3=delete,4=clear,5=forEach,6=keys,7=values,8=entries */
+	if (tv.type != JS_T_OBJECT || !tv.u.obj || tv.u.obj->host_tag != JS_HTAG_MAP) return ipo_js_undef();
+	js_map_data_t *m = (js_map_data_t *)tv.u.obj->host_ptr;
+	if (!m) return ipo_js_undef();
+	ipo_js_val_t k = argc >= 1 ? argv[0] : ipo_js_undef();
+	if (op <= 3) {
+		for (size_t i = 0; i < m->len; i++) {
+			if (js_same_value_zero(m->keys[i], k)) {
+				if (op == 0) return m->vals[i];
+				if (op == 1) { m->vals[i] = argc >= 2 ? argv[1] : ipo_js_undef(); return tv; }
+				if (op == 2) return ipo_js_bool(1);
+				if (op == 3) {
+					memmove(&m->keys[i], &m->keys[i + 1], (m->len - i - 1) * sizeof(ipo_js_val_t));
+					memmove(&m->vals[i], &m->vals[i + 1], (m->len - i - 1) * sizeof(ipo_js_val_t));
+					m->len--;
+					return ipo_js_bool(1);
+				}
+			}
+		}
+		if (op == 1) {
+			if (m->len >= m->cap) {
+				size_t nc = m->cap ? m->cap * 2 : 8;
+				m->keys = (ipo_js_val_t *)xrealloc(m->keys, nc * sizeof(ipo_js_val_t));
+				m->vals = (ipo_js_val_t *)xrealloc(m->vals, nc * sizeof(ipo_js_val_t));
+				m->cap = nc;
+			}
+			m->keys[m->len] = k;
+			m->vals[m->len] = argc >= 2 ? argv[1] : ipo_js_undef();
+			m->len++;
+			return tv;
+		}
+		return (op == 0) ? ipo_js_undef() : ipo_js_bool(0);
+	}
+	if (op == 4) { m->len = 0; return ipo_js_undef(); }
+	if (op == 5) {
+		if (argc >= 1 && ipo_js_is_callable(argv[0])) {
+			ipo_js_val_t this_arg = argc >= 2 ? argv[1] : ipo_js_undef();
+			for (size_t i = 0; i < m->len; i++) {
+				ipo_js_val_t args[3] = { m->vals[i], m->keys[i], tv };
+				vm_call_obj(vm, argv[0], this_arg, 3, args, NULL);
+				if (vm->sig != SIG_NONE) break;
+			}
+		}
+		return ipo_js_undef();
+	}
+	ipo_js_obj_t *out = ipo_js_new_array(vm, 0);
+	size_t top = ipo_js_gc_push_root(vm, ipo_js_obj_val(out));
+	for (size_t i = 0; i < m->len; i++) {
+		if (op == 6) ipo_js_arr_push(vm, out, m->keys[i]);
+		else if (op == 7) ipo_js_arr_push(vm, out, m->vals[i]);
+		else {
+			ipo_js_obj_t *pair = ipo_js_new_array(vm, 2);
+			pair->u.arr.items[0] = m->keys[i];
+			pair->u.arr.items[1] = m->vals[i];
+			ipo_js_arr_push(vm, out, ipo_js_obj_val(pair));
+		}
+	}
+	ipo_js_gc_pop_roots(vm, top);
+	return ipo_js_obj_val(out);
+}
+
+/* Set & WeakSet */
+typedef struct {
+	size_t len, cap;
+	ipo_js_val_t *items;
+} js_set_data_t;
+
+static void js_set_mark(ipo_js_vm_t *vm, ipo_js_obj_t *o) {
+	js_set_data_t *s = (js_set_data_t *)o->host_ptr;
+	if (!s) return;
+	for (size_t i = 0; i < s->len; i++) ipo_js_gc_mark_val(vm, s->items[i]);
+}
+
+static void js_set_finalize(ipo_js_vm_t *vm, ipo_js_obj_t *o) {
+	(void)vm;
+	js_set_data_t *s = (js_set_data_t *)o->host_ptr;
+	if (s) { free(s->items); free(s); o->host_ptr = NULL; }
+}
+
+static int js_set_host_get(ipo_js_vm_t *vm, ipo_js_obj_t *o, const char *key, ipo_js_val_t *out) {
+	(void)vm;
+	js_set_data_t *s = (js_set_data_t *)o->host_ptr;
+	if (s && strcmp(key, "size") == 0) { *out = ipo_js_num((double)s->len); return 1; }
+	return 0;
+}
+
+static void js_set_insert_val(js_set_data_t *s, ipo_js_val_t v) {
+	for (size_t i = 0; i < s->len; i++) {
+		if (js_same_value_zero(s->items[i], v)) return;
+	}
+	if (s->len >= s->cap) {
+		size_t nc = s->cap ? s->cap * 2 : 8;
+		s->items = (ipo_js_val_t *)xrealloc(s->items, nc * sizeof(ipo_js_val_t));
+		s->cap = nc;
+	}
+	s->items[s->len++] = v;
+}
+
+static ipo_js_val_t js_set_ctor(ipo_js_vm_t *vm, ipo_js_val_t tv, int argc, const ipo_js_val_t *argv, void *ud) {
+	(void)tv;
+	int is_weak = (int)(intptr_t)ud;
+	ipo_js_obj_t *o = vm_alloc_obj(vm, JS_OBJ_PLAIN, js_get_ctor_proto(vm, is_weak ? "WeakSet" : "Set"));
+	js_set_data_t *s = (js_set_data_t *)xcalloc(1, sizeof(js_set_data_t));
+	o->host_tag = JS_HTAG_SET;
+	o->host_ptr = s;
+	o->host_get = js_set_host_get;
+	o->host_mark = js_set_mark;
+	o->host_finalize = js_set_finalize;
+	size_t top = ipo_js_gc_push_root(vm, ipo_js_obj_val(o));
+	if (argc >= 1 && argv[0].type != JS_T_UNDEFINED && argv[0].type != JS_T_NULL) {
+		ipo_js_obj_t *it = js_collect_iterable(vm, argv[0]);
+		ipo_js_gc_push_root(vm, ipo_js_obj_val(it));
+		for (size_t i = 0; i < it->u.arr.len; i++) js_set_insert_val(s, it->u.arr.items[i]);
+	}
+	ipo_js_gc_pop_roots(vm, top);
+	return ipo_js_obj_val(o);
+}
+
+static ipo_js_val_t js_set_op(ipo_js_vm_t *vm, ipo_js_val_t tv, int argc, const ipo_js_val_t *argv, void *ud) {
+	int op = (int)(intptr_t)ud; /* 0=add,1=has,2=delete,3=clear,4=forEach,5=values/keys,6=entries */
+	if (tv.type != JS_T_OBJECT || !tv.u.obj || tv.u.obj->host_tag != JS_HTAG_SET) return ipo_js_undef();
+	js_set_data_t *s = (js_set_data_t *)tv.u.obj->host_ptr;
+	if (!s) return ipo_js_undef();
+	ipo_js_val_t v = argc >= 1 ? argv[0] : ipo_js_undef();
+	if (op == 0) { js_set_insert_val(s, v); return tv; }
+	if (op == 1 || op == 2) {
+		for (size_t i = 0; i < s->len; i++) {
+			if (js_same_value_zero(s->items[i], v)) {
+				if (op == 2) {
+					memmove(&s->items[i], &s->items[i + 1], (s->len - i - 1) * sizeof(ipo_js_val_t));
+					s->len--;
+				}
+				return ipo_js_bool(1);
+			}
+		}
+		return ipo_js_bool(0);
+	}
+	if (op == 3) { s->len = 0; return ipo_js_undef(); }
+	if (op == 4) {
+		if (argc >= 1 && ipo_js_is_callable(argv[0])) {
+			ipo_js_val_t this_arg = argc >= 2 ? argv[1] : ipo_js_undef();
+			for (size_t i = 0; i < s->len; i++) {
+				ipo_js_val_t args[3] = { s->items[i], s->items[i], tv };
+				vm_call_obj(vm, argv[0], this_arg, 3, args, NULL);
+				if (vm->sig != SIG_NONE) break;
+			}
+		}
+		return ipo_js_undef();
+	}
+	ipo_js_obj_t *out = ipo_js_new_array(vm, 0);
+	size_t top = ipo_js_gc_push_root(vm, ipo_js_obj_val(out));
+	for (size_t i = 0; i < s->len; i++) {
+		if (op == 5) ipo_js_arr_push(vm, out, s->items[i]);
+		else {
+			ipo_js_obj_t *pair = ipo_js_new_array(vm, 2);
+			pair->u.arr.items[0] = s->items[i]; pair->u.arr.items[1] = s->items[i];
+			ipo_js_arr_push(vm, out, ipo_js_obj_val(pair));
+		}
+	}
+	ipo_js_gc_pop_roots(vm, top);
+	return ipo_js_obj_val(out);
+}
+
+/* ArrayBuffer & TypedArrays */
+typedef struct {
+	uint8_t *bytes;
+	size_t len;
+} js_abuf_data_t;
+
+typedef struct {
+	ipo_js_obj_t *buf_obj;
+	uint8_t *bytes;
+	size_t byte_offset;
+	size_t len;
+	size_t elem_size;
+	int kind; /* 0=u8,1=i8,2=u16,3=i16,4=i32,5=u32,6=f32,7=f64,8=u8c */
+} js_ta_data_t;
+
+static const char *const s_ta_names[9] = {
+	"Uint8Array", "Int8Array", "Uint16Array", "Int16Array",
+	"Int32Array", "Uint32Array", "Float32Array", "Float64Array", "Uint8ClampedArray"
+};
+static const size_t s_ta_esize[9] = {1, 1, 2, 2, 4, 4, 4, 8, 1};
+
+static void js_abuf_finalize(ipo_js_vm_t *vm, ipo_js_obj_t *o) {
+	(void)vm;
+	js_abuf_data_t *ab = (js_abuf_data_t *)o->host_ptr;
+	if (ab) { free(ab->bytes); free(ab); o->host_ptr = NULL; }
+}
+
+static int js_abuf_host_get(ipo_js_vm_t *vm, ipo_js_obj_t *o, const char *key, ipo_js_val_t *out) {
+	(void)vm;
+	js_abuf_data_t *ab = (js_abuf_data_t *)o->host_ptr;
+	if (ab && strcmp(key, "byteLength") == 0) { *out = ipo_js_num((double)ab->len); return 1; }
+	return 0;
+}
+
+static ipo_js_obj_t *js_alloc_abuf(ipo_js_vm_t *vm, size_t blen) {
+	ipo_js_obj_t *o = vm_alloc_obj(vm, JS_OBJ_PLAIN, js_get_ctor_proto(vm, "ArrayBuffer"));
+	js_abuf_data_t *ab = (js_abuf_data_t *)xcalloc(1, sizeof(js_abuf_data_t));
+	ab->bytes = (uint8_t *)xcalloc(blen ? blen : 1, 1);
+	ab->len = blen;
+	o->host_tag = JS_HTAG_ABUF;
+	o->host_ptr = ab;
+	o->host_get = js_abuf_host_get;
+	o->host_finalize = js_abuf_finalize;
+	return o;
+}
+
+static ipo_js_val_t js_abuf_ctor(ipo_js_vm_t *vm, ipo_js_val_t tv, int argc, const ipo_js_val_t *argv, void *ud) {
+	(void)tv; (void)ud;
+	double d = (argc >= 1) ? ipo_js_to_num(vm, argv[0]) : 0.0;
+	size_t blen = (d > 0 && d < 64.0 * 1024.0 * 1024.0) ? (size_t)d : 0;
+	return ipo_js_obj_val(js_alloc_abuf(vm, blen));
+}
+
+static ipo_js_val_t js_abuf_slice(ipo_js_vm_t *vm, ipo_js_val_t tv, int argc, const ipo_js_val_t *argv, void *ud) {
+	(void)ud;
+	if (tv.type != JS_T_OBJECT || !tv.u.obj || tv.u.obj->host_tag != JS_HTAG_ABUF) return ipo_js_undef();
+	js_abuf_data_t *ab = (js_abuf_data_t *)tv.u.obj->host_ptr;
+	size_t s = (argc >= 1 && argv[0].type != JS_T_UNDEFINED) ? norm_idx(ipo_js_to_i32(vm, argv[0]), ab->len) : 0;
+	size_t e = (argc >= 2 && argv[1].type != JS_T_UNDEFINED) ? norm_idx(ipo_js_to_i32(vm, argv[1]), ab->len) : ab->len;
+	if (e < s) e = s;
+	ipo_js_obj_t *no = js_alloc_abuf(vm, e - s);
+	js_abuf_data_t *nab = (js_abuf_data_t *)no->host_ptr;
+	if (e > s) memcpy(nab->bytes, ab->bytes + s, e - s);
+	return ipo_js_obj_val(no);
+}
+
+static double js_ta_read_elem(const js_ta_data_t *ta, size_t idx) {
+	const uint8_t *p = ta->bytes + idx * ta->elem_size;
+	switch (ta->kind) {
+	case 0: case 8: return (double)p[0];
+	case 1: return (double)(int8_t)p[0];
+	case 2: { uint16_t v; memcpy(&v, p, 2); return (double)v; }
+	case 3: { int16_t v;  memcpy(&v, p, 2); return (double)v; }
+	case 4: { int32_t v;  memcpy(&v, p, 4); return (double)v; }
+	case 5: { uint32_t v; memcpy(&v, p, 4); return (double)v; }
+	case 6: { float v;    memcpy(&v, p, 4); return (double)v; }
+	case 7: { double v;   memcpy(&v, p, 8); return v; }
+	}
+	return 0.0;
+}
+
+static void js_ta_write_elem(js_ta_data_t *ta, size_t idx, double d) {
+	uint8_t *p = ta->bytes + idx * ta->elem_size;
+	switch (ta->kind) {
+	case 0: p[0] = (uint8_t)(int64_t)d; break;
+	case 1: p[0] = (uint8_t)(int8_t)(int64_t)d; break;
+	case 2: { uint16_t v = (uint16_t)(int64_t)d; memcpy(p, &v, 2); break; }
+	case 3: { int16_t v  = (int16_t)(int64_t)d;  memcpy(p, &v, 2); break; }
+	case 4: { int32_t v  = (int32_t)(int64_t)d;  memcpy(p, &v, 4); break; }
+	case 5: { uint32_t v = (uint32_t)(int64_t)d; memcpy(p, &v, 4); break; }
+	case 6: { float v    = (float)d;             memcpy(p, &v, 4); break; }
+	case 7: { double v   = d;                    memcpy(p, &v, 8); break; }
+	case 8: { double r = isnan(d) ? 0.0 : (d >= 0.0 ? d + 0.5 : d - 0.5); int64_t iv = (int64_t)r; p[0] = (uint8_t)(iv < 0 ? 0 : (iv > 255 ? 255 : iv)); break; }
+	}
+}
+
+static void js_ta_mark(ipo_js_vm_t *vm, ipo_js_obj_t *o) {
+	js_ta_data_t *ta = (js_ta_data_t *)o->host_ptr;
+	if (ta && ta->buf_obj) ipo_js_gc_mark_obj(vm, ta->buf_obj);
+}
+
+static void js_ta_finalize(ipo_js_vm_t *vm, ipo_js_obj_t *o) {
+	(void)vm;
+	free(o->host_ptr);
+	o->host_ptr = NULL;
+}
+
+static int js_ta_host_get(ipo_js_vm_t *vm, ipo_js_obj_t *o, const char *key, ipo_js_val_t *out) {
+	(void)vm;
+	js_ta_data_t *ta = (js_ta_data_t *)o->host_ptr;
+	if (!ta) return 0;
+	if (strcmp(key, "length") == 0) { *out = ipo_js_num((double)ta->len); return 1; }
+	if (strcmp(key, "byteLength") == 0) { *out = ipo_js_num((double)(ta->len * ta->elem_size)); return 1; }
+	if (strcmp(key, "byteOffset") == 0) { *out = ipo_js_num((double)ta->byte_offset); return 1; }
+	if (strcmp(key, "buffer") == 0) { *out = ipo_js_obj_val(ta->buf_obj); return 1; }
+	if (strcmp(key, "BYTES_PER_ELEMENT") == 0) { *out = ipo_js_num((double)ta->elem_size); return 1; }
+	size_t idx = 0;
+	if (parse_array_index(key, &idx) && idx < ta->len) {
+		*out = ipo_js_num(js_ta_read_elem(ta, idx));
+		return 1;
+	}
+	return 0;
+}
+
+static int js_ta_host_set(ipo_js_vm_t *vm, ipo_js_obj_t *o, const char *key, ipo_js_val_t val) {
+	js_ta_data_t *ta = (js_ta_data_t *)o->host_ptr;
+	if (!ta) return 0;
+	size_t idx = 0;
+	if (parse_array_index(key, &idx)) {
+		if (idx < ta->len) js_ta_write_elem(ta, idx, ipo_js_to_num(vm, val));
+		return 1;
+	}
+	return 0;
+}
+
+static ipo_js_obj_t *js_alloc_ta(ipo_js_vm_t *vm, int kind, ipo_js_obj_t *abuf, size_t byte_off, size_t len) {
+	if (kind < 0 || kind > 8) kind = 0;
+	size_t esz = s_ta_esize[kind];
+	ipo_js_obj_t *o = vm_alloc_obj(vm, JS_OBJ_PLAIN, js_get_ctor_proto(vm, s_ta_names[kind]));
+	size_t top = ipo_js_gc_push_root(vm, ipo_js_obj_val(o));
+	if (!abuf) {
+		abuf = js_alloc_abuf(vm, len * esz);
+		byte_off = 0;
+	}
+	js_abuf_data_t *ab = (js_abuf_data_t *)abuf->host_ptr;
+	if (byte_off > ab->len) byte_off = ab->len;
+	size_t max_len = (ab->len - byte_off) / esz;
+	if (len > max_len) len = max_len;
+	js_ta_data_t *ta = (js_ta_data_t *)xcalloc(1, sizeof(js_ta_data_t));
+	ta->buf_obj = abuf;
+	ta->bytes = ab->bytes + byte_off;
+	ta->byte_offset = byte_off;
+	ta->len = len;
+	ta->elem_size = esz;
+	ta->kind = kind;
+	o->host_tag = JS_HTAG_TA;
+	o->host_ptr = ta;
+	o->host_get = js_ta_host_get;
+	o->host_set = js_ta_host_set;
+	o->host_mark = js_ta_mark;
+	o->host_finalize = js_ta_finalize;
+	ipo_js_gc_pop_roots(vm, top);
+	return o;
+}
+
+static ipo_js_val_t js_ta_ctor(ipo_js_vm_t *vm, ipo_js_val_t tv, int argc, const ipo_js_val_t *argv, void *ud) {
+	(void)tv;
+	int kind = (int)(intptr_t)ud;
+	size_t esz = s_ta_esize[kind];
+	if (argc < 1 || argv[0].type == JS_T_UNDEFINED) return ipo_js_obj_val(js_alloc_ta(vm, kind, NULL, 0, 0));
+	if (argv[0].type == JS_T_OBJECT && argv[0].u.obj && argv[0].u.obj->host_tag == JS_HTAG_ABUF) {
+		js_abuf_data_t *ab = (js_abuf_data_t *)argv[0].u.obj->host_ptr;
+		size_t off = (argc >= 2 && argv[1].type != JS_T_UNDEFINED) ? (size_t)ipo_js_to_num(vm, argv[1]) : 0;
+		size_t max_l = (off < ab->len) ? (ab->len - off) / esz : 0;
+		size_t len = (argc >= 3 && argv[2].type != JS_T_UNDEFINED) ? (size_t)ipo_js_to_num(vm, argv[2]) : max_l;
+		return ipo_js_obj_val(js_alloc_ta(vm, kind, argv[0].u.obj, off, len));
+	}
+	if (argv[0].type == JS_T_OBJECT && argv[0].u.obj) {
+		ipo_js_obj_t *src = js_collect_iterable(vm, argv[0]);
+		size_t top = ipo_js_gc_push_root(vm, ipo_js_obj_val(src));
+		ipo_js_obj_t *out = js_alloc_ta(vm, kind, NULL, 0, src->u.arr.len);
+		js_ta_data_t *ta = (js_ta_data_t *)out->host_ptr;
+		for (size_t i = 0; i < src->u.arr.len; i++) js_ta_write_elem(ta, i, ipo_js_to_num(vm, src->u.arr.items[i]));
+		ipo_js_gc_pop_roots(vm, top);
+		return ipo_js_obj_val(out);
+	}
+	double d = ipo_js_to_num(vm, argv[0]);
+	size_t len = (d > 0 && d < 16777216.0) ? (size_t)d : 0;
+	return ipo_js_obj_val(js_alloc_ta(vm, kind, NULL, 0, len));
+}
+
+static ipo_js_val_t js_ta_subslice(ipo_js_vm_t *vm, ipo_js_val_t tv, int argc, const ipo_js_val_t *argv, void *ud) {
+	int is_slice = (int)(intptr_t)ud;
+	if (tv.type != JS_T_OBJECT || !tv.u.obj || tv.u.obj->host_tag != JS_HTAG_TA) return ipo_js_undef();
+	js_ta_data_t *ta = (js_ta_data_t *)tv.u.obj->host_ptr;
+	size_t s = (argc >= 1 && argv[0].type != JS_T_UNDEFINED) ? norm_idx(ipo_js_to_i32(vm, argv[0]), ta->len) : 0;
+	size_t e = (argc >= 2 && argv[1].type != JS_T_UNDEFINED) ? norm_idx(ipo_js_to_i32(vm, argv[1]), ta->len) : ta->len;
+	if (e < s) e = s;
+	if (!is_slice) return ipo_js_obj_val(js_alloc_ta(vm, ta->kind, ta->buf_obj, ta->byte_offset + s * ta->elem_size, e - s));
+	ipo_js_obj_t *no = js_alloc_ta(vm, ta->kind, NULL, 0, e - s);
+	js_ta_data_t *nta = (js_ta_data_t *)no->host_ptr;
+	if (e > s) memcpy(nta->bytes, ta->bytes + s * ta->elem_size, (e - s) * ta->elem_size);
+	return ipo_js_obj_val(no);
+}
+
+static ipo_js_val_t js_ta_set(ipo_js_vm_t *vm, ipo_js_val_t tv, int argc, const ipo_js_val_t *argv, void *ud) {
+	(void)ud;
+	if (tv.type != JS_T_OBJECT || !tv.u.obj || tv.u.obj->host_tag != JS_HTAG_TA || argc < 1) return ipo_js_undef();
+	js_ta_data_t *ta = (js_ta_data_t *)tv.u.obj->host_ptr;
+	size_t off = (argc >= 2) ? (size_t)ipo_js_to_i32(vm, argv[1]) : 0;
+	ipo_js_obj_t *src = js_collect_iterable(vm, argv[0]);
+	size_t top = ipo_js_gc_push_root(vm, ipo_js_obj_val(src));
+	for (size_t i = 0; i < src->u.arr.len && off + i < ta->len; i++) {
+		js_ta_write_elem(ta, off + i, ipo_js_to_num(vm, src->u.arr.items[i]));
+	}
+	ipo_js_gc_pop_roots(vm, top);
+	return ipo_js_undef();
+}
+
+static ipo_js_val_t js_ta_fill(ipo_js_vm_t *vm, ipo_js_val_t tv, int argc, const ipo_js_val_t *argv, void *ud) {
+	(void)ud;
+	if (tv.type != JS_T_OBJECT || !tv.u.obj || tv.u.obj->host_tag != JS_HTAG_TA) return tv;
+	js_ta_data_t *ta = (js_ta_data_t *)tv.u.obj->host_ptr;
+	double fv = argc >= 1 ? ipo_js_to_num(vm, argv[0]) : 0.0;
+	size_t s = (argc >= 2 && argv[1].type != JS_T_UNDEFINED) ? norm_idx(ipo_js_to_i32(vm, argv[1]), ta->len) : 0;
+	size_t e = (argc >= 3 && argv[2].type != JS_T_UNDEFINED) ? norm_idx(ipo_js_to_i32(vm, argv[2]), ta->len) : ta->len;
+	for (size_t i = s; i < e; i++) js_ta_write_elem(ta, i, fv);
+	return tv;
+}
+
+/* TextEncoder & TextDecoder */
+static ipo_js_val_t js_te_encode(ipo_js_vm_t *vm, ipo_js_val_t tv, int argc, const ipo_js_val_t *argv, void *ud) {
+	(void)tv; (void)ud;
+	size_t slen = 0;
+	const char *s = (argc >= 1 && argv[0].type != JS_T_UNDEFINED) ? ipo_js_cstr(vm, argv[0], &slen) : "";
+	ipo_js_obj_t *ta_obj = js_alloc_ta(vm, 0, NULL, 0, slen);
+	js_ta_data_t *ta = (js_ta_data_t *)ta_obj->host_ptr;
+	if (slen > 0) memcpy(ta->bytes, s, slen);
+	return ipo_js_obj_val(ta_obj);
+}
+
+static ipo_js_val_t js_te_ctor(ipo_js_vm_t *vm, ipo_js_val_t tv, int argc, const ipo_js_val_t *argv, void *ud) {
+	(void)argc; (void)argv; (void)ud;
+	ipo_js_obj_t *o = (tv.type == JS_T_OBJECT && tv.u.obj) ? tv.u.obj : ipo_js_new_object(vm, vm->obj_proto);
+	ipo_js_set_prop(vm, o, "encoding", ipo_js_str_cstr(vm, "utf-8"));
+	ipo_js_set_prop(vm, o, "encode", ipo_js_obj_val(ipo_js_new_native_fn(vm, "encode", js_te_encode, NULL, 0)));
+	return ipo_js_obj_val(o);
+}
+
+static ipo_js_val_t js_td_decode(ipo_js_vm_t *vm, ipo_js_val_t tv, int argc, const ipo_js_val_t *argv, void *ud) {
+	(void)tv; (void)ud;
+	if (argc < 1 || argv[0].type != JS_T_OBJECT || !argv[0].u.obj) return ipo_js_str_cstr(vm, "");
+	ipo_js_obj_t *o = argv[0].u.obj;
+	if (o->host_tag == JS_HTAG_TA && o->host_ptr) {
+		js_ta_data_t *ta = (js_ta_data_t *)o->host_ptr;
+		return ipo_js_str_new(vm, (const char *)ta->bytes, ta->len * ta->elem_size);
+	}
+	if (o->host_tag == JS_HTAG_ABUF && o->host_ptr) {
+		js_abuf_data_t *ab = (js_abuf_data_t *)o->host_ptr;
+		return ipo_js_str_new(vm, (const char *)ab->bytes, ab->len);
+	}
+	return ipo_js_str_cstr(vm, "");
+}
+
+static ipo_js_val_t js_td_ctor(ipo_js_vm_t *vm, ipo_js_val_t tv, int argc, const ipo_js_val_t *argv, void *ud) {
+	(void)ud;
+	ipo_js_obj_t *o = (tv.type == JS_T_OBJECT && tv.u.obj) ? tv.u.obj : ipo_js_new_object(vm, vm->obj_proto);
+	const char *enc = (argc >= 1 && argv[0].type != JS_T_UNDEFINED) ? ipo_js_cstr(vm, argv[0], NULL) : "utf-8";
+	ipo_js_set_prop(vm, o, "encoding", ipo_js_str_cstr(vm, enc));
+	ipo_js_set_prop(vm, o, "decode", ipo_js_obj_val(ipo_js_new_native_fn(vm, "decode", js_td_decode, NULL, 0)));
+	return ipo_js_obj_val(o);
+}
+
+/* Unified iterable collector for for..of, spread, Array.from, Map/Set, Promise.all */
+static ipo_js_obj_t *js_collect_iterable(ipo_js_vm_t *vm, ipo_js_val_t rhs) {
+	ipo_js_obj_t *items = ipo_js_new_array(vm, 0);
+	size_t top = ipo_js_gc_push_root(vm, ipo_js_obj_val(items));
+	if (rhs.type == JS_T_STRING && rhs.u.str) {
+		for (size_t i = 0; i < rhs.u.str->len; i++)
+			ipo_js_arr_push(vm, items, ipo_js_str_new(vm, &rhs.u.str->data[i], 1));
+	} else if (rhs.type == JS_T_OBJECT && rhs.u.obj) {
+		ipo_js_obj_t *o = rhs.u.obj;
+		if (o->kind == JS_OBJ_ARRAY) {
+			for (size_t i = 0; i < o->u.arr.len; i++) ipo_js_arr_push(vm, items, o->u.arr.items[i]);
+		} else if (o->host_tag == JS_HTAG_SET && o->host_ptr) {
+			js_set_data_t *s = (js_set_data_t *)o->host_ptr;
+			for (size_t i = 0; i < s->len; i++) ipo_js_arr_push(vm, items, s->items[i]);
+		} else if (o->host_tag == JS_HTAG_MAP && o->host_ptr) {
+			js_map_data_t *m = (js_map_data_t *)o->host_ptr;
+			for (size_t i = 0; i < m->len; i++) {
+				ipo_js_obj_t *pair = ipo_js_new_array(vm, 2);
+				pair->u.arr.items[0] = m->keys[i];
+				pair->u.arr.items[1] = m->vals[i];
+				ipo_js_arr_push(vm, items, ipo_js_obj_val(pair));
+			}
+		} else if (o->host_tag == JS_HTAG_TA && o->host_ptr) {
+			js_ta_data_t *ta = (js_ta_data_t *)o->host_ptr;
+			for (size_t i = 0; i < ta->len; i++) ipo_js_arr_push(vm, items, ipo_js_num(js_ta_read_elem(ta, i)));
+		} else {
+			ipo_js_val_t lv = ipo_js_undef();
+			if (ipo_js_get_prop(vm, o, "length", &lv) && lv.type == JS_T_NUMBER && lv.u.num > 0) {
+				size_t n = (size_t)lv.u.num;
+				if (n > 1000000) n = 1000000;
+				for (size_t i = 0; i < n; i++) {
+					char nb[24]; snprintf(nb, sizeof(nb), "%lu", (unsigned long)i);
+					ipo_js_val_t ev = ipo_js_undef();
+					ipo_js_get_prop(vm, o, nb, &ev);
+					ipo_js_arr_push(vm, items, ev);
+				}
+			}
+		}
+	}
+	ipo_js_gc_pop_roots(vm, top);
+	return items;
+}
+
+/* Additional String methods */
+static ipo_js_val_t js_str_at(ipo_js_vm_t *vm, ipo_js_val_t tv, int argc, const ipo_js_val_t *argv, void *ud) {
+	int want_cp = (int)(intptr_t)ud;
+	size_t len = 0;
+	const char *s = ipo_js_cstr(vm, tv, &len);
+	int64_t idx = (argc >= 1) ? (int64_t)ipo_js_to_i32(vm, argv[0]) : 0;
+	if (!want_cp && idx < 0) idx += (int64_t)len;
+	if (idx < 0 || (size_t)idx >= len) return ipo_js_undef();
+	return want_cp ? ipo_js_num((double)(unsigned char)s[(size_t)idx]) : ipo_js_str_new(vm, s + (size_t)idx, 1);
+}
+
+static ipo_js_val_t js_str_match_all(ipo_js_vm_t *vm, ipo_js_val_t tv, int argc, const ipo_js_val_t *argv, void *ud) {
+	(void)ud;
+	size_t slen = 0;
+	const char *s = ipo_js_cstr(vm, tv, &slen);
+	ipo_js_obj_t *out = ipo_js_new_array(vm, 0);
+	if (argc < 1) return ipo_js_obj_val(out);
+	const char *pat = NULL;
+	size_t plen = 0;
+	uint8_t fl = 2;
+	if (argv[0].type == JS_T_OBJECT && argv[0].u.obj && argv[0].u.obj->kind == JS_OBJ_REGEXP) {
+		pat = argv[0].u.obj->u.re.pattern->data;
+		plen = argv[0].u.obj->u.re.pattern->len;
+		fl = argv[0].u.obj->u.re.flags | 2;
+	} else {
+		pat = ipo_js_cstr(vm, argv[0], &plen);
+	}
+	re_prog_t *prog = re_compile(pat, plen, fl);
+	size_t pos = 0, ms = 0, me = 0;
+	re_state_t st;
+	if (!re_state_init(&st, prog ? (prog->num_groups + 1) : 1)) {
+		re_free(prog);
+		return ipo_js_obj_val(out);
+	}
+	size_t top = ipo_js_gc_push_root(vm, ipo_js_obj_val(out));
+	while (pos <= slen && re_exec_at(prog, s, slen, pos, &st, &ms, &me)) {
+		ipo_js_obj_t *m = ipo_js_new_array(vm, 0);
+		ipo_js_arr_push(vm, m, ipo_js_str_new(vm, s + ms, me - ms));
+		for (int g = 1; g <= prog->num_groups && g < st.cap_count; g++) {
+			if (st.cap_start[g] >= 0 && st.cap_end[g] >= st.cap_start[g])
+				ipo_js_arr_push(vm, m, ipo_js_str_new(vm, s + st.cap_start[g], (size_t)(st.cap_end[g] - st.cap_start[g])));
+			else ipo_js_arr_push(vm, m, ipo_js_undef());
+		}
+		ipo_js_set_prop(vm, m, "index", ipo_js_num((double)ms));
+		ipo_js_arr_push(vm, out, ipo_js_obj_val(m));
+		pos = (me > ms) ? me : (me + 1);
+	}
+	re_state_free(&st);
+	re_free(prog);
+	ipo_js_gc_pop_roots(vm, top);
+	return ipo_js_obj_val(out);
+}
+
+/* Promise.all / race / allSettled / any & finally */
+static ipo_js_val_t js_prom_comb_cb(ipo_js_vm_t *vm, ipo_js_val_t tv, int argc, const ipo_js_val_t *argv, void *ud) {
+	(void)tv;
+	ipo_js_obj_t *state = (ipo_js_obj_t *)ud;
+	ipo_js_val_t idx_v = ipo_js_undef(), mode_v = ipo_js_undef(), out_v = ipo_js_undef();
+	ipo_js_val_t rem_v = ipo_js_undef(), res_v = ipo_js_undef(), is_rej_v = ipo_js_undef();
+	ipo_js_get_prop(vm, state, "i", &idx_v);
+	ipo_js_get_prop(vm, state, "m", &mode_v);
+	ipo_js_get_prop(vm, state, "a", &res_v);
+	ipo_js_get_prop(vm, state, "p", &out_v);
+	ipo_js_get_prop(vm, state, "c", &rem_v);
+	ipo_js_get_prop(vm, state, "r", &is_rej_v);
+	int idx = (int)idx_v.u.num, mode = (int)mode_v.u.num, is_rej = (int)is_rej_v.u.b;
+	int rem = (int)rem_v.u.num;
+	ipo_js_obj_t *outp = out_v.u.obj;
+	if (!outp || outp->u.prom.state != 0) return ipo_js_undef();
+	ipo_js_val_t val = argc >= 1 ? argv[0] : ipo_js_undef();
+
+	if (mode == 1) { /* race */
+		promise_settle(vm, outp, is_rej ? 2 : 1, val);
+		return ipo_js_undef();
+	}
+	if (mode == 0) { /* all */
+		if (is_rej) { promise_settle(vm, outp, 2, val); return ipo_js_undef(); }
+		if (res_v.type == JS_T_OBJECT && res_v.u.obj && res_v.u.obj->kind == JS_OBJ_ARRAY && (size_t)idx < res_v.u.obj->u.arr.len)
+			res_v.u.obj->u.arr.items[idx] = val;
+	} else if (mode == 2) { /* allSettled */
+		ipo_js_obj_t *entry = ipo_js_new_object(vm, vm->obj_proto);
+		ipo_js_set_prop(vm, entry, "status", ipo_js_str_cstr(vm, is_rej ? "rejected" : "fulfilled"));
+		ipo_js_set_prop(vm, entry, is_rej ? "reason" : "value", val);
+		if (res_v.type == JS_T_OBJECT && res_v.u.obj && res_v.u.obj->kind == JS_OBJ_ARRAY && (size_t)idx < res_v.u.obj->u.arr.len)
+			res_v.u.obj->u.arr.items[idx] = ipo_js_obj_val(entry);
+	} else if (mode == 3) { /* any */
+		if (!is_rej) { promise_settle(vm, outp, 1, val); return ipo_js_undef(); }
+	}
+	ipo_js_val_t holder = ipo_js_undef();
+	if (ipo_js_get_prop(vm, state, "h", &holder) && holder.type == JS_T_OBJECT && holder.u.obj) {
+		ipo_js_val_t hc = ipo_js_undef();
+		ipo_js_get_prop(vm, holder.u.obj, "rem", &hc);
+		int hrem = (int)hc.u.num - 1;
+		ipo_js_set_prop(vm, holder.u.obj, "rem", ipo_js_num((double)hrem));
+		if (hrem <= 0) {
+			if (mode == 3) promise_settle(vm, outp, 2, ipo_js_obj_val(ipo_js_new_error(vm, "AggregateError", "All promises were rejected")));
+			else promise_settle(vm, outp, 1, res_v);
+		}
+	}
+	return ipo_js_undef();
+}
+
+static ipo_js_val_t js_prom_comb(ipo_js_vm_t *vm, ipo_js_val_t tv, int argc, const ipo_js_val_t *argv, void *ud) {
+	(void)tv;
+	int mode = (int)(intptr_t)ud; /* 0=all, 1=race, 2=allSettled, 3=any */
+	ipo_js_obj_t *outp = ipo_js_new_promise(vm);
+	size_t top = ipo_js_gc_push_root(vm, ipo_js_obj_val(outp));
+	ipo_js_obj_t *items = (argc >= 1) ? js_collect_iterable(vm, argv[0]) : ipo_js_new_array(vm, 0);
+	ipo_js_gc_push_root(vm, ipo_js_obj_val(items));
+	size_t n = items->u.arr.len;
+	ipo_js_obj_t *res_arr = ipo_js_new_array(vm, n);
+	ipo_js_gc_push_root(vm, ipo_js_obj_val(res_arr));
+	if (n == 0) {
+		if (mode == 0 || mode == 2) promise_settle(vm, outp, 1, ipo_js_obj_val(res_arr));
+		else if (mode == 3) promise_settle(vm, outp, 2, ipo_js_obj_val(ipo_js_new_error(vm, "AggregateError", "All promises were rejected")));
+		ipo_js_gc_pop_roots(vm, top);
+		return ipo_js_obj_val(outp);
+	}
+	ipo_js_obj_t *holder = ipo_js_new_object(vm, NULL);
+	ipo_js_set_prop(vm, holder, "rem", ipo_js_num((double)n));
+	for (size_t i = 0; i < n; i++) {
+		ipo_js_val_t pval = items->u.arr.items[i];
+		ipo_js_obj_t *p = (pval.type == JS_T_OBJECT && pval.u.obj && pval.u.obj->kind == JS_OBJ_PROMISE) ? pval.u.obj : NULL;
+		if (!p) {
+			p = ipo_js_new_promise(vm);
+			promise_settle(vm, p, 1, pval);
+		}
+		ipo_js_obj_t *sf = ipo_js_new_object(vm, NULL);
+		ipo_js_set_prop(vm, sf, "i", ipo_js_num((double)i));
+		ipo_js_set_prop(vm, sf, "m", ipo_js_num((double)mode));
+		ipo_js_set_prop(vm, sf, "a", ipo_js_obj_val(res_arr));
+		ipo_js_set_prop(vm, sf, "p", ipo_js_obj_val(outp));
+		ipo_js_set_prop(vm, sf, "h", ipo_js_obj_val(holder));
+		ipo_js_set_prop(vm, sf, "r", ipo_js_bool(0));
+		ipo_js_obj_t *sr = ipo_js_new_object(vm, NULL);
+		ipo_js_set_prop(vm, sr, "i", ipo_js_num((double)i));
+		ipo_js_set_prop(vm, sr, "m", ipo_js_num((double)mode));
+		ipo_js_set_prop(vm, sr, "a", ipo_js_obj_val(res_arr));
+		ipo_js_set_prop(vm, sr, "p", ipo_js_obj_val(outp));
+		ipo_js_set_prop(vm, sr, "h", ipo_js_obj_val(holder));
+		ipo_js_set_prop(vm, sr, "r", ipo_js_bool(1));
+		ipo_js_val_t cb_args[2] = {
+			ipo_js_obj_val(ipo_js_new_native_fn(vm, "onFulfilled", js_prom_comb_cb, sf, 0)),
+			ipo_js_obj_val(ipo_js_new_native_fn(vm, "onRejected",  js_prom_comb_cb, sr, 0))
+		};
+		/* Keep sf/sr alive via closure prop on callback */
+		ipo_js_set_prop(vm, cb_args[0].u.obj, "_s", ipo_js_obj_val(sf));
+		ipo_js_set_prop(vm, cb_args[1].u.obj, "_s", ipo_js_obj_val(sr));
+		js_prom_then(vm, ipo_js_obj_val(p), 2, cb_args, (void *)0);
+	}
+	ipo_js_gc_pop_roots(vm, top);
+	return ipo_js_obj_val(outp);
+}
+
+static ipo_js_val_t js_prom_finally_cb(ipo_js_vm_t *vm, ipo_js_val_t tv, int argc, const ipo_js_val_t *argv, void *ud) {
+	(void)tv;
+	ipo_js_obj_t *wrap = (ipo_js_obj_t *)ud;
+	ipo_js_val_t fn = ipo_js_undef(), is_rej = ipo_js_undef();
+	ipo_js_get_prop(vm, wrap, "fn", &fn);
+	ipo_js_get_prop(vm, wrap, "rej", &is_rej);
+	if (ipo_js_is_callable(fn)) vm_call_obj(vm, fn, ipo_js_undef(), 0, NULL, NULL);
+	ipo_js_val_t v = argc >= 1 ? argv[0] : ipo_js_undef();
+	if (ipo_js_to_bool(is_rej)) { ipo_js_throw(vm, v); return ipo_js_undef(); }
+	return v;
+}
+
+static ipo_js_val_t js_prom_finally(ipo_js_vm_t *vm, ipo_js_val_t tv, int argc, const ipo_js_val_t *argv, void *ud) {
+	(void)ud;
+	ipo_js_val_t fn = argc >= 1 ? argv[0] : ipo_js_undef();
+	ipo_js_obj_t *wf = ipo_js_new_object(vm, NULL);
+	ipo_js_set_prop(vm, wf, "fn", fn); ipo_js_set_prop(vm, wf, "rej", ipo_js_bool(0));
+	ipo_js_obj_t *wr = ipo_js_new_object(vm, NULL);
+	ipo_js_set_prop(vm, wr, "fn", fn); ipo_js_set_prop(vm, wr, "rej", ipo_js_bool(1));
+	ipo_js_obj_t *cbf = ipo_js_new_native_fn(vm, "finFul", js_prom_finally_cb, wf, 0);
+	ipo_js_obj_t *cbr = ipo_js_new_native_fn(vm, "finRej", js_prom_finally_cb, wr, 0);
+	ipo_js_set_prop(vm, cbf, "_w", ipo_js_obj_val(wf));
+	ipo_js_set_prop(vm, cbr, "_w", ipo_js_obj_val(wr));
+	ipo_js_val_t args[2] = { ipo_js_obj_val(cbf), ipo_js_obj_val(cbr) };
+	return js_prom_then(vm, tv, 2, args, (void *)0);
+}
+
+void ipo_js_vm_queue_microtask(ipo_js_vm_t *vm, ipo_js_val_t fn) {
+	if (!vm || !ipo_js_is_callable(fn)) return;
+	vm_enqueue_microtask(vm, fn, ipo_js_undef(), NULL, 0);
+}
+
 /* =========================================================================
  * VM Initialization & Standard Library Registration
  * ========================================================================= */
@@ -6761,8 +7918,8 @@ ipo_js_vm_t *ipo_js_vm_new(void *host_ctx, int max_call_depth, int max_steps) {
 	ipo_js_vm_t *vm = (ipo_js_vm_t *)xcalloc(1, sizeof(ipo_js_vm_t));
 	vm->host_ctx = host_ctx;
 	vm->max_depth = max_call_depth > 0 ? max_call_depth : 100;
-	vm->max_steps = max_steps > 0 ? max_steps : 2000000;
-	vm->gc_threshold = 512 * 1024;
+	vm->max_steps = max_steps > 0 ? max_steps : 20000000;
+	vm->gc_threshold = 1024 * 1024;
 	vm->rng_state = (uint32_t)time(NULL) ^ 0x9E3779B9u;
 
 	vm->obj_proto     = vm_alloc_obj(vm, JS_OBJ_PLAIN, NULL);
@@ -6807,12 +7964,19 @@ ipo_js_vm_t *ipo_js_vm_new(void *host_ctx, int max_call_depth, int max_steps) {
 	add_fn(vm, vm->obj_proto, "toString",       js_obj_to_str,  NULL, 0);
 	ipo_js_obj_t *obj_ctor = ipo_js_new_native_fn(vm, "Object", js_obj_ctor, NULL, 1);
 	ipo_js_set_prop(vm, obj_ctor, "prototype", ipo_js_obj_val(vm->obj_proto));
-	add_fn(vm, obj_ctor, "keys",           js_obj_keys_vals_entries, (void *)0, 0);
-	add_fn(vm, obj_ctor, "values",         js_obj_keys_vals_entries, (void *)1, 0);
-	add_fn(vm, obj_ctor, "entries",        js_obj_keys_vals_entries, (void *)2, 0);
-	add_fn(vm, obj_ctor, "assign",         js_obj_assign,            NULL, 0);
-	add_fn(vm, obj_ctor, "create",         js_obj_create,            NULL, 0);
-	add_fn(vm, obj_ctor, "defineProperty", js_obj_define_prop,       NULL, 0);
+	add_fn(vm, obj_ctor, "keys",               js_obj_keys_vals_entries, (void *)0, 0);
+	add_fn(vm, obj_ctor, "values",             js_obj_keys_vals_entries, (void *)1, 0);
+	add_fn(vm, obj_ctor, "entries",            js_obj_keys_vals_entries, (void *)2, 0);
+	add_fn(vm, obj_ctor, "getOwnPropertyNames",js_obj_keys_vals_entries, (void *)0, 0);
+	add_fn(vm, obj_ctor, "fromEntries",        js_obj_from_entries,      NULL, 0);
+	add_fn(vm, obj_ctor, "assign",             js_obj_assign,            NULL, 0);
+	add_fn(vm, obj_ctor, "create",             js_obj_create,            NULL, 0);
+	add_fn(vm, obj_ctor, "defineProperty",     js_obj_define_prop,       NULL, 0);
+	add_fn(vm, obj_ctor, "getPrototypeOf",     js_obj_get_proto,         NULL, 0);
+	add_fn(vm, obj_ctor, "setPrototypeOf",     js_obj_set_proto,         NULL, 0);
+	add_fn(vm, obj_ctor, "freeze",             js_obj_freeze_id,         NULL, 0);
+	add_fn(vm, obj_ctor, "seal",               js_obj_freeze_id,         NULL, 0);
+	add_fn(vm, obj_ctor, "is",                 js_obj_is,                NULL, 0);
 	ipo_js_set_prop(vm, g, "Object", ipo_js_obj_val(obj_ctor));
 
 	/* Array */
@@ -6840,11 +8004,16 @@ ipo_js_vm_t *ipo_js_vm_new(void *host_ctx, int max_call_depth, int max_steps) {
 	add_fn(vm, vm->arr_proto, "reduce",      js_arr_reduce,   (void *)0, 0);
 	add_fn(vm, vm->arr_proto, "reduceRight", js_arr_reduce,   (void *)1, 0);
 	add_fn(vm, vm->arr_proto, "flat",        js_arr_flat,     NULL, 0);
+	add_fn(vm, vm->arr_proto, "at",          js_arr_at,       NULL, 0);
+	add_fn(vm, vm->arr_proto, "fill",        js_arr_fill,     NULL, 0);
+	add_fn(vm, vm->arr_proto, "findLast",    js_arr_find_last,(void *)0, 0);
+	add_fn(vm, vm->arr_proto, "findLastIndex",js_arr_find_last,(void *)1, 0);
 	add_fn(vm, vm->arr_proto, "toString",    js_obj_to_str,   NULL, 0);
 	ipo_js_obj_t *arr_ctor = ipo_js_new_native_fn(vm, "Array", js_arr_ctor, NULL, 1);
 	ipo_js_set_prop(vm, arr_ctor, "prototype", ipo_js_obj_val(vm->arr_proto));
 	add_fn(vm, arr_ctor, "isArray", js_arr_is_array, NULL, 0);
 	add_fn(vm, arr_ctor, "from",    js_arr_from,     NULL, 0);
+	add_fn(vm, arr_ctor, "of",      js_arr_of,       NULL, 0);
 	ipo_js_set_prop(vm, g, "Array", ipo_js_obj_val(arr_ctor));
 
 	/* String */
@@ -6863,10 +8032,15 @@ ipo_js_vm_t *ipo_js_vm_new(void *host_ctx, int max_call_depth, int max_steps) {
 	add_fn(vm, vm->str_proto, "trim",        js_str_case_trim,    (void *)2, 0);
 	add_fn(vm, vm->str_proto, "trimStart",   js_str_case_trim,    (void *)3, 0);
 	add_fn(vm, vm->str_proto, "trimEnd",     js_str_case_trim,    (void *)4, 0);
+	add_fn(vm, vm->str_proto, "trimLeft",    js_str_case_trim,    (void *)3, 0);
+	add_fn(vm, vm->str_proto, "trimRight",   js_str_case_trim,    (void *)4, 0);
+	add_fn(vm, vm->str_proto, "at",          js_str_at,           (void *)0, 0);
+	add_fn(vm, vm->str_proto, "codePointAt", js_str_at,           (void *)1, 0);
 	add_fn(vm, vm->str_proto, "split",       js_str_split,        NULL, 0);
 	add_fn(vm, vm->str_proto, "replace",     js_str_replace,      (void *)0, 0);
 	add_fn(vm, vm->str_proto, "replaceAll",  js_str_replace,      (void *)1, 0);
 	add_fn(vm, vm->str_proto, "match",       js_str_match,        NULL, 0);
+	add_fn(vm, vm->str_proto, "matchAll",    js_str_match_all,    NULL, 0);
 	add_fn(vm, vm->str_proto, "repeat",      js_str_repeat_pad,   (void *)0, 0);
 	add_fn(vm, vm->str_proto, "padStart",    js_str_repeat_pad,   (void *)1, 0);
 	add_fn(vm, vm->str_proto, "padEnd",      js_str_repeat_pad,   (void *)2, 0);
@@ -6957,13 +8131,97 @@ ipo_js_vm_t *ipo_js_vm_new(void *host_ctx, int max_call_depth, int max_steps) {
 	add_fn(vm, g, "RangeError",     js_err_ctor, (void *)"RangeError", 1);
 
 	/* Promise */
-	add_fn(vm, vm->promise_proto, "then",  js_prom_then, (void *)0, 0);
-	add_fn(vm, vm->promise_proto, "catch", js_prom_then, (void *)1, 0);
+	add_fn(vm, vm->promise_proto, "then",    js_prom_then,    (void *)0, 0);
+	add_fn(vm, vm->promise_proto, "catch",   js_prom_then,    (void *)1, 0);
+	add_fn(vm, vm->promise_proto, "finally", js_prom_finally, NULL, 0);
 	ipo_js_obj_t *prom_ctor = ipo_js_new_native_fn(vm, "Promise", js_prom_ctor, NULL, 1);
 	ipo_js_set_prop(vm, prom_ctor, "prototype", ipo_js_obj_val(vm->promise_proto));
-	add_fn(vm, prom_ctor, "resolve", js_prom_static_settle, (void *)1, 0);
-	add_fn(vm, prom_ctor, "reject",  js_prom_static_settle, (void *)2, 0);
+	add_fn(vm, prom_ctor, "resolve",    js_prom_static_settle, (void *)1, 0);
+	add_fn(vm, prom_ctor, "reject",     js_prom_static_settle, (void *)2, 0);
+	add_fn(vm, prom_ctor, "all",        js_prom_comb,          (void *)0, 0);
+	add_fn(vm, prom_ctor, "race",       js_prom_comb,          (void *)1, 0);
+	add_fn(vm, prom_ctor, "allSettled", js_prom_comb,          (void *)2, 0);
+	add_fn(vm, prom_ctor, "any",        js_prom_comb,          (void *)3, 0);
 	ipo_js_set_prop(vm, g, "Promise", ipo_js_obj_val(prom_ctor));
+
+	/* Symbol */
+	ipo_js_obj_t *sym_ctor = ipo_js_new_native_fn(vm, "Symbol", js_sym_ctor, NULL, 0);
+	ipo_js_obj_t *sym_proto = ipo_js_new_object(vm, vm->obj_proto);
+	add_fn(vm, sym_proto, "toString", js_sym_to_str, NULL, 0);
+	ipo_js_set_prop(vm, sym_ctor, "prototype", ipo_js_obj_val(sym_proto));
+	ipo_js_set_prop(vm, g, "Symbol", ipo_js_obj_val(sym_ctor));
+	add_fn(vm, sym_ctor, "for", js_sym_for, NULL, 0);
+	ipo_js_set_prop(vm, sym_ctor, "iterator",      ipo_js_obj_val(js_make_symbol(vm, "Symbol.iterator")));
+	ipo_js_set_prop(vm, sym_ctor, "asyncIterator", ipo_js_obj_val(js_make_symbol(vm, "Symbol.asyncIterator")));
+	ipo_js_set_prop(vm, sym_ctor, "toStringTag",   ipo_js_obj_val(js_make_symbol(vm, "Symbol.toStringTag")));
+	ipo_js_set_prop(vm, sym_ctor, "hasInstance",   ipo_js_obj_val(js_make_symbol(vm, "Symbol.hasInstance")));
+
+	/* Map & WeakMap */
+	for (int wk = 0; wk <= 1; wk++) {
+		const char *nm = wk ? "WeakMap" : "Map";
+		ipo_js_obj_t *mproto = ipo_js_new_object(vm, vm->obj_proto);
+		add_fn(vm, mproto, "get",     js_map_op, (void *)0, 0);
+		add_fn(vm, mproto, "set",     js_map_op, (void *)1, 0);
+		add_fn(vm, mproto, "has",     js_map_op, (void *)2, 0);
+		add_fn(vm, mproto, "delete",  js_map_op, (void *)3, 0);
+		if (!wk) {
+			add_fn(vm, mproto, "clear",   js_map_op, (void *)4, 0);
+			add_fn(vm, mproto, "forEach", js_map_op, (void *)5, 0);
+			add_fn(vm, mproto, "keys",    js_map_op, (void *)6, 0);
+			add_fn(vm, mproto, "values",  js_map_op, (void *)7, 0);
+			add_fn(vm, mproto, "entries", js_map_op, (void *)8, 0);
+		}
+		ipo_js_obj_t *mctor = ipo_js_new_native_fn(vm, nm, js_map_ctor, (void *)(intptr_t)wk, 1);
+		ipo_js_set_prop(vm, mctor, "prototype", ipo_js_obj_val(mproto));
+		ipo_js_set_prop(vm, mproto, "constructor", ipo_js_obj_val(mctor));
+		ipo_js_set_prop(vm, g, nm, ipo_js_obj_val(mctor));
+	}
+
+	/* Set & WeakSet */
+	for (int wk = 0; wk <= 1; wk++) {
+		const char *nm = wk ? "WeakSet" : "Set";
+		ipo_js_obj_t *sproto = ipo_js_new_object(vm, vm->obj_proto);
+		add_fn(vm, sproto, "add",    js_set_op, (void *)0, 0);
+		add_fn(vm, sproto, "has",    js_set_op, (void *)1, 0);
+		add_fn(vm, sproto, "delete", js_set_op, (void *)2, 0);
+		if (!wk) {
+			add_fn(vm, sproto, "clear",   js_set_op, (void *)3, 0);
+			add_fn(vm, sproto, "forEach", js_set_op, (void *)4, 0);
+			add_fn(vm, sproto, "keys",    js_set_op, (void *)5, 0);
+			add_fn(vm, sproto, "values",  js_set_op, (void *)5, 0);
+			add_fn(vm, sproto, "entries", js_set_op, (void *)6, 0);
+		}
+		ipo_js_obj_t *sctor = ipo_js_new_native_fn(vm, nm, js_set_ctor, (void *)(intptr_t)wk, 1);
+		ipo_js_set_prop(vm, sctor, "prototype", ipo_js_obj_val(sproto));
+		ipo_js_set_prop(vm, sproto, "constructor", ipo_js_obj_val(sctor));
+		ipo_js_set_prop(vm, g, nm, ipo_js_obj_val(sctor));
+	}
+
+	/* ArrayBuffer & TypedArrays */
+	ipo_js_obj_t *ab_proto = ipo_js_new_object(vm, vm->obj_proto);
+	add_fn(vm, ab_proto, "slice", js_abuf_slice, NULL, 0);
+	ipo_js_obj_t *ab_ctor = ipo_js_new_native_fn(vm, "ArrayBuffer", js_abuf_ctor, NULL, 1);
+	ipo_js_set_prop(vm, ab_ctor, "prototype", ipo_js_obj_val(ab_proto));
+	ipo_js_set_prop(vm, ab_proto, "constructor", ipo_js_obj_val(ab_ctor));
+	ipo_js_set_prop(vm, g, "ArrayBuffer", ipo_js_obj_val(ab_ctor));
+
+	for (int tk = 0; tk < 9; tk++) {
+		ipo_js_obj_t *tproto = ipo_js_new_object(vm, vm->obj_proto);
+		add_fn(vm, tproto, "subarray", js_ta_subslice, (void *)0, 0);
+		add_fn(vm, tproto, "slice",    js_ta_subslice, (void *)1, 0);
+		add_fn(vm, tproto, "set",      js_ta_set,      NULL, 0);
+		add_fn(vm, tproto, "fill",     js_ta_fill,     NULL, 0);
+		ipo_js_set_prop(vm, tproto, "BYTES_PER_ELEMENT", ipo_js_num((double)s_ta_esize[tk]));
+		ipo_js_obj_t *tctor = ipo_js_new_native_fn(vm, s_ta_names[tk], js_ta_ctor, (void *)(intptr_t)tk, 1);
+		ipo_js_set_prop(vm, tctor, "prototype", ipo_js_obj_val(tproto));
+		ipo_js_set_prop(vm, tproto, "constructor", ipo_js_obj_val(tctor));
+		ipo_js_set_prop(vm, tctor, "BYTES_PER_ELEMENT", ipo_js_num((double)s_ta_esize[tk]));
+		ipo_js_set_prop(vm, g, s_ta_names[tk], ipo_js_obj_val(tctor));
+	}
+
+	/* TextEncoder / TextDecoder */
+	add_fn(vm, g, "TextEncoder", js_te_ctor, NULL, 1);
+	add_fn(vm, g, "TextDecoder", js_td_ctor, NULL, 1);
 
 	/* console */
 	ipo_js_obj_t *con_o = ipo_js_new_object(vm, vm->obj_proto);

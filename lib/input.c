@@ -127,8 +127,30 @@ char get_char(uint8_t scancode) {
 /* Mouse API */
 void mouse_get_state(mouse_state_t *out_state) {
     if (!out_state) return;
+    static uint8_t *s_raw_pkt = NULL;
+    static size_t s_raw_cap = 0u;
+    if (!s_raw_pkt || s_raw_cap < 4u) {
+        uint8_t *nb = (uint8_t *)realloc(s_raw_pkt, 4u);
+        if (nb) {
+            s_raw_pkt = nb;
+            s_raw_cap = 4u;
+        }
+    }
+    out_state->raw_packet = s_raw_pkt;
+    out_state->raw_packet_len = s_raw_cap;
     uint32_t arg = (uint32_t)(uintptr_t)out_state;
     ipo_syscall(IPO_SYSCALL_MOUSE_GET_STATE, 1u, &arg);
+    if (out_state->raw_packet_len > s_raw_cap) {
+        size_t ncap = out_state->raw_packet_len;
+        uint8_t *nb = (uint8_t *)realloc(s_raw_pkt, ncap);
+        if (nb) {
+            s_raw_pkt = nb;
+            s_raw_cap = ncap;
+            out_state->raw_packet = s_raw_pkt;
+            out_state->raw_packet_len = s_raw_cap;
+            ipo_syscall(IPO_SYSCALL_MOUSE_GET_STATE, 1u, &arg);
+        }
+    }
 }
 
 void mouse_get_cumulative_motion(int64_t *out_x, int64_t *out_y) {

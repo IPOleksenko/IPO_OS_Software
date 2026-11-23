@@ -1,0 +1,56 @@
+#pragma once
+#include_next <algorithm>
+#include <cstddef>
+
+namespace std {
+
+template <class It>
+ptrdiff_t distance(It first, It last) {
+    return last - first;
+}
+
+template <class It, class UnaryPredicate>
+It remove_if(It first, It last, UnaryPredicate p) {
+    It result = first;
+    for (; first != last; ++first) {
+        if (!p(*first)) {
+            if (result != first) *result = std::move(*first);
+            ++result;
+        }
+    }
+    return result;
+}
+
+template <class ForwardIt>
+ForwardIt shift_left(ForwardIt first, ForwardIt last, ptrdiff_t n) {
+    if (n <= 0) return last;
+    ptrdiff_t len = last - first;
+    if (n >= len) return first;
+    ForwardIt src = first + n;
+    ForwardIt dst = first;
+    while (src != last) {
+        *dst++ = std::move(*src++);
+    }
+    return dst;
+}
+
+template <class RandomIt, class Compare>
+void sort(RandomIt first, RandomIt last, Compare comp) {
+    ptrdiff_t n = last - first;
+    for (ptrdiff_t i = 1; i < n; ++i) {
+        auto key = std::move(first[i]);
+        ptrdiff_t j = i - 1;
+        while (j >= 0 && comp(key, first[j])) {
+            first[j + 1] = std::move(first[j]);
+            --j;
+        }
+        first[j + 1] = std::move(key);
+    }
+}
+
+template <class RandomIt>
+void sort(RandomIt first, RandomIt last) {
+    sort(first, last, [](const auto& a, const auto& b) { return a < b; });
+}
+
+} // namespace std

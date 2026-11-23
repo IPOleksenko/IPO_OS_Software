@@ -1,0 +1,22 @@
+[package]
+name = "pokered-ipo"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "pokered_ipo"
+crate-type = ["staticlib"]
+
+[dependencies]
+pokered-app = { path = "../../../third_party/open-pokered/crates/pokered-app", default-features = false, features = ["mobile"] }
+pokered-core = { path = "../../../third_party/open-pokered/crates/pokered-core", default-features = false, features = ["embedded-map-data", "embedded-scripts"] }
+pokered-renderer = { path = "../../../third_party/open-pokered/crates/pokered-renderer", default-features = false, features = ["framebuffer", "embedded-assets"] }
+
+[patch.crates-io]
+ron = { path = "../../../third_party/open-pokered/vendor/ron" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+panic = "abort"

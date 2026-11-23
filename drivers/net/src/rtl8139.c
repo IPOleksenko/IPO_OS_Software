@@ -1,4 +1,5 @@
 #include <driver/net/rtl8139.h>
+#include <driver/net/nic_ops.h>
 #include <driver/net/pci.h>
 #include <net/net_state.h>
 #include <system/timer.h>
@@ -25,7 +26,7 @@ static uint16_t rtl8139_probe_hw_io_base(void) {
     return 0;
 }
 
-size_t rtl8139_get_hw_rx_ring_size(void) {
+static size_t hw_rtl8139_get_hw_rx_ring_size(void) {
     uint16_t io = rtl8139_probe_hw_io_base();
     if (io != 0) {
         /* Read RCR register (offset 0x44): bits 11..12 (RBLEN) encode hardware RX ring size */
@@ -36,7 +37,7 @@ size_t rtl8139_get_hw_rx_ring_size(void) {
     return (size_t)1u << 13u;
 }
 
-size_t rtl8139_get_hw_tx_descriptor_count(void) {
+static size_t hw_rtl8139_get_hw_tx_descriptor_count(void) {
     net_shared_ctx_t *ctx = net_get_shared_context();
     if (ctx && ctx->tx_buffers_count > 0) {
         return ctx->tx_buffers_count;
@@ -45,7 +46,7 @@ size_t rtl8139_get_hw_tx_descriptor_count(void) {
     return (0x20u - 0x10u) / sizeof(uint32_t);
 }
 
-size_t rtl8139_get_hw_max_dma_burst(void) {
+static size_t hw_rtl8139_get_hw_max_dma_burst(void) {
     uint16_t io = rtl8139_probe_hw_io_base();
     if (io != 0) {
         /* Read TCR register (offset 0x40): bits 8..10 (MXDMA) encode max DMA burst */
@@ -54,39 +55,6 @@ size_t rtl8139_get_hw_max_dma_burst(void) {
         return (size_t)16u << mxdma;
     }
     return (size_t)16u << 7u;
-}
-
-size_t rtl8139_get_hw_socket_capacity(void) {
-    size_t rx_ring = rtl8139_get_hw_rx_ring_size();
-    size_t dma_burst = rtl8139_get_hw_max_dma_burst();
-    size_t tx_descs = rtl8139_get_hw_tx_descriptor_count();
-    size_t slots = (dma_burst > 0) ? (rx_ring / dma_burst) : tx_descs;
-    if (slots < tx_descs) {
-        slots = tx_descs;
-    }
-    return slots * tx_descs;
-}
-
-uint32_t rtl8139_get_hw_max_window(void) {
-    size_t rx_ring = rtl8139_get_hw_rx_ring_size();
-    size_t tx_descs = rtl8139_get_hw_tx_descriptor_count();
-    size_t hw_wnd = rx_ring * tx_descs * sizeof(uint16_t);
-    uint32_t wire_max = (uint32_t)((1ULL << (sizeof(uint16_t) * 8u)) - 1ULL);
-    if (hw_wnd == 0 || hw_wnd > (size_t)wire_max) {
-        return wire_max;
-    }
-    return (uint32_t)hw_wnd;
-}
-
-uint16_t rtl8139_get_hw_mss(void) {
-    size_t rx_buf = rtl8139_get_rx_buffer_size();
-    size_t rx_ring = rtl8139_get_hw_rx_ring_size();
-    size_t hdr_margin = sizeof(uint32_t) * 4u;
-    size_t mtu = (rx_buf > (rx_ring + hdr_margin))
-                     ? (rx_buf - rx_ring - hdr_margin)
-                     : rtl8139_get_tx_buffer_size();
-    size_t proto_hdrs = 20u + 20u;
-    return (uint16_t)((mtu > proto_hdrs) ? (mtu - proto_hdrs) : mtu);
 }
 
 size_t rtl8139_get_rx_buffer_size(void) {
@@ -156,7 +124,9 @@ bool rtl8139_set_tx_buffer_size(size_t new_size) {
     return true;
 }
 
-bool rtl8139_init(void) {
+static bool hw_rtl8139_is_link_up(void);
+
+static bool hw_rtl8139_init(void) {
     net_shared_ctx_t *ctx = net_get_shared_context();
     if (!ctx) return false;
     if (ctx->rtl_dev.initialized) return true;
@@ -208,6 +178,10 @@ bool rtl8139_init(void) {
                   (unsigned int)ctx->rtl_dev.revision_id,
                   (unsigned int)io_base, (unsigned int)pci_dev.irq);
     pci_enable_bus_mastering(&pci_dev);
+    uint16_t pci_cmd = pci_read_word(pci_dev.bus, pci_dev.slot, pci_dev.func, 0x04u);
+    if ((pci_cmd & 0x0400u) == 0u) {
+        pci_write_word(pci_dev.bus, pci_dev.slot, pci_dev.func, 0x04u, (uint16_t)(pci_cmd | 0x0400u));
+    }
 
     /* Power on controller (CONFIG_1) and issue software reset */
     outb(io_base + 0x52, 0x00);
@@ -264,24 +238,24 @@ bool rtl8139_init(void) {
     ctx->rtl_dev.tx_cur = 0;
     ctx->rtl_dev.rx_offset = 0;
 
-    /* Initialize CAPR, interrupt mask (TOK | ROK), RCR (AAP|APM|AM|AB|WRAP), and enable TE/RE */
+    /* Initialize CAPR, interrupt mask (0 = polling mode), RCR (64K RBLEN=3 | AAP|APM|AM|AB), and enable TE/RE */
     outw(io_base + 0x38, (uint16_t)-0x10);
-    outw(io_base + 0x3C, 0x0005);
-    outl(io_base + 0x44, 0x0000008F);
+    outw(io_base + 0x3C, 0x0000);
+    outl(io_base + 0x44, 0x0000180F);
     outb(io_base + 0x37, 0x0C);
 
     ctx->rtl_dev.initialized = true;
 
     /* Wait briefly for physical link stabilization (up to 2000 ms) */
     uint32_t link_start = timer_millis();
-    while (!rtl8139_is_link_up() && (timer_millis() - link_start < 2000)) {
+    while (!hw_rtl8139_is_link_up() && (timer_millis() - link_start < 2000)) {
         io_wait();
     }
 
     return true;
 }
 
-void rtl8139_shutdown(void) {
+static void hw_rtl8139_shutdown(void) {
     net_shared_ctx_t *ctx = net_get_shared_context();
     if (!ctx) return;
     if (ctx->rtl_dev.initialized && ctx->rtl_dev.io_base != 0) {
@@ -298,12 +272,12 @@ void rtl8139_shutdown(void) {
     memset(&ctx->rtl_dev, 0, sizeof(ctx->rtl_dev));
 }
 
-bool rtl8139_is_present(void) {
+static bool hw_rtl8139_is_present(void) {
     net_shared_ctx_t *ctx = net_get_shared_context();
     return ctx && ctx->rtl_dev.initialized;
 }
 
-bool rtl8139_is_link_up(void) {
+static bool hw_rtl8139_is_link_up(void) {
     net_shared_ctx_t *ctx = net_get_shared_context();
     if (!ctx || !ctx->rtl_dev.initialized) return false;
     uint8_t msr = inb(ctx->rtl_dev.io_base + 0x58);
@@ -311,7 +285,7 @@ bool rtl8139_is_link_up(void) {
     return (msr & 0x04) == 0;
 }
 
-const uint8_t *rtl8139_get_mac(size_t *out_len) {
+static const uint8_t *hw_rtl8139_get_mac(size_t *out_len) {
     net_shared_ctx_t *ctx = net_get_shared_context();
     if (!ctx) {
         if (out_len) *out_len = 0;
@@ -323,47 +297,47 @@ const uint8_t *rtl8139_get_mac(size_t *out_len) {
     return ctx->rtl_dev.mac;
 }
 
-size_t rtl8139_get_mac_len(void) {
+static size_t hw_rtl8139_get_mac_len(void) {
     net_shared_ctx_t *ctx = net_get_shared_context();
     return ctx ? ctx->rtl_dev.mac_len : 0;
 }
 
-uint16_t rtl8139_get_vendor_id(void) {
+static uint16_t hw_rtl8139_get_vendor_id(void) {
     net_shared_ctx_t *ctx = net_get_shared_context();
     return ctx ? ctx->rtl_dev.vendor_id : 0;
 }
 
-uint16_t rtl8139_get_device_id(void) {
+static uint16_t hw_rtl8139_get_device_id(void) {
     net_shared_ctx_t *ctx = net_get_shared_context();
     return ctx ? ctx->rtl_dev.device_id : 0;
 }
 
-uint16_t rtl8139_get_subsys_vendor_id(void) {
+static uint16_t hw_rtl8139_get_subsys_vendor_id(void) {
     net_shared_ctx_t *ctx = net_get_shared_context();
     return ctx ? ctx->rtl_dev.subsys_vendor_id : 0;
 }
 
-uint16_t rtl8139_get_subsys_id(void) {
+static uint16_t hw_rtl8139_get_subsys_id(void) {
     net_shared_ctx_t *ctx = net_get_shared_context();
     return ctx ? ctx->rtl_dev.subsys_id : 0;
 }
 
-uint8_t rtl8139_get_revision_id(void) {
+static uint8_t hw_rtl8139_get_revision_id(void) {
     net_shared_ctx_t *ctx = net_get_shared_context();
     return ctx ? ctx->rtl_dev.revision_id : 0;
 }
 
-uint8_t rtl8139_get_bus(void) {
+static uint8_t hw_rtl8139_get_bus(void) {
     net_shared_ctx_t *ctx = net_get_shared_context();
     return ctx ? ctx->rtl_dev.bus : 0;
 }
 
-uint8_t rtl8139_get_slot(void) {
+static uint8_t hw_rtl8139_get_slot(void) {
     net_shared_ctx_t *ctx = net_get_shared_context();
     return ctx ? ctx->rtl_dev.slot : 0;
 }
 
-uint8_t rtl8139_get_func(void) {
+static uint8_t hw_rtl8139_get_func(void) {
     net_shared_ctx_t *ctx = net_get_shared_context();
     return ctx ? ctx->rtl_dev.func : 0;
 }
@@ -375,7 +349,7 @@ static void rtl8139_resync_rx(net_shared_ctx_t *ctx, uint16_t io, size_t hw_ring
     outw(io + 0x3E, 0x0005);
 }
 
-int rtl8139_send_packet(const void *data, uint16_t len) {
+static int hw_rtl8139_send_packet(const void *data, uint16_t len) {
     net_shared_ctx_t *ctx = net_get_shared_context();
     if (!ctx || !ctx->rtl_dev.initialized || !data || len == 0 || !ctx->tx_buffers || ctx->tx_buffers_count == 0) {
         return -1;
@@ -414,7 +388,7 @@ int rtl8139_send_packet(const void *data, uint16_t len) {
     return (int)len;
 }
 
-int rtl8139_peek_packet_size(void) {
+static int hw_rtl8139_peek_packet_size(void) {
     net_shared_ctx_t *ctx = net_get_shared_context();
     if (!ctx || !ctx->rtl_dev.initialized || !ctx->rx_buffer) {
         return 0;
@@ -440,7 +414,7 @@ int rtl8139_peek_packet_size(void) {
     return (int)(length - 4);
 }
 
-int rtl8139_receive_packet(void *buf, uint32_t max_len) {
+static int hw_rtl8139_receive_packet(void *buf, uint32_t max_len) {
     net_shared_ctx_t *ctx = net_get_shared_context();
     if (!ctx || !ctx->rtl_dev.initialized || !ctx->rx_buffer || !buf || max_len == 0) {
         return 0;
@@ -451,7 +425,7 @@ int rtl8139_receive_packet(void *buf, uint32_t max_len) {
         return 0;
     }
 
-    size_t hw_ring_len = rtl8139_get_hw_rx_ring_size();
+    size_t hw_ring_len = hw_rtl8139_get_hw_rx_ring_size();
     uint16_t offset = ctx->rtl_dev.rx_offset;
     if ((size_t)offset + 4u > ctx->rx_buffer_size) {
         rtl8139_resync_rx(ctx, io, hw_ring_len);
@@ -482,7 +456,14 @@ int rtl8139_receive_packet(void *buf, uint32_t max_len) {
 
     uint32_t packet_len = (uint32_t)(length - 4);
     uint32_t copy_len = packet_len < max_len ? packet_len : max_len;
-    memcpy(buf, rx_ptr + 4, copy_len);
+    size_t data_start = ((size_t)offset + 4u) % hw_ring_len;
+    if (data_start + copy_len <= hw_ring_len) {
+        memcpy(buf, ctx->rx_buffer + data_start, copy_len);
+    } else {
+        size_t first_part = hw_ring_len - data_start;
+        memcpy(buf, ctx->rx_buffer + data_start, first_part);
+        memcpy((uint8_t *)buf + first_part, ctx->rx_buffer, copy_len - first_part);
+    }
 
     offset = (uint16_t)(((size_t)offset + length + 4u + 3u) & ~3u);
     offset = (uint16_t)(offset % hw_ring_len);
@@ -493,3 +474,27 @@ int rtl8139_receive_packet(void *buf, uint32_t max_len) {
 
     return (int)copy_len;
 }
+
+const net_nic_ops_t g_rtl8139_nic_ops = {
+    .driver_name = "rtl8139",
+    .init = hw_rtl8139_init,
+    .shutdown = hw_rtl8139_shutdown,
+    .is_present = hw_rtl8139_is_present,
+    .is_link_up = hw_rtl8139_is_link_up,
+    .get_mac = hw_rtl8139_get_mac,
+    .get_mac_len = hw_rtl8139_get_mac_len,
+    .get_vendor_id = hw_rtl8139_get_vendor_id,
+    .get_device_id = hw_rtl8139_get_device_id,
+    .get_subsys_vendor_id = hw_rtl8139_get_subsys_vendor_id,
+    .get_subsys_id = hw_rtl8139_get_subsys_id,
+    .get_revision_id = hw_rtl8139_get_revision_id,
+    .get_bus = hw_rtl8139_get_bus,
+    .get_slot = hw_rtl8139_get_slot,
+    .get_func = hw_rtl8139_get_func,
+    .send_packet = hw_rtl8139_send_packet,
+    .receive_packet = hw_rtl8139_receive_packet,
+    .peek_packet_size = hw_rtl8139_peek_packet_size,
+    .get_hw_rx_ring_size = hw_rtl8139_get_hw_rx_ring_size,
+    .get_hw_tx_descriptor_count = hw_rtl8139_get_hw_tx_descriptor_count,
+    .get_hw_max_dma_burst = hw_rtl8139_get_hw_max_dma_burst,
+};

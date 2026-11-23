@@ -40,40 +40,65 @@ typedef struct {
     size_t capacity;
 } binfmt_reg_table_t;
 
-static void binfmt_table_init(binfmt_reg_table_t *table) {
+static int binfmt_table_init(binfmt_reg_table_t *table) {
     table->capacity = 4;
     table->count = 0;
     table->items = (binfmt_reg_entry_t *)malloc(table->capacity * sizeof(binfmt_reg_entry_t));
+    if (!table->items) {
+        table->capacity = 0;
+        printf("[binfmt] Error: Out of memory initializing format table!\n");
+        return -1;
+    }
+    return 0;
 }
 
-static void binfmt_table_add(binfmt_reg_table_t *table,
-                             const char *name,
-                             const void *magic_bytes,
-                             uint32_t magic_len,
-                             uint32_t offset,
-                             const char *runner,
-                             const char *description) {
+static int binfmt_table_add(binfmt_reg_table_t *table,
+                            const char *name,
+                            const void *magic_bytes,
+                            uint32_t magic_len,
+                            uint32_t offset,
+                            const char *runner,
+                            const char *description) {
     if (table->count >= table->capacity) {
-        table->capacity *= 2;
-        binfmt_reg_entry_t *new_items = (binfmt_reg_entry_t *)realloc(table->items, table->capacity * sizeof(binfmt_reg_entry_t));
+        size_t new_cap = table->capacity ? (table->capacity * 2u) : 4u;
+        if (new_cap > ((size_t)-1) / sizeof(binfmt_reg_entry_t)) {
+            printf("[binfmt] Error: Table size overflow!\n");
+            return -1;
+        }
+        binfmt_reg_entry_t *new_items =
+            (binfmt_reg_entry_t *)realloc(table->items, new_cap * sizeof(binfmt_reg_entry_t));
         if (!new_items) {
             printf("[binfmt] Error: Out of memory expanding format table!\n");
-            return;
+            return -1;
         }
         table->items = new_items;
+        table->capacity = new_cap;
+    }
+
+    char *name_copy = dup_str(name ? name : "");
+    char *runner_copy = dup_str(runner ? runner : "");
+    char *desc_copy = dup_str(description ? description : "");
+    uint8_t *magic_copy = (uint8_t *)malloc(magic_len > 0 ? magic_len : 1);
+    if (!name_copy || !runner_copy || !desc_copy || !magic_copy) {
+        free(name_copy);
+        free(runner_copy);
+        free(desc_copy);
+        free(magic_copy);
+        printf("[binfmt] Error: Out of memory adding format '%s'!\n", name ? name : "?");
+        return -1;
+    }
+    if (magic_bytes && magic_len > 0) {
+        memcpy(magic_copy, magic_bytes, magic_len);
     }
 
     binfmt_reg_entry_t *entry = &table->items[table->count++];
-    entry->name = dup_str(name);
+    entry->name = name_copy;
+    entry->magic = magic_copy;
     entry->magic_len = magic_len;
     entry->offset = offset;
-    entry->runner = dup_str(runner);
-    entry->description = dup_str(description ? description : "");
-
-    entry->magic = (uint8_t *)malloc(magic_len > 0 ? magic_len : 1);
-    if (entry->magic && magic_bytes && magic_len > 0) {
-        memcpy(entry->magic, magic_bytes, magic_len);
-    }
+    entry->runner = runner_copy;
+    entry->description = desc_copy;
+    return 0;
 }
 
 static void binfmt_table_free(binfmt_reg_table_t *table) {
@@ -229,7 +254,9 @@ static void populate_ecosystem_formats(binfmt_reg_table_t *table) {
  */
 static int cmd_init(bool verbose) {
     binfmt_reg_table_t table;
-    binfmt_table_init(&table);
+    if (binfmt_table_init(&table) != 0) {
+        return 1;
+    }
     populate_ecosystem_formats(&table);
 
     if (verbose) {

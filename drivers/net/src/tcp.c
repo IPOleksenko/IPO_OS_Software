@@ -186,6 +186,19 @@ void tcp_free_tcb(tcp_tcb_t *tcb) {
         }
     }
 
+    if (tcb->ooo) {
+        for (size_t i = 0; i < tcb->ooo_cap; i++) {
+            if (tcb->ooo[i].data) {
+                kfree(tcb->ooo[i].data);
+                tcb->ooo[i].data = NULL;
+            }
+            tcb->ooo[i].valid = false;
+        }
+        kfree(tcb->ooo);
+        tcb->ooo = NULL;
+        tcb->ooo_cap = 0u;
+    }
+
     dyn_buf_free(&tcb->rx_buf);
     dyn_buf_free(&tcb->tx_buf);
     kfree(tcb);
@@ -535,11 +548,75 @@ void tcp_receive(ip4_addr_t src_ip, ip4_addr_t dst_ip, const void *payload, uint
                 if (seq_num == tcb->rcv_nxt) {
                     if (dyn_buf_append(&tcb->rx_buf, tcp_data, tcp_data_len)) {
                         tcb->rcv_nxt += tcp_data_len;
+                        /* Drain any contiguous out-of-order segments already queued */
+                        bool drained;
+                        do {
+                            drained = false;
+                            for (size_t oi = 0; oi < tcb->ooo_cap; oi++) {
+                                if (!tcb->ooo[oi].valid || !tcb->ooo[oi].data) continue;
+                                uint32_t s_seq = tcb->ooo[oi].seq;
+                                uint16_t s_len = tcb->ooo[oi].len;
+                                if (TCP_SEQ_LEQ(s_seq, tcb->rcv_nxt)) {
+                                    uint32_t end_seq = s_seq + (uint32_t)s_len;
+                                    if (TCP_SEQ_GT(end_seq, tcb->rcv_nxt)) {
+                                        uint32_t skip = tcb->rcv_nxt - s_seq;
+                                        uint16_t take = (uint16_t)(s_len - skip);
+                                        if (dyn_buf_append(&tcb->rx_buf, tcb->ooo[oi].data + skip, take)) {
+                                            tcb->rcv_nxt += take;
+                                        }
+                                    }
+                                    kfree(tcb->ooo[oi].data);
+                                    tcb->ooo[oi].data = NULL;
+                                    tcb->ooo[oi].valid = false;
+                                    drained = true;
+                                }
+                            }
+                        } while (drained);
+
                         uint32_t max_wnd = tcb->max_rcv_wnd ? tcb->max_rcv_wnd : rtl8139_get_hw_max_window();
                         if (tcb->rx_buf.size < max_wnd) {
                             tcb->rcv_wnd = max_wnd - (uint32_t)tcb->rx_buf.size;
                         } else {
                             tcb->rcv_wnd = 0;
+                        }
+                    }
+                    tcp_send_ack(tcb);
+                } else if (TCP_SEQ_GT(seq_num, tcb->rcv_nxt) &&
+                           (uint32_t)(seq_num - tcb->rcv_nxt) <= tcb->rcv_wnd) {
+                    /* Buffer out-of-order segment cleanly, expanding OOO slot array dynamically as needed */
+                    bool already = false;
+                    int free_slot = -1;
+                    for (size_t oi = 0; oi < tcb->ooo_cap; oi++) {
+                        if (tcb->ooo[oi].valid) {
+                            if (tcb->ooo[oi].seq == seq_num && tcb->ooo[oi].len >= tcp_data_len) {
+                                already = true;
+                                break;
+                            }
+                        } else if (free_slot < 0) {
+                            free_slot = (int)oi;
+                        }
+                    }
+                    if (!already && free_slot < 0) {
+                        size_t new_cap = tcb->ooo_cap ? (tcb->ooo_cap * 2u) : 8u;
+                        if (new_cap > tcb->ooo_cap && new_cap <= SIZE_MAX / sizeof(tcb->ooo[0])) {
+                            void *no = krealloc(tcb->ooo, new_cap * sizeof(tcb->ooo[0]));
+                            if (no) {
+                                tcb->ooo = no;
+                                memset(tcb->ooo + tcb->ooo_cap, 0,
+                                       (new_cap - tcb->ooo_cap) * sizeof(tcb->ooo[0]));
+                                free_slot = (int)tcb->ooo_cap;
+                                tcb->ooo_cap = new_cap;
+                            }
+                        }
+                    }
+                    if (!already && free_slot >= 0) {
+                        uint8_t *copy = (uint8_t *)kmalloc(tcp_data_len);
+                        if (copy) {
+                            memcpy(copy, tcp_data, tcp_data_len);
+                            tcb->ooo[free_slot].valid = true;
+                            tcb->ooo[free_slot].seq = seq_num;
+                            tcb->ooo[free_slot].len = tcp_data_len;
+                            tcb->ooo[free_slot].data = copy;
                         }
                     }
                     tcp_send_ack(tcb);

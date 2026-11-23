@@ -25,7 +25,6 @@
 
 #define VRING_DESC_F_WRITE         2u
 #define VRING_AVAIL_F_NO_INT       1u
-#define VIO_Q_MAX                  64u
 
 typedef struct {
     uint32_t device_feature_select;
@@ -49,16 +48,10 @@ typedef struct {
     uint32_t queue_device_hi;
 } __attribute__((packed)) vio_common_cfg_t;
 
-typedef struct {
-    uint8_t select;
-    uint8_t subsel;
-    uint8_t size;
-    uint8_t reserved[5];
-    union {
-        char    string[128];
-        uint8_t bitmap[128];
-    } u;
-} __attribute__((packed)) vio_input_cfg_t;
+#define VIO_CFG_OFF_SELECT         0u
+#define VIO_CFG_OFF_SUBSEL         1u
+#define VIO_CFG_OFF_SIZE           2u
+#define VIO_CFG_OFF_DATA           8u
 
 typedef struct {
     uint16_t type;
@@ -76,7 +69,7 @@ typedef struct {
 typedef struct {
     uint16_t flags;
     uint16_t idx;
-    uint16_t ring[VIO_Q_MAX];
+    uint16_t ring[];
 } __attribute__((packed)) vio_vring_avail_t;
 
 typedef struct {
@@ -87,7 +80,7 @@ typedef struct {
 typedef struct {
     uint16_t flags;
     uint16_t idx;
-    vio_vring_used_elem_t ring[VIO_Q_MAX];
+    vio_vring_used_elem_t ring[];
 } __attribute__((packed)) vio_vring_used_t;
 
 typedef struct {
@@ -103,7 +96,7 @@ typedef struct {
     uint32_t notify_mult;
     volatile uint8_t *isr;
     uint32_t isr_size;
-    volatile vio_input_cfg_t *dev_cfg;
+    volatile uint8_t *dev_cfg;
     uint32_t dev_cfg_size;
 
     uint16_t qsz;
@@ -111,13 +104,13 @@ typedef struct {
     uint16_t last_used;
 
     void *ring_virt;
-    uint32_t ring_phys;
+    uint64_t ring_phys;
     vio_vring_desc_t  *desc;
     vio_vring_avail_t *avail;
     vio_vring_used_t  *used;
 
     vio_input_event_t *buf_virt;
-    uint32_t buf_phys;
+    uint64_t buf_phys;
 
     char *name;
     char *serial;
@@ -129,36 +122,35 @@ static inline void vio_mb(void) {
     __asm__ volatile("" ::: "memory");
 }
 
-static inline void vio_read_cfg_str(volatile vio_input_cfg_t *cfg, uint8_t sel, char **out_str) {
+static inline void vio_read_cfg_str(volatile uint8_t *cfg, uint8_t sel, char **out_str) {
     if (!out_str) return;
     if (*out_str) {
         kfree(*out_str);
         *out_str = NULL;
     }
     if (!cfg) return;
-    cfg->select = sel;
-    cfg->subsel = 0;
+    cfg[VIO_CFG_OFF_SELECT] = sel;
+    cfg[VIO_CFG_OFF_SUBSEL] = 0;
     vio_mb();
-    uint8_t sz = cfg->size;
-    if (sz > sizeof(cfg->u.string)) sz = (uint8_t)sizeof(cfg->u.string);
+    uint8_t sz = cfg[VIO_CFG_OFF_SIZE];
     char *s = (char *)kmalloc((size_t)sz + 1u);
     if (!s) return;
     for (uint8_t i = 0; i < sz; i++) {
-        s[i] = cfg->u.string[i];
+        s[i] = (char)cfg[VIO_CFG_OFF_DATA + i];
     }
     s[sz] = '\0';
     *out_str = s;
 }
 
-static inline bool vio_has_ev_bit(volatile vio_input_cfg_t *cfg, uint8_t ev_type, uint16_t code) {
+static inline bool vio_has_ev_bit(volatile uint8_t *cfg, uint8_t ev_type, uint16_t code) {
     if (!cfg) return false;
-    cfg->select = VIRTIO_INPUT_CFG_EV_BITS;
-    cfg->subsel = ev_type;
+    cfg[VIO_CFG_OFF_SELECT] = VIRTIO_INPUT_CFG_EV_BITS;
+    cfg[VIO_CFG_OFF_SUBSEL] = ev_type;
     vio_mb();
-    uint8_t sz = cfg->size;
+    uint8_t sz = cfg[VIO_CFG_OFF_SIZE];
     uint16_t byte_idx = (uint16_t)(code >> 3);
     if (sz == 0 || byte_idx >= sz) return false;
-    uint8_t val = cfg->u.bitmap[byte_idx];
+    uint8_t val = cfg[VIO_CFG_OFF_DATA + byte_idx];
     return (val & (uint8_t)(1u << (code & 7u))) != 0u;
 }
 
@@ -206,18 +198,17 @@ static void vio_cleanup_dev(vio_input_dev_t *v) {
 static bool vio_map_cap_bar(const kmd_pci_device_t *pdev, uint8_t cap_off,
                             void **out_va, uint32_t *out_len) {
     uint8_t bar_idx = pci_read_byte(pdev->bus, pdev->slot, pdev->func, (uint8_t)(cap_off + 4u));
-    if (bar_idx >= 6u) return false;
     uint32_t bar_lo = pci_read_dword(pdev->bus, pdev->slot, pdev->func, (uint8_t)(0x10u + bar_idx * 4u));
     if (bar_lo == 0u || (bar_lo & 1u) != 0u) return false; /* Require MMIO BAR */
-    if (((bar_lo >> 1) & 3u) == 2u && bar_idx < 5u) {
+    uint64_t phys64 = (uint64_t)(bar_lo & ~0xFu);
+    if (((bar_lo >> 1) & 3u) == 2u) {
         uint32_t bar_hi = pci_read_dword(pdev->bus, pdev->slot, pdev->func, (uint8_t)(0x14u + bar_idx * 4u));
-        if (bar_hi != 0u) return false;
+        phys64 |= ((uint64_t)bar_hi << 32);
     }
     uint32_t cap_offset = pci_read_dword(pdev->bus, pdev->slot, pdev->func, (uint8_t)(cap_off + 8u));
     uint32_t cap_len    = pci_read_dword(pdev->bus, pdev->slot, pdev->func, (uint8_t)(cap_off + 12u));
     if (cap_len == 0u) cap_len = 4096u;
-    uint32_t phys = (bar_lo & ~0xFu) + cap_offset;
-    void *va = ipo_hw_map_mmio(phys, cap_len, IPO_MMIO_CACHE_DISABLE, 0u);
+    void *va = ipo_hw_map_mmio(phys64 + (uint64_t)cap_offset, cap_len, IPO_MMIO_CACHE_DISABLE, 0u);
     if (!va) return false;
     *out_va = va;
     if (out_len) *out_len = cap_len;
@@ -239,10 +230,12 @@ static bool vio_probe_and_init(vio_input_dev_t *out_dev, vio_match_fn_t match_fn
         uint16_t status = pci_read_word(pdev->bus, pdev->slot, pdev->func, 0x06u);
         if ((status & 0x0010u) == 0u) continue;
 
-        /* Ensure Memory Space (bit 1) + Bus Master (bit 2) enabled */
-        uint16_t cmd = pci_read_word(pdev->bus, pdev->slot, pdev->func, 0x04u);
-        pci_write_word(pdev->bus, pdev->slot, pdev->func, 0x04u, (uint16_t)(cmd | 0x0006u));
+        /* Ensure Memory Space (bit 1), Bus Master (bit 2), and Interrupt Disable (bit 10) for polling */
         pci_enable_bus_mastering(pdev);
+        uint16_t cmd = pci_read_word(pdev->bus, pdev->slot, pdev->func, 0x04u);
+        if ((cmd & 0x0400u) == 0u) {
+            pci_write_word(pdev->bus, pdev->slot, pdev->func, 0x04u, (uint16_t)(cmd | 0x0400u));
+        }
 
         vio_input_dev_t tmp;
         memset(&tmp, 0, sizeof(tmp));
@@ -252,7 +245,26 @@ static bool vio_probe_and_init(vio_input_dev_t *out_dev, vio_match_fn_t match_fn
         tmp.irq = pdev->irq;
 
         uint8_t cap_off = (uint8_t)(pci_read_byte(pdev->bus, pdev->slot, pdev->func, 0x34u) & 0xFCu);
-        for (int step = 0; step < 48 && cap_off != 0u; step++) {
+        uint8_t *visited = NULL;
+        size_t visited_cnt = 0u, visited_cap = 0u;
+        while (cap_off != 0u) {
+            bool seen = false;
+            for (size_t vi = 0u; vi < visited_cnt; vi++) {
+                if (visited[vi] == cap_off) { seen = true; break; }
+            }
+            if (seen) break;
+            if (visited_cnt >= visited_cap) {
+                size_t nc = visited_cap ? visited_cap * 2u : 16u;
+                uint8_t *nv = (uint8_t *)kmalloc(nc);
+                if (!nv) break;
+                if (visited) {
+                    memcpy(nv, visited, visited_cnt);
+                    kfree(visited);
+                }
+                visited = nv;
+                visited_cap = nc;
+            }
+            visited[visited_cnt++] = cap_off;
             uint8_t cap_id   = pci_read_byte(pdev->bus, pdev->slot, pdev->func, cap_off);
             uint8_t cap_len  = pci_read_byte(pdev->bus, pdev->slot, pdev->func, (uint8_t)(cap_off + 2u));
             uint8_t cap_next = (uint8_t)(pci_read_byte(pdev->bus, pdev->slot, pdev->func, (uint8_t)(cap_off + 1u)) & 0xFCu);
@@ -278,13 +290,14 @@ static bool vio_probe_and_init(vio_input_dev_t *out_dev, vio_match_fn_t match_fn
                     }
                 } else if (cfg_type == VIRTIO_PCI_CAP_DEVICE_CFG && !tmp.dev_cfg) {
                     if (vio_map_cap_bar(pdev, cap_off, &va, &len)) {
-                        tmp.dev_cfg = (volatile vio_input_cfg_t *)va;
+                        tmp.dev_cfg = (volatile uint8_t *)va;
                         tmp.dev_cfg_size = len;
                     }
                 }
             }
             cap_off = cap_next;
         }
+        if (visited) kfree(visited);
 
         if (!tmp.common || !tmp.notify_base || !tmp.dev_cfg) {
             vio_cleanup_dev(&tmp);
@@ -331,15 +344,20 @@ static bool vio_probe_and_init(vio_input_dev_t *out_dev, vio_match_fn_t match_fn
             vio_cleanup_dev(&tmp);
             continue;
         }
-        if (qsz > VIO_Q_MAX) {
-            qsz = VIO_Q_MAX;
-            tmp.common->queue_size = qsz;
-        }
         tmp.qsz = qsz;
         tmp.notify_off = tmp.common->queue_notify_off;
 
-        tmp.ring_virt = ipo_hw_alloc_dma(4096u, 4096u, &tmp.ring_phys, 0u);
-        tmp.buf_virt  = (vio_input_event_t *)ipo_hw_alloc_dma(4096u, 4096u, &tmp.buf_phys, 0u);
+        uint32_t desc_bytes = (uint32_t)qsz * (uint32_t)sizeof(vio_vring_desc_t);
+        uint32_t avail_bytes = 6u + (uint32_t)qsz * 2u;
+        uint32_t avail_off = desc_bytes;
+        uint32_t used_off = (avail_off + avail_bytes + 4095u) & ~4095u;
+        uint32_t used_bytes = 8u + (uint32_t)qsz * (uint32_t)sizeof(vio_vring_used_elem_t);
+        uint32_t ring_total = (used_off + used_bytes + 4095u) & ~4095u;
+        uint32_t ev_bytes = (uint32_t)qsz * (uint32_t)sizeof(vio_input_event_t);
+        uint32_t buf_total = (ev_bytes + 4095u) & ~4095u;
+
+        tmp.ring_virt = ipo_hw_alloc_dma(ring_total, 4096u, &tmp.ring_phys, 0u);
+        tmp.buf_virt  = (vio_input_event_t *)ipo_hw_alloc_dma(buf_total, 4096u, &tmp.buf_phys, 0u);
         if (!tmp.ring_virt || !tmp.buf_virt) {
             vio_cleanup_dev(&tmp);
             continue;
@@ -347,8 +365,8 @@ static bool vio_probe_and_init(vio_input_dev_t *out_dev, vio_match_fn_t match_fn
 
         uint8_t *rv = (uint8_t *)tmp.ring_virt;
         tmp.desc  = (vio_vring_desc_t *)(rv + 0u);
-        tmp.avail = (vio_vring_avail_t *)(rv + 1024u);
-        tmp.used  = (vio_vring_used_t *)(rv + 2048u);
+        tmp.avail = (vio_vring_avail_t *)(rv + avail_off);
+        tmp.used  = (vio_vring_used_t *)(rv + used_off);
 
         tmp.avail->flags = VRING_AVAIL_F_NO_INT;
         for (uint16_t idx = 0; idx < qsz; idx++) {
@@ -363,12 +381,12 @@ static bool vio_probe_and_init(vio_input_dev_t *out_dev, vio_match_fn_t match_fn
         tmp.avail->idx = qsz;
 
         tmp.common->queue_msix_vector = 0xFFFFu;
-        tmp.common->queue_desc_lo     = tmp.ring_phys + 0u;
-        tmp.common->queue_desc_hi     = 0u;
-        tmp.common->queue_driver_lo   = tmp.ring_phys + 1024u;
-        tmp.common->queue_driver_hi   = 0u;
-        tmp.common->queue_device_lo   = tmp.ring_phys + 2048u;
-        tmp.common->queue_device_hi   = 0u;
+        tmp.common->queue_desc_lo     = (uint32_t)(tmp.ring_phys + 0u);
+        tmp.common->queue_desc_hi     = (uint32_t)((tmp.ring_phys + 0u) >> 32);
+        tmp.common->queue_driver_lo   = (uint32_t)(tmp.ring_phys + avail_off);
+        tmp.common->queue_driver_hi   = (uint32_t)((tmp.ring_phys + avail_off) >> 32);
+        tmp.common->queue_device_lo   = (uint32_t)(tmp.ring_phys + used_off);
+        tmp.common->queue_device_hi   = (uint32_t)((tmp.ring_phys + used_off) >> 32);
         vio_mb();
         tmp.common->queue_enable = 1u;
         vio_mb();

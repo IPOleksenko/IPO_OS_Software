@@ -81,7 +81,9 @@ void vga_init_font_cache(void);
 
 typedef struct {
     uint32_t codepoint;    /* Unicode codepoint (e.g. 0x0410, 0x4E2D, 0x03B1) */
-    uint8_t  bitmap[16];   /* 8x16 1-bit font bitmap */
+    uint32_t width;        /* Arbitrary glyph width in pixels */
+    uint32_t height;       /* Arbitrary glyph height in pixels */
+    const uint8_t *bitmap; /* Dynamically sized 1-bit font bitmap */
 } dynamic_glyph_def_t;
 
 void vga_load_font(uint8_t start_code, uint32_t count, const uint8_t *glyphs);

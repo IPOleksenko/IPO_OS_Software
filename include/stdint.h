@@ -17,6 +17,24 @@ typedef uint32_t           uintptr_t;
 typedef int64_t            intmax_t;
 typedef uint64_t           uintmax_t;
 
+typedef int8_t             int_least8_t;
+typedef int16_t            int_least16_t;
+typedef int32_t            int_least32_t;
+typedef int64_t            int_least64_t;
+typedef uint8_t            uint_least8_t;
+typedef uint16_t           uint_least16_t;
+typedef uint32_t           uint_least32_t;
+typedef uint64_t           uint_least64_t;
+
+typedef int8_t             int_fast8_t;
+typedef int32_t            int_fast16_t;
+typedef int32_t            int_fast32_t;
+typedef int64_t            int_fast64_t;
+typedef uint8_t            uint_fast8_t;
+typedef uint32_t           uint_fast16_t;
+typedef uint32_t           uint_fast32_t;
+typedef uint64_t           uint_fast64_t;
+
 #ifndef INT8_C
 #define INT8_C(value) value
 #endif
@@ -69,6 +87,21 @@ typedef uint64_t           uintmax_t;
 #endif
 #ifndef INTPTR_MIN
 #define INTPTR_MIN  (-2147483647 - 1)
+#endif
+#ifndef INTMAX_MIN
+#define INTMAX_MIN  INT64_MIN
+#endif
+#ifndef INTMAX_MAX
+#define INTMAX_MAX  INT64_MAX
+#endif
+#ifndef UINTMAX_MAX
+#define UINTMAX_MAX UINT64_MAX
+#endif
+#ifndef PTRDIFF_MIN
+#define PTRDIFF_MIN INT32_MIN
+#endif
+#ifndef PTRDIFF_MAX
+#define PTRDIFF_MAX INT32_MAX
 #endif
 
 #endif

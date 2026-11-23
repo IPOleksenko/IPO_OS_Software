@@ -28,18 +28,18 @@ typedef enum {
 
 typedef struct yt_http_stream {
     yt_http_state_t state;
-    char url[4096];
-    char host[256];
-    char path[3840];
+    char *url;
+    char *host;
+    char *path;
     uint16_t port;
     bool is_https;
     int sock;
     SSL_CTX *ssl_ctx;
     SSL *ssl;
 
-    char method[8];
-    char content_type[64];
-    char user_agent[160];
+    char *method;
+    char *content_type;
+    char *user_agent;
     uint8_t *post_copy;
     size_t post_len;
     bool use_range;
@@ -49,44 +49,47 @@ typedef struct yt_http_stream {
     int req_len;
     int req_sent;
 
-    char hdr_buf[16384];
+    char *hdr_buf;
     size_t hdr_len;
+    size_t hdr_cap;
     int status_code;
     int64_t content_length;
     int64_t total_size;
     bool chunked;
     int chunk_state;
     size_t chunk_rem;
-    int redirects;
+    char **redirect_history;
+    size_t redirect_count;
+    size_t redirect_cap;
     uint32_t start_ms;
     uint32_t last_rx_ms;
-    char err_msg[128];
+    char *err_msg;
 } yt_http_stream_t;
 
 typedef struct yt_search_item {
-    char video_id[16];
-    char title[160];
-    char channel[80];
-    char duration[24];
-    char views[48];
-    char published[48];
+    char *video_id;
+    char *title;
+    char *channel;
+    char *duration;
+    char *views;
+    char *published;
 } yt_search_item_t;
 
 typedef struct yt_player_info {
-    char video_id[16];
-    char title[160];
-    char author[80];
+    char *video_id;
+    char *title;
+    char *author;
     uint32_t duration_ms;
     int width;
     int height;
     int fps;
-    char stream_url[4096];
-    char error_msg[160];
+    char *stream_url;
+    char *error_msg;
 } yt_player_info_t;
 
 yt_url_kind_t yt_classify_url(const char *url);
-int  yt_extract_video_id(const char *url, char *out_id, size_t out_cap);
-void yt_url_decode(const char *src, size_t len, char *dst, size_t cap);
+char *yt_extract_video_id_alloc(const char *url);
+char *yt_url_decode_alloc(const char *src, size_t len);
 
 int  yt_http_stream_open(yt_http_stream_t *st, const char *method, const char *url,
                          const char *content_type, const void *body, size_t body_len,
@@ -97,9 +100,11 @@ int  yt_http_stream_read(yt_http_stream_t *st, uint8_t *out, size_t cap, bool *o
 
 /* Parses ANDROID player Innertube JSON buffer into info. Returns 0 on playable OK, -1 otherwise. */
 int  yt_parse_player_json(const char *json, size_t len, const char *fallback_vid, yt_player_info_t *info);
+void yt_player_info_free(yt_player_info_t *info);
 
-/* Parses WEB search Innertube JSON into items (up to max_items). Returns item count. */
-int  yt_parse_search_json(const char *json, size_t len, yt_search_item_t *items, int max_items);
+/* Parses WEB search Innertube JSON dynamically into *out_items. Returns item count (free with yt_search_items_free). */
+int  yt_parse_search_json(const char *json, size_t len, yt_search_item_t **out_items);
+void yt_search_items_free(yt_search_item_t *items, int count);
 
 /* Synchronous helper for YouTube HTML page rendering (used by Links yt/https browse handler).
  * Caller must free(*out_html) with free(). Returns 0 on success. */

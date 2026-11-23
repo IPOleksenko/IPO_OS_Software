@@ -1,4 +1,5 @@
 #include <net/icmp.h>
+#include <net/net_lock.h>
 #include <net/net_state.h>
 #include <net/ipv4.h>
 #include <system/timer.h>
@@ -228,8 +229,7 @@ bool icmp_poll_reply(uint16_t id, uint16_t seq, icmp_echo_reply_t *out_reply, ui
                 }
             }
         }
-        ipo_syscall(IPO_SYSCALL_PROCESS_YIELD, 0, NULL);
-        io_wait();
+        net_lock_yield_sleep();
     }
 
     return false;
@@ -266,8 +266,7 @@ bool icmp_ping_ex(ip4_addr_t dst_ip, uint16_t id, uint16_t seq, uint8_t ttl,
             return true;
         }
 
-        ipo_syscall(IPO_SYSCALL_PROCESS_YIELD, 0, NULL);
-        io_wait();
+        net_lock_yield_sleep();
     }
 
     return false;

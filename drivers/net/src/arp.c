@@ -1,4 +1,5 @@
 #include <net/arp.h>
+#include <net/net_lock.h>
 #include <net/net_state.h>
 #include <net/ethernet.h>
 #include <system/timer.h>
@@ -379,8 +380,7 @@ bool arp_resolve_ex(ip4_addr_t target_ip, mac_addr_t *out_mac, uint32_t timeout_
             last_req = timer_millis();
             retries_sent++;
         }
-        ipo_syscall(IPO_SYSCALL_PROCESS_YIELD, 0, NULL);
-        io_wait();
+        net_lock_yield_sleep();
     }
 
     return false;

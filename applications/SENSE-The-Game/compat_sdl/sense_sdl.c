@@ -22,6 +22,7 @@
 #include <system/timer.h>
 #include <vga_gfx.h>
 #include <wm.h>
+#include "../../common/ipo_hd_present.h"
 
 extern uint8_t *ns_image_wuffs_decode_to_bgra(const uint8_t *data, size_t len,
                                               int *out_w, int *out_h,
@@ -59,6 +60,7 @@ static uint8_t s_pal_dac[PAL_COUNT][3];
 static uint8_t s_pal_r[PAL_COUNT];
 static uint8_t s_pal_g[PAL_COUNT];
 static uint8_t s_pal_b[PAL_COUNT];
+static uint32_t s_pal_xrgb[PAL_COUNT];
 static uint8_t s_rgb15_to_pal[32768];
 static uint8_t s_blend[BLEND_LEVELS][256][256];
 static uint32_t s_hist_rgb15[32768];
@@ -96,6 +98,10 @@ static void set_pal_dac(int idx, uint8_t r6, uint8_t g6, uint8_t b6) {
     s_pal_r[idx] = dac6_to_8(r6);
     s_pal_g[idx] = dac6_to_8(g6);
     s_pal_b[idx] = dac6_to_8(b6);
+    s_pal_xrgb[idx] = 0xFF000000u |
+                      ((uint32_t)s_pal_r[idx] << 16) |
+                      ((uint32_t)s_pal_g[idx] << 8) |
+                      (uint32_t)s_pal_b[idx];
 }
 
 /* Redmean perceptual distance preserves hue accuracy on browns, skin, and teals. */
@@ -160,14 +166,113 @@ static void init_default_palette_entries(void) {
 }
 
 static void rebuild_rgb15_and_blend_luts(void) {
-    for (int r5 = 0; r5 < 32; r5++) {
-        int r8 = (r5 << 3) | (r5 >> 2);
-        for (int g5 = 0; g5 < 32; g5++) {
-            int g8 = (g5 << 3) | (g5 >> 2);
-            for (int b5 = 0; b5 < 32; b5++) {
-                int b8 = (b5 << 3) | (b5 >> 2);
-                s_rgb15_to_pal[(r5 << 10) | (g5 << 5) | b5] =
-                    find_nearest_pal(r8, g8, b8);
+    static const uint8_t s_comp_q6[32] = {
+        0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2,
+        3, 3, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 5, 5, 5, 5
+    };
+    if (!s_adaptive_active) {
+        for (int r5 = 0; r5 < 32; r5++) {
+            int r8 = (r5 << 3) | (r5 >> 2);
+            int cr = (int)s_comp_q6[r5];
+            int dr_c = r8 - cr * 51;
+            int w0_c = dr_c * dr_c * 3;
+            for (int g5 = 0; g5 < 32; g5++) {
+                int g8 = (g5 << 3) | (g5 >> 2);
+                int cg = (int)s_comp_q6[g5];
+                int dg_c = g8 - cg * 51;
+                int wg_c = dg_c * dg_c * 4;
+                for (int b5 = 0; b5 < 32; b5++) {
+                    int b8 = (b5 << 3) | (b5 >> 2);
+                    int cb = (int)s_comp_q6[b5];
+                    int db_c = b8 - cb * 51;
+                    int best_d = w0_c + wg_c + db_c * db_c * 2;
+                    int best = 32 + (cr * 6 + cg) * 6 + cb;
+                    int smax = r8 > g8 ? (r8 > b8 ? r8 : b8) : (g8 > b8 ? g8 : b8);
+                    int smin = r8 < g8 ? (r8 < b8 ? r8 : b8) : (g8 < b8 ? g8 : b8);
+                    if (smax - smin <= 42) {
+                        for (int i = 16; i < 32; i++) {
+                            int dr = r8 - (int)s_pal_r[i];
+                            int dg = g8 - (int)s_pal_g[i];
+                            int db = b8 - (int)s_pal_b[i];
+                            int d = dr * dr * 3 + dg * dg * 4 + db * db * 2;
+                            if (d < best_d) {
+                                best_d = d;
+                                best = i;
+                            }
+                        }
+                    }
+                    s_rgb15_to_pal[(r5 << 10) | (g5 << 5) | b5] = (uint8_t)best;
+                }
+            }
+        }
+    } else {
+        int lim = s_active_pal_count;
+        uint8_t order[PAL_COUNT];
+        int luma[PAL_COUNT];
+        for (int i = 0; i < lim; i++) {
+            order[i] = (uint8_t)i;
+            luma[i] = (int)s_pal_r[i] * 3 + (int)s_pal_g[i] * 6 + (int)s_pal_b[i];
+        }
+        for (int i = 1; i < lim; i++) {
+            uint8_t k = order[i];
+            int lk = luma[k];
+            int j = i - 1;
+            while (j >= 0 && luma[order[j]] > lk) {
+                order[j + 1] = order[j];
+                j--;
+            }
+            order[j + 1] = k;
+        }
+        for (int r5 = 0; r5 < 32; r5++) {
+            int r8 = (r5 << 3) | (r5 >> 2);
+            for (int g5 = 0; g5 < 32; g5++) {
+                int g8 = (g5 << 3) | (g5 >> 2);
+                for (int b5 = 0; b5 < 32; b5++) {
+                    int b8 = (b5 << 3) | (b5 >> 2);
+                    int lt = r8 * 3 + g8 * 6 + b8;
+                    int lo_s = 0, hi_s = lim - 1;
+                    while (lo_s < hi_s) {
+                        int mid = (lo_s + hi_s) >> 1;
+                        if (luma[order[mid]] < lt) lo_s = mid + 1;
+                        else hi_s = mid;
+                    }
+                    int left = lo_s - 1;
+                    int right = lo_s;
+                    int best_i = order[right < lim ? right : (lim - 1)];
+                    int best_d = 0x7FFFFFFF;
+                    while (left >= 0 || right < lim) {
+                        int step = -1;
+                        if (left >= 0 && right < lim) {
+                            int dl = lt - luma[order[left]];
+                            int dr_l = luma[order[right]] - lt;
+                            step = (dl <= dr_l) ? (int)order[left--] : (int)order[right++];
+                        } else if (left >= 0) {
+                            step = (int)order[left--];
+                        } else {
+                            step = (int)order[right++];
+                        }
+                        int dL = luma[step] - lt;
+                        if ((dL * dL) / 14 >= best_d) {
+                            if (luma[step] < lt) left = -1;
+                            else right = lim;
+                            continue;
+                        }
+                        int pr = (int)s_pal_r[step];
+                        int pg = (int)s_pal_g[step];
+                        int pb = (int)s_pal_b[step];
+                        int rmean = (r8 + pr) >> 1;
+                        int dr = r8 - pr;
+                        int dg = g8 - pg;
+                        int db = b8 - pb;
+                        int d = (((512 + rmean) * dr * dr) >> 8) + 4 * dg * dg + (((767 - rmean) * db * db) >> 8);
+                        if (d < best_d) {
+                            best_d = d;
+                            best_i = step;
+                            if (d == 0) break;
+                        }
+                    }
+                    s_rgb15_to_pal[(r5 << 10) | (g5 << 5) | b5] = (uint8_t)best_i;
+                }
             }
         }
     }
@@ -196,6 +301,11 @@ static void rebuild_rgb15_and_blend_luts(void) {
     }
 }
 
+static bool sense_is_truecolor_display(void) {
+    ipo_gfx_caps_t caps;
+    return (ipo_gfx_get_caps(&caps) == 0 && caps.active_hw_bpp >= 15u);
+}
+
 static void apply_sense_dac_palette(bool restore_default) {
     if (restore_default) {
         if (!s_palette_applied) return;
@@ -203,20 +313,13 @@ static void apply_sense_dac_palette(bool restore_default) {
         s_palette_applied = false;
         s_adaptive_active = false;
     }
+    /* On >=15bpp BGA displays we present 32-bit XRGB8888 via s_pal_xrgb; leave HW DAC untouched */
+    if (sense_is_truecolor_display()) return;
     for (int i = 0; i < PAL_COUNT; i++) {
         vga_gfx_set_palette((uint8_t)i,
                             s_pal_dac[i][0],
                             s_pal_dac[i][1],
                             s_pal_dac[i][2]);
-    }
-    /* Keep 0..15 WM/Win95 colors intact; program 16..255 hardware DAC slots directly */
-    if (process_is_foreground()) {
-        outb(0x3C8, (uint8_t)PAL_STD_RESERVED);
-        for (int i = PAL_STD_RESERVED; i < PAL_COUNT; i++) {
-            outb(0x3C9, s_pal_dac[i][0] & 0x3Fu);
-            outb(0x3C9, s_pal_dac[i][1] & 0x3Fu);
-            outb(0x3C9, s_pal_dac[i][2] & 0x3Fu);
-        }
     }
 }
 
@@ -230,56 +333,75 @@ static void init_palette_and_luts(void) {
 /* =========================================================================
  * Error & Logging
  * ========================================================================= */
-static char s_err_buf[256] = "";
+static char *s_err_buf = NULL;
 
 void sense_sdl_set_error(const char *fmt, ...) {
-    va_list ap;
+    if (!fmt) return;
+    va_list ap, aq;
     va_start(ap, fmt);
-    vsnprintf(s_err_buf, sizeof(s_err_buf), fmt, ap);
+    va_copy(aq, ap);
+    int n = vsnprintf(NULL, 0, fmt, aq);
+    va_end(aq);
+    if (n >= 0) {
+        char *nb = (char *)malloc((size_t)n + 1u);
+        if (nb) {
+            vsnprintf(nb, (size_t)n + 1u, fmt, ap);
+            free(s_err_buf);
+            s_err_buf = nb;
+        }
+    }
     va_end(ap);
 }
 
 const char *SDL_GetError(void) {
-    return s_err_buf;
+    return s_err_buf ? s_err_buf : "";
+}
+
+static void sense_log_vfmt(const char *prefix, const char *fmt, va_list ap) {
+    if (!fmt) return;
+    va_list aq;
+    va_copy(aq, ap);
+    int n = vsnprintf(NULL, 0, fmt, aq);
+    va_end(aq);
+    if (n >= 0) {
+        char *buf = (char *)malloc((size_t)n + 1u);
+        if (buf) {
+            vsnprintf(buf, (size_t)n + 1u, fmt, ap);
+            serial_printf("%s %s\n", prefix, buf);
+            free(buf);
+        }
+    }
 }
 
 void SDL_Log(const char *fmt, ...) {
-    char buf[512];
     va_list ap;
     va_start(ap, fmt);
-    vsnprintf(buf, sizeof(buf), fmt, ap);
+    sense_log_vfmt("[SENSE: The Game]", fmt, ap);
     va_end(ap);
-    serial_printf("[SENSE: The Game] %s\n", buf);
 }
 
 void SDL_LogWarn(int category, const char *fmt, ...) {
     (void)category;
-    char buf[512];
     va_list ap;
     va_start(ap, fmt);
-    vsnprintf(buf, sizeof(buf), fmt, ap);
+    sense_log_vfmt("[SENSE: The Game WARN]", fmt, ap);
     va_end(ap);
-    serial_printf("[SENSE: The Game WARN] %s\n", buf);
 }
 
 void SDL_LogError(int category, const char *fmt, ...) {
     (void)category;
-    char buf[512];
     va_list ap;
     va_start(ap, fmt);
-    vsnprintf(buf, sizeof(buf), fmt, ap);
+    sense_log_vfmt("[SENSE: The Game ERR]", fmt, ap);
     va_end(ap);
-    serial_printf("[SENSE: The Game ERR] %s\n", buf);
 }
 
 void SDL_LogCritical(int category, const char *fmt, ...) {
     (void)category;
-    char buf[512];
     va_list ap;
     va_start(ap, fmt);
-    vsnprintf(buf, sizeof(buf), fmt, ap);
+    sense_log_vfmt("[SENSE: The Game CRIT]", fmt, ap);
     va_end(ap);
-    serial_printf("[SENSE: The Game CRIT] %s\n", buf);
 }
 
 void SDL_LogDebug(int category, const char *fmt, ...) {
@@ -311,8 +433,6 @@ typedef struct {
     uint32_t stamp;
 } RLECacheEntry;
 
-#define TEX_RLE_CAP 160
-
 struct SDL_Texture {
     int w, h;
     uint32_t *bgra; /* straight-alpha BGRA8888 (A<<24 | R<<16 | G<<8 | B) */
@@ -320,16 +440,21 @@ struct SDL_Texture {
     Uint8 alpha_mod;
 
     bool is_solid;
+    bool is_opaque;
     bool is_image;
+    uint8_t solid_r, solid_g, solid_b;
     uint8_t solid_pal;
     uint8_t solid_a;
+    int *row_xmin;
+    int *row_xmax;
 
     uint32_t refcount;
     struct SDL_Texture *backing_tex;
     struct SDL_Texture *prev;
     struct SDL_Texture *next;
     int last_rle;
-    RLECacheEntry cache[TEX_RLE_CAP];
+    RLECacheEntry *cache;
+    int rle_cap;
     uint32_t stamp_seq;
 };
 
@@ -429,6 +554,7 @@ static void accumulate_texture_hist(const uint32_t *bgra, int w, int h) {
         s_hist_rgb15[key_dk] += w_base;
     }
 
+    if (!sense_is_truecolor_display() && wm_session_active()) return;
     if (!s_adaptive_active || new_bins >= 8u) {
         s_hist_dirty = true;
     }
@@ -436,7 +562,7 @@ static void accumulate_texture_hist(const uint32_t *bgra, int w, int h) {
 
 static void invalidate_all_tex_rles(void) {
     for (SDL_Texture *t = s_tex_head; t; t = t->next) {
-        for (int i = 0; i < TEX_RLE_CAP; i++) {
+        for (int i = 0; i < t->rle_cap; i++) {
             free(t->cache[i].blob);
             free(t->cache[i].row_off);
             t->cache[i].blob = NULL;
@@ -454,6 +580,7 @@ static void invalidate_all_tex_rles(void) {
 
 static void rebuild_adaptive_palette(void) {
     s_hist_dirty = false;
+    if (!sense_is_truecolor_display() && wm_session_active()) return;
 
     /* Ensure baseline UI text/meter accent bins remain represented */
     static const uint32_t k_ui_anchors[] = {
@@ -591,13 +718,22 @@ static SDL_Texture *create_texture_from_bgra_ex(SDL_Renderer *renderer, int w, i
     size_t npx = (size_t)w * (size_t)h;
 
     if (is_premultiplied) {
+        static uint32_t s_inv_alpha[256];
+        static bool s_inv_init = false;
+        if (!s_inv_init) {
+            for (uint32_t a = 1u; a < 255u; a++) {
+                s_inv_alpha[a] = ((255u << 16) + (a >> 1)) / a;
+            }
+            s_inv_init = true;
+        }
         for (size_t i = 0; i < npx; i++) {
             uint32_t px = src[i];
             uint8_t a = (uint8_t)(px >> 24);
             if (a > 0 && a < 255) {
-                uint32_t b = ((px & 0xFFu) * 255u) / a; if (b > 255u) b = 255u;
-                uint32_t g = (((px >> 8) & 0xFFu) * 255u) / a; if (g > 255u) g = 255u;
-                uint32_t r = (((px >> 16) & 0xFFu) * 255u) / a; if (r > 255u) r = 255u;
+                uint32_t inv = s_inv_alpha[a];
+                uint32_t b = ((px & 0xFFu) * inv + 32768u) >> 16; if (b > 255u) b = 255u;
+                uint32_t g = (((px >> 8) & 0xFFu) * inv + 32768u) >> 16; if (g > 255u) g = 255u;
+                uint32_t r = (((px >> 16) & 0xFFu) * inv + 32768u) >> 16; if (r > 255u) r = 255u;
                 src[i] = ((uint32_t)a << 24) | (r << 16) | (g << 8) | b;
             }
         }
@@ -631,9 +767,33 @@ static SDL_Texture *create_texture_from_bgra_ex(SDL_Renderer *renderer, int w, i
         uint8_t r, g, b, a;
         unpack_bgra(first, &r, &g, &b, &a);
         tex->is_solid = true;
+        tex->solid_r = r;
+        tex->solid_g = g;
+        tex->solid_b = b;
         tex->solid_pal = quant_rgb(r, g, b);
         tex->solid_a = a;
     }
+
+    bool all_opaque = true;
+    tex->row_xmin = (int *)malloc((size_t)h * sizeof(int));
+    tex->row_xmax = (int *)malloc((size_t)h * sizeof(int));
+    for (int ry = 0; ry < h; ry++) {
+        const uint32_t *rptr = src + (size_t)ry * (size_t)w;
+        int xmin = w, xmax = -1;
+        for (int rx = 0; rx < w; rx++) {
+            uint8_t a = (uint8_t)(rptr[rx] >> 24);
+            if (a != 255u) all_opaque = false;
+            if (a != 0u) {
+                if (rx < xmin) xmin = rx;
+                xmax = rx;
+            }
+        }
+        if (tex->row_xmin && tex->row_xmax) {
+            tex->row_xmin[ry] = xmin;
+            tex->row_xmax[ry] = xmax;
+        }
+    }
+    tex->is_opaque = all_opaque;
 
     return tex;
 }
@@ -643,8 +803,6 @@ SDL_Texture *sense_sdl_create_texture_from_bgra(SDL_Renderer *renderer, int w, i
     return create_texture_from_bgra_ex(renderer, w, h, bgra_pixels, is_premultiplied, false);
 }
 
-#define TEX_SURF_CACHE_CAP 64
-
 typedef struct {
     SDL_Renderer *ren;
     uint64_t      key;
@@ -652,11 +810,12 @@ typedef struct {
     uint32_t      stamp;
 } TexSurfCacheEntry;
 
-static TexSurfCacheEntry s_tex_surf_cache[TEX_SURF_CACHE_CAP];
+static TexSurfCacheEntry *s_tex_surf_cache = NULL;
+static int s_tex_surf_cap = 0;
 static uint32_t s_tex_surf_stamp = 0;
 
 static void tex_surf_cache_purge_renderer(SDL_Renderer *ren) {
-    for (int i = 0; i < TEX_SURF_CACHE_CAP; i++) {
+    for (int i = 0; i < s_tex_surf_cap; i++) {
         if (s_tex_surf_cache[i].tex && s_tex_surf_cache[i].ren == ren) {
             SDL_Texture *t = s_tex_surf_cache[i].tex;
             s_tex_surf_cache[i].tex = NULL;
@@ -665,6 +824,19 @@ static void tex_surf_cache_purge_renderer(SDL_Renderer *ren) {
             SDL_DestroyTexture(t);
         }
     }
+}
+
+static void tex_surf_cache_free_all(void) {
+    for (int i = 0; i < s_tex_surf_cap; i++) {
+        if (s_tex_surf_cache[i].tex) {
+            SDL_Texture *t = s_tex_surf_cache[i].tex;
+            s_tex_surf_cache[i].tex = NULL;
+            SDL_DestroyTexture(t);
+        }
+    }
+    free(s_tex_surf_cache);
+    s_tex_surf_cache = NULL;
+    s_tex_surf_cap = 0;
 }
 
 static SDL_Texture *wrap_surface_texture_alpha(SDL_Texture *tex, const SDL_Surface *surface) {
@@ -689,35 +861,43 @@ SDL_Texture *SDL_CreateTextureFromSurface(SDL_Renderer *renderer, SDL_Surface *s
         return NULL;
     }
 
-    int lru_idx = -1;
+    int slot_idx = -1;
     if (surface->cache_key != 0) {
-        uint32_t lru_stamp = 0xFFFFFFFFu;
-        for (int i = 0; i < TEX_SURF_CACHE_CAP; i++) {
+        for (int i = 0; i < s_tex_surf_cap; i++) {
             TexSurfCacheEntry *e = &s_tex_surf_cache[i];
             if (e->tex && e->ren == renderer && e->key == surface->cache_key) {
                 e->stamp = ++s_tex_surf_stamp;
                 e->tex->refcount++;
                 return wrap_surface_texture_alpha(e->tex, surface);
             }
-            if (!e->tex) {
-                lru_idx = i;
-                break;
+            if (!e->tex && slot_idx < 0) {
+                slot_idx = i;
             }
-            if (e->stamp < lru_stamp) {
-                lru_stamp = e->stamp;
-                lru_idx = i;
+        }
+        if (slot_idx < 0) {
+            int new_cap = s_tex_surf_cap ? (s_tex_surf_cap * 2) : 64;
+            if (new_cap > s_tex_surf_cap && (size_t)new_cap <= SIZE_MAX / sizeof(TexSurfCacheEntry)) {
+                TexSurfCacheEntry *nc = (TexSurfCacheEntry *)realloc(s_tex_surf_cache, (size_t)new_cap * sizeof(TexSurfCacheEntry));
+                if (nc) {
+                    memset(nc + s_tex_surf_cap, 0, (size_t)(new_cap - s_tex_surf_cap) * sizeof(TexSurfCacheEntry));
+                    slot_idx = s_tex_surf_cap;
+                    s_tex_surf_cache = nc;
+                    s_tex_surf_cap = new_cap;
+                }
             }
         }
     }
 
+    if ((size_t)surface->w > SIZE_MAX / (size_t)surface->h / 4u) return NULL;
     size_t sz = (size_t)surface->w * (size_t)surface->h * 4u;
     uint32_t *copy = (uint32_t *)malloc(sz);
     if (!copy) return NULL;
     memcpy(copy, surface->pixels, sz);
     SDL_Texture *tex = sense_sdl_create_texture_from_bgra(renderer, surface->w, surface->h,
                                                           copy, surface->is_premultiplied);
-    if (tex && surface->cache_key != 0 && lru_idx >= 0) {
-        TexSurfCacheEntry *slot = &s_tex_surf_cache[lru_idx];
+    if (!tex) return NULL;
+    if (surface->cache_key != 0 && slot_idx >= 0) {
+        TexSurfCacheEntry *slot = &s_tex_surf_cache[slot_idx];
         if (slot->tex) {
             SDL_Texture *old = slot->tex;
             slot->tex = NULL;
@@ -745,10 +925,13 @@ void SDL_DestroyTexture(SDL_Texture *texture) {
     if (texture->prev) texture->prev->next = texture->next;
     else if (s_tex_head == texture) s_tex_head = texture->next;
     if (texture->next) texture->next->prev = texture->prev;
-    for (int i = 0; i < TEX_RLE_CAP; i++) {
+    for (int i = 0; i < texture->rle_cap; i++) {
         free(texture->cache[i].blob);
         free(texture->cache[i].row_off);
     }
+    free(texture->cache);
+    free(texture->row_xmin);
+    free(texture->row_xmax);
     free(texture->bgra);
     free(texture);
 }
@@ -809,7 +992,7 @@ static const RLECacheEntry *tex_get_rle(SDL_Texture *tex,
                                         int sx, int sy, int sw, int sh,
                                         int dw, int dh) {
     int last = tex->last_rle;
-    if (last >= 0 && last < TEX_RLE_CAP) {
+    if (last >= 0 && last < tex->rle_cap) {
         RLECacheEntry *e = &tex->cache[last];
         if (e->blob && e->sx == sx && e->sy == sy && e->sw == sw && e->sh == sh &&
             e->dw == dw && e->dh == dh) {
@@ -818,25 +1001,33 @@ static const RLECacheEntry *tex_get_rle(SDL_Texture *tex,
         }
     }
 
-    uint32_t oldest_idx = 0;
-    uint32_t oldest_stamp = 0xFFFFFFFFu;
-
-    for (uint32_t i = 0; i < TEX_RLE_CAP; i++) {
+    int free_idx = -1;
+    for (int i = 0; i < tex->rle_cap; i++) {
         RLECacheEntry *e = &tex->cache[i];
         if (e->blob && e->sx == sx && e->sy == sy && e->sw == sw && e->sh == sh &&
             e->dw == dw && e->dh == dh) {
             e->stamp = ++tex->stamp_seq;
-            tex->last_rle = (int)i;
+            tex->last_rle = i;
             return e;
         }
-        if (e->stamp < oldest_stamp) {
-            oldest_stamp = e->stamp;
-            oldest_idx = i;
+        if (!e->blob && free_idx < 0) {
+            free_idx = i;
         }
     }
 
-    RLECacheEntry *e = &tex->cache[oldest_idx];
-    tex->last_rle = (int)oldest_idx;
+    if (free_idx < 0) {
+        int new_cap = tex->rle_cap ? (tex->rle_cap * 2) : 16;
+        if (new_cap <= tex->rle_cap || (size_t)new_cap > SIZE_MAX / sizeof(RLECacheEntry)) return NULL;
+        RLECacheEntry *nc = (RLECacheEntry *)realloc(tex->cache, (size_t)new_cap * sizeof(RLECacheEntry));
+        if (!nc) return NULL;
+        memset(nc + tex->rle_cap, 0, (size_t)(new_cap - tex->rle_cap) * sizeof(RLECacheEntry));
+        free_idx = tex->rle_cap;
+        tex->cache = nc;
+        tex->rle_cap = new_cap;
+    }
+
+    RLECacheEntry *e = &tex->cache[free_idx];
+    tex->last_rle = free_idx;
     free(e->blob);
     free(e->row_off);
     memset(e, 0, sizeof(*e));
@@ -934,6 +1125,7 @@ static const RLECacheEntry *tex_get_rle(SDL_Texture *tex,
  * ========================================================================= */
 struct SDL_Window {
     wm_window_t *wm_win;
+    ipo_hd_view_t hd;
     bool direct_gfx;
     bool hw_direct_fb;
     bool fast_2x_scale;
@@ -947,12 +1139,18 @@ struct SDL_Window {
 struct SDL_Renderer {
     SDL_Window *window;
     int fb_w, fb_h;
+    uint32_t *fb32;
     uint8_t *fb8;
     uint8_t *present_buf8;
     int present_w, present_h;
     int logical_w, logical_h;
     Uint8 draw_r, draw_g, draw_b, draw_a;
     SDL_BlendMode draw_blend;
+    bool vsync_enabled;
+    uint32_t last_present_ms;
+
+    int *copy_xlut;
+    int copy_xlut_cap;
 
     uint32_t *wm_xlut;
     int wm_xlut_w;
@@ -985,19 +1183,8 @@ static void sync_window_dimensions(SDL_Window *win, bool emit_resize) {
     if (win->wm_win && wm_is_window_valid(win->wm_win)) {
         if (win->fullscreen) {
             win->hw_direct_fb = (sw > (int)win->wm_win->w || sh > (int)win->wm_win->h);
-            if (win->hw_direct_fb) {
-                if (sw >= 960 && (sw & 1) == 0 && (sh & 1) == 0) {
-                    new_w = sw / 2;
-                    new_h = sh / 2;
-                    win->fast_2x_scale = true;
-                } else {
-                    new_w = sw;
-                    new_h = sh;
-                }
-            } else {
-                new_w = (int)win->wm_win->w;
-                new_h = (int)win->wm_win->h;
-            }
+            new_w = sw;
+            new_h = sh;
         } else {
             win->hw_direct_fb = false;
             int ww = (int)win->wm_win->w;
@@ -1022,24 +1209,25 @@ static void sync_window_dimensions(SDL_Window *win, bool emit_resize) {
     if (s_active_ren && s_active_ren->window == win &&
         (s_active_ren->fb_w != new_w || s_active_ren->fb_h != new_h)) {
         uint8_t *nfb = (uint8_t *)calloc((size_t)new_w * (size_t)new_h, 1);
-        if (nfb) {
+        uint32_t *nfb32 = (uint32_t *)calloc((size_t)new_w * (size_t)new_h, sizeof(uint32_t));
+        if (nfb && nfb32) {
             free(s_active_ren->fb8);
+            free(s_active_ren->fb32);
             s_active_ren->fb8 = nfb;
+            s_active_ren->fb32 = nfb32;
             s_active_ren->fb_w = new_w;
             s_active_ren->fb_h = new_h;
+        } else {
+            free(nfb);
+            free(nfb32);
         }
     }
 
-    if (emit_resize && changed) {
-        SDL_Event ev;
-        memset(&ev, 0, sizeof(ev));
-        ev.type = SDL_WINDOWEVENT;
-        ev.window.event = SDL_WINDOWEVENT_SIZE_CHANGED;
-        ev.window.windowID = 1;
-        ev.window.data1 = new_w;
-        ev.window.data2 = new_h;
-        sdl_push_event(&ev);
+    if (changed && win->hd.caps_cached) {
+        ipo_hd_setup(&win->hd, win->wm_win, new_w, new_h, false);
     }
+
+    (void)emit_resize;
 }
 
 int SDL_GetDisplayBounds(int displayIndex, SDL_Rect *rect) {
@@ -1058,7 +1246,7 @@ int SDL_GetDisplayBounds(int displayIndex, SDL_Rect *rect) {
 }
 
 SDL_Window *SDL_CreateWindow(const char *title, int x, int y, int w, int h, Uint32 flags) {
-    (void)x; (void)y; (void)w; (void)h;
+    (void)x; (void)y;
     init_palette_and_luts();
 
     SDL_Window *win = (SDL_Window *)calloc(1, sizeof(SDL_Window));
@@ -1070,6 +1258,8 @@ SDL_Window *SDL_CreateWindow(const char *title, int x, int y, int w, int h, Uint
     if (sw < 320 || sw > 4096) sw = 320;
     if (sh < 200 || sh > 4096) sh = 200;
 
+    win->win_w = (w > 0) ? w : 1280;
+    win->win_h = (h > 0) ? h : 720;
     win->fullscreen = ((flags & SDL_WINDOW_FULLSCREEN) != 0);
 
     {
@@ -1102,6 +1292,7 @@ SDL_Window *SDL_CreateWindow(const char *title, int x, int y, int w, int h, Uint
     }
 
     sync_window_dimensions(win, false);
+    ipo_hd_setup(&win->hd, win->wm_win, win->canvas_w, win->canvas_h, false);
     s_active_win = win;
     return win;
 }
@@ -1109,6 +1300,7 @@ SDL_Window *SDL_CreateWindow(const char *title, int x, int y, int w, int h, Uint
 void SDL_DestroyWindow(SDL_Window *window) {
     if (!window) return;
     apply_sense_dac_palette(true);
+    ipo_hd_free(&window->hd);
     if (s_active_win == window) s_active_win = NULL;
     if (window->wm_win) {
         if (wm_is_window_valid(window->wm_win)) {
@@ -1159,12 +1351,12 @@ void SDL_GetWindowSize(SDL_Window *window, int *w, int *h) {
         if (h) *h = 0;
         return;
     }
-    if (w) *w = window->canvas_w;
-    if (h) *h = window->canvas_h;
+    if (w) *w = (window->win_w > 0) ? window->win_w : window->canvas_w;
+    if (h) *h = (window->win_h > 0) ? window->win_h : window->canvas_h;
 }
 
 SDL_Renderer *SDL_CreateRenderer(SDL_Window *window, int index, Uint32 flags) {
-    (void)index; (void)flags;
+    (void)index;
     if (!window) return NULL;
     SDL_Renderer *ren = (SDL_Renderer *)calloc(1, sizeof(SDL_Renderer));
     if (!ren) return NULL;
@@ -1172,8 +1364,16 @@ SDL_Renderer *SDL_CreateRenderer(SDL_Window *window, int index, Uint32 flags) {
     ren->fb_w = window->canvas_w > 0 ? window->canvas_w : 320;
     ren->fb_h = window->canvas_h > 0 ? window->canvas_h : 200;
     ren->fb8 = (uint8_t *)calloc((size_t)ren->fb_w * (size_t)ren->fb_h, 1);
-    if (!ren->fb8) { free(ren); return NULL; }
-    ren->fps_last_ms = timer_millis();
+    ren->fb32 = (uint32_t *)calloc((size_t)ren->fb_w * (size_t)ren->fb_h, sizeof(uint32_t));
+    if (!ren->fb8 || !ren->fb32) {
+        free(ren->fb8);
+        free(ren->fb32);
+        free(ren);
+        return NULL;
+    }
+    ren->vsync_enabled = ((flags & SDL_RENDERER_PRESENTVSYNC) != 0);
+    ren->last_present_ms = timer_millis();
+    ren->fps_last_ms = ren->last_present_ms;
     s_active_ren = ren;
     return ren;
 }
@@ -1182,8 +1382,10 @@ void SDL_DestroyRenderer(SDL_Renderer *renderer) {
     if (!renderer) return;
     tex_surf_cache_purge_renderer(renderer);
     if (s_active_ren == renderer) s_active_ren = NULL;
+    free(renderer->copy_xlut);
     free(renderer->wm_xlut);
     free(renderer->present_buf8);
+    free(renderer->fb32);
     free(renderer->fb8);
     free(renderer);
 }
@@ -1212,24 +1414,22 @@ int SDL_SetRenderDrawBlendMode(SDL_Renderer *renderer, SDL_BlendMode blendMode) 
 
 static void map_dst_rect(const SDL_Renderer *ren, const SDL_Rect *in_rect,
                          int *ox, int *oy, int *ow, int *oh) {
-    int rw = in_rect ? in_rect->w : (ren->logical_w > 0 ? ren->logical_w : ren->fb_w);
-    int rh = in_rect ? in_rect->h : (ren->logical_h > 0 ? ren->logical_h : ren->fb_h);
+    int lw = (ren->logical_w > 0) ? ren->logical_w : ren->fb_w;
+    int lh = (ren->logical_h > 0) ? ren->logical_h : ren->fb_h;
+    int rw = in_rect ? in_rect->w : lw;
+    int rh = in_rect ? in_rect->h : lh;
     int rx = in_rect ? in_rect->x : 0;
     int ry = in_rect ? in_rect->y : 0;
 
-    if (ren->logical_w > 0 && ren->logical_h > 0 &&
-        (ren->logical_w != ren->fb_w || ren->logical_h != ren->fb_h)) {
-        float sx = (float)ren->fb_w / (float)ren->logical_w;
-        float sy = (float)ren->fb_h / (float)ren->logical_h;
-        float s = (sx < sy) ? sx : sy;
-        int vw = (int)floorf((float)ren->logical_w * s + 0.5f);
-        int vh = (int)floorf((float)ren->logical_h * s + 0.5f);
-        int vx = (ren->fb_w - vw) / 2;
-        int vy = (ren->fb_h - vh) / 2;
-        *ox = vx + (int)floorf((float)rx * s + 0.5f);
-        *oy = vy + (int)floorf((float)ry * s + 0.5f);
-        *ow = (int)floorf((float)rw * s + 0.5f);
-        *oh = (int)floorf((float)rh * s + 0.5f);
+    if (lw > 0 && lh > 0 && (lw != ren->fb_w || lh != ren->fb_h)) {
+        int x0 = (int)(((int64_t)rx * (int64_t)ren->fb_w + (lw / 2)) / lw);
+        int y0 = (int)(((int64_t)ry * (int64_t)ren->fb_h + (lh / 2)) / lh);
+        int x1 = (int)(((int64_t)(rx + rw) * (int64_t)ren->fb_w + (lw / 2)) / lw);
+        int y1 = (int)(((int64_t)(ry + rh) * (int64_t)ren->fb_h + (lh / 2)) / lh);
+        *ox = x0;
+        *oy = y0;
+        *ow = x1 - x0;
+        *oh = y1 - y0;
         if (*ow < 1 && rw > 0) *ow = 1;
         if (*oh < 1 && rh > 0) *oh = 1;
     } else {
@@ -1285,10 +1485,172 @@ static void fill_solid_pal_rect(SDL_Renderer *ren, int x, int y, int w, int h,
     }
 }
 
+static inline void fast_fill_u32(uint32_t *dst, uint32_t val, size_t count) {
+    if (count == 0u) return;
+    __asm__ volatile(
+        "cld\n\t"
+        "rep stosl\n\t"
+        : "+D"(dst), "+c"(count)
+        : "a"(val)
+        : "memory");
+}
+
+static void fill_solid_rgb_rect32(SDL_Renderer *ren, int x, int y, int w, int h,
+                                  uint8_t r, uint8_t g, uint8_t b, uint8_t alpha) {
+    if (!ren || !ren->fb32 || w <= 0 || h <= 0 || alpha == 0u) return;
+    int x0 = (x < 0) ? 0 : x;
+    int y0 = (y < 0) ? 0 : y;
+    int x1 = x + w; if (x1 > ren->fb_w) x1 = ren->fb_w;
+    int y1 = y + h; if (y1 > ren->fb_h) y1 = ren->fb_h;
+    if (x0 >= x1 || y0 >= y1) return;
+
+    int cw = x1 - x0;
+    if (alpha == 255u) {
+        uint32_t xrgb = 0xFF000000u | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
+        for (int dy = y0; dy < y1; dy++) {
+            fast_fill_u32(ren->fb32 + (size_t)dy * (size_t)ren->fb_w + (size_t)x0, xrgb, (size_t)cw);
+        }
+        return;
+    }
+
+    uint32_t a256 = (uint32_t)alpha + (uint32_t)(alpha >> 7);
+    uint32_t inv_a = 256u - a256;
+    uint32_t src_rb_pre = (((uint32_t)r << 16) | (uint32_t)b) * a256;
+    uint32_t src_g_pre  = ((uint32_t)g << 8) * a256;
+
+    for (int dy = y0; dy < y1; dy++) {
+        uint32_t *dst = ren->fb32 + (size_t)dy * (size_t)ren->fb_w + (size_t)x0;
+        if (src_rb_pre == 0u && src_g_pre == 0u) {
+            for (int cx = 0; cx < cw; cx++) {
+                uint32_t d = dst[cx];
+                uint32_t orb = (((d & 0x00FF00FFu) * inv_a) >> 8) & 0x00FF00FFu;
+                uint32_t og  = (((d & 0x0000FF00u) * inv_a) >> 8) & 0x0000FF00u;
+                dst[cx] = 0xFF000000u | orb | og;
+            }
+        } else {
+            for (int cx = 0; cx < cw; cx++) {
+                uint32_t d = dst[cx];
+                uint32_t orb = ((src_rb_pre + (d & 0x00FF00FFu) * inv_a) >> 8) & 0x00FF00FFu;
+                uint32_t og  = ((src_g_pre  + (d & 0x0000FF00u) * inv_a) >> 8) & 0x0000FF00u;
+                dst[cx] = 0xFF000000u | orb | og;
+            }
+        }
+    }
+}
+
+static void render_copy_truecolor32(SDL_Renderer *ren, const SDL_Texture *src_tex,
+                                    SDL_BlendMode blend_mode, Uint8 amod,
+                                    int sx, int sy, int sw, int sh,
+                                    int ox, int oy, int ow, int oh) {
+    if (!ren || !ren->fb32 || !src_tex || !src_tex->bgra || ow <= 0 || oh <= 0) return;
+    if (blend_mode == SDL_BLENDMODE_NONE) amod = 255u;
+    if (amod == 0u) return;
+
+    int sy0 = (oy < 0) ? -oy : 0;
+    int sy1 = oh;
+    if (oy + sy1 > ren->fb_h) sy1 = ren->fb_h - oy;
+    int sx0 = (ox < 0) ? -ox : 0;
+    int sx1 = ow;
+    if (ox + sx1 > ren->fb_w) sx1 = ren->fb_w - ox;
+    if (sx0 >= sx1 || sy0 >= sy1) return;
+
+    int span_w = sx1 - sx0;
+    if (!ren->copy_xlut || ren->copy_xlut_cap < span_w) {
+        int ncap = (span_w < 512) ? 512 : span_w;
+        int *nl = (int *)realloc(ren->copy_xlut, (size_t)ncap * sizeof(int));
+        if (!nl) return;
+        ren->copy_xlut = nl;
+        ren->copy_xlut_cap = ncap;
+    }
+    int *xlut = ren->copy_xlut;
+    for (int i = 0; i < span_w; i++) {
+        int isx = sx + ((sx0 + i) * sw) / ow;
+        if (isx >= src_tex->w) isx = src_tex->w - 1;
+        xlut[i] = isx;
+    }
+
+    bool full_opaque = ((src_tex->is_opaque || blend_mode == SDL_BLENDMODE_NONE) && amod == 255u);
+    int prev_isy = -1;
+    uint32_t *prev_dst = NULL;
+
+    for (int sdy = sy0; sdy < sy1; sdy++) {
+        int isy = sy + (sdy * sh) / oh;
+        if (isy >= src_tex->h) isy = src_tex->h - 1;
+        if (src_tex->row_xmin && src_tex->row_xmax && blend_mode != SDL_BLENDMODE_NONE) {
+            if (src_tex->row_xmin[isy] > src_tex->row_xmax[isy]) continue;
+        }
+        uint32_t *dst = ren->fb32 + (size_t)(oy + sdy) * (size_t)ren->fb_w + (size_t)(ox + sx0);
+        if (full_opaque && isy == prev_isy && prev_dst) {
+            memcpy(dst, prev_dst, (size_t)span_w * sizeof(uint32_t));
+            continue;
+        }
+        const uint32_t *srow = src_tex->bgra + (size_t)isy * (size_t)src_tex->w;
+
+        int i0 = 0;
+        int i1 = span_w;
+        if (src_tex->row_xmin && src_tex->row_xmax && blend_mode != SDL_BLENDMODE_NONE) {
+            int rmin = src_tex->row_xmin[isy];
+            int rmax = src_tex->row_xmax[isy];
+            while (i0 < i1 && xlut[i0] < rmin) i0++;
+            while (i1 > i0 && xlut[i1 - 1] > rmax) i1--;
+        }
+
+        if (full_opaque) {
+            for (int i = i0; i < i1; i++) {
+                dst[i] = 0xFF000000u | srow[xlut[i]];
+            }
+            prev_isy = isy;
+            prev_dst = dst;
+        } else if (amod == 255u) {
+            for (int i = i0; i < i1; i++) {
+                uint32_t spx = srow[xlut[i]];
+                uint32_t a = spx >> 24;
+                if (a == 0u) continue;
+                if (a == 255u) {
+                    dst[i] = spx;
+                } else {
+                    uint32_t a256 = a + 1u;
+                    uint32_t inv_a = 256u - a256;
+                    uint32_t d = dst[i];
+                    uint32_t orb = (((spx & 0x00FF00FFu) * a256 + (d & 0x00FF00FFu) * inv_a) >> 8) & 0x00FF00FFu;
+                    uint32_t og  = (((spx & 0x0000FF00u) * a256 + (d & 0x0000FF00u) * inv_a) >> 8) & 0x0000FF00u;
+                    dst[i] = 0xFF000000u | orb | og;
+                }
+            }
+        } else {
+            uint32_t am256 = (uint32_t)amod + 1u;
+            for (int i = i0; i < i1; i++) {
+                uint32_t spx = srow[xlut[i]];
+                uint32_t a = (blend_mode == SDL_BLENDMODE_NONE) ? 255u : (spx >> 24);
+                if (a == 0u) continue;
+                uint32_t eff_a = (a * am256) >> 8;
+                if (eff_a == 0u) continue;
+                if (eff_a >= 255u) {
+                    dst[i] = 0xFF000000u | spx;
+                } else {
+                    uint32_t a256 = eff_a + 1u;
+                    uint32_t inv_a = 256u - a256;
+                    uint32_t d = dst[i];
+                    uint32_t orb = (((spx & 0x00FF00FFu) * a256 + (d & 0x00FF00FFu) * inv_a) >> 8) & 0x00FF00FFu;
+                    uint32_t og  = (((spx & 0x0000FF00u) * a256 + (d & 0x0000FF00u) * inv_a) >> 8) & 0x0000FF00u;
+                    dst[i] = 0xFF000000u | orb | og;
+                }
+            }
+        }
+    }
+}
+
 int SDL_RenderClear(SDL_Renderer *renderer) {
     if (!renderer || !renderer->fb8) return -1;
-    uint8_t pal = quant_rgb(renderer->draw_r, renderer->draw_g, renderer->draw_b);
-    memset(renderer->fb8, pal, (size_t)renderer->fb_w * (size_t)renderer->fb_h);
+    if (renderer->fb32) {
+        uint32_t xrgb = 0xFF000000u | ((uint32_t)renderer->draw_r << 16) |
+                        ((uint32_t)renderer->draw_g << 8) | (uint32_t)renderer->draw_b;
+        fast_fill_u32(renderer->fb32, xrgb, (size_t)renderer->fb_w * (size_t)renderer->fb_h);
+    }
+    if (!sense_is_truecolor_display()) {
+        uint8_t pal = quant_rgb(renderer->draw_r, renderer->draw_g, renderer->draw_b);
+        memset(renderer->fb8, pal, (size_t)renderer->fb_w * (size_t)renderer->fb_h);
+    }
     return 0;
 }
 
@@ -1296,9 +1658,15 @@ int SDL_RenderFillRect(SDL_Renderer *renderer, const SDL_Rect *rect) {
     if (!renderer || !renderer->fb8) return -1;
     int ox, oy, ow, oh;
     map_dst_rect(renderer, rect, &ox, &oy, &ow, &oh);
-    uint8_t pal = quant_rgb(renderer->draw_r, renderer->draw_g, renderer->draw_b);
     uint8_t alpha = (renderer->draw_blend == SDL_BLENDMODE_NONE) ? 255 : renderer->draw_a;
-    fill_solid_pal_rect(renderer, ox, oy, ow, oh, pal, alpha);
+    if (renderer->fb32) {
+        fill_solid_rgb_rect32(renderer, ox, oy, ow, oh,
+                              renderer->draw_r, renderer->draw_g, renderer->draw_b, alpha);
+    }
+    if (!sense_is_truecolor_display()) {
+        uint8_t pal = quant_rgb(renderer->draw_r, renderer->draw_g, renderer->draw_b);
+        fill_solid_pal_rect(renderer, ox, oy, ow, oh, pal, alpha);
+    }
     return 0;
 }
 
@@ -1354,8 +1722,22 @@ int SDL_RenderCopy(SDL_Renderer *renderer, SDL_Texture *texture,
     if (src_tex->is_solid) {
         uint8_t base_a = (texture->blend_mode == SDL_BLENDMODE_NONE) ? 255 : src_tex->solid_a;
         uint8_t eff_a = (uint8_t)(((unsigned)base_a * texture->alpha_mod) / 255u);
-        fill_solid_pal_rect(renderer, ox, oy, ow, oh, src_tex->solid_pal, eff_a);
+        if (renderer->fb32) {
+            fill_solid_rgb_rect32(renderer, ox, oy, ow, oh,
+                                  src_tex->solid_r, src_tex->solid_g, src_tex->solid_b, eff_a);
+        }
+        if (!sense_is_truecolor_display()) {
+            fill_solid_pal_rect(renderer, ox, oy, ow, oh, src_tex->solid_pal, eff_a);
+        }
         return 0;
+    }
+
+    if (renderer->fb32) {
+        render_copy_truecolor32(renderer, src_tex, texture->blend_mode, texture->alpha_mod,
+                                sx, sy, sw, sh, ox, oy, ow, oh);
+        if (sense_is_truecolor_display()) {
+            return 0;
+        }
     }
 
     const RLECacheEntry *rle = tex_get_rle(src_tex, sx, sy, sw, sh, ow, oh);
@@ -1555,7 +1937,20 @@ void SDL_RenderPresent(SDL_Renderer *renderer) {
     if (!renderer || !renderer->window || !renderer->fb8) return;
     SDL_Window *win = renderer->window;
     if (win->wm_win && wm_is_window_valid(win->wm_win)) {
-        if (win->hw_direct_fb && wm_get_focused() == win->wm_win) {
+        if (win->wm_win->fullscreen != win->fullscreen) {
+            win->fullscreen = win->wm_win->fullscreen;
+            wm_set_cursor_visible(win->wm_win, !win->fullscreen);
+            sync_window_dimensions(win, true);
+        }
+        if (renderer->fb32 &&
+            ipo_hd_present_xrgb32(&win->hd, win->wm_win, false,
+                                  renderer->fb32, renderer->fb_w, renderer->fb_h, renderer->fb_w)) {
+            wm_compositor_tick();
+        } else if (ipo_hd_present_pal32(&win->hd, win->wm_win, false,
+                                        renderer->fb8, renderer->fb_w, renderer->fb_h, renderer->fb_w,
+                                        s_pal_xrgb)) {
+            wm_compositor_tick();
+        } else if (win->hw_direct_fb && win->wm_win->fullscreen && wm_get_focused() == win->wm_win) {
             if (win->fast_2x_scale) {
                 flip_fast_2x(renderer, win->screen_w, win->screen_h);
             } else {
@@ -1567,7 +1962,26 @@ void SDL_RenderPresent(SDL_Renderer *renderer) {
             wm_compositor_tick();
         }
     } else if (win->direct_gfx) {
-        vga_gfx_flip_scaled_buffer(renderer->fb8, renderer->fb_w, renderer->fb_h);
+        if (!(renderer->fb32 &&
+              ipo_hd_present_xrgb32(&win->hd, NULL, true,
+                                    renderer->fb32, renderer->fb_w, renderer->fb_h, renderer->fb_w)) &&
+            !ipo_hd_present_pal32(&win->hd, NULL, true,
+                                  renderer->fb8, renderer->fb_w, renderer->fb_h, renderer->fb_w,
+                                  s_pal_xrgb)) {
+            vga_gfx_flip_scaled_buffer(renderer->fb8, renderer->fb_w, renderer->fb_h);
+        }
+    }
+
+    if (renderer->vsync_enabled) {
+        uint32_t vnow = timer_millis();
+        uint32_t elapsed = vnow - renderer->last_present_ms;
+        if (elapsed < 16u) {
+            uint32_t target = renderer->last_present_ms + 16u;
+            while ((int32_t)(timer_millis() - target) < 0) {
+                ipo_syscall(IPO_SYSCALL_PROCESS_YIELD, 0, NULL);
+            }
+        }
+        renderer->last_present_ms = timer_millis();
     }
 
     renderer->fps_frames++;
@@ -1598,26 +2012,8 @@ void SDL_Delay(Uint32 ms) {
         serial_printf("[SENSE: The Game] loss_screen t=%u\n", (unsigned)timer_millis());
     }
 
-    /* Adaptive target pacing on the main 60Hz loop call SDL_Delay(16) */
-    if (ms == 16 && s_active_ren) {
-        uint32_t now = timer_millis();
-        if (!s_active_ren->frame_timer_init) {
-            s_active_ren->frame_timer_init = true;
-            s_active_ren->frame_target_ms = now + 13u;
-        } else {
-            s_active_ren->frame_target_ms += 13u;
-            int32_t ahead = (int32_t)(s_active_ren->frame_target_ms - now);
-            if (ahead > 14) s_active_ren->frame_target_ms = now + 13u;
-            else if (ahead < -25) s_active_ren->frame_target_ms = now;
-        }
-        while ((int32_t)(timer_millis() - s_active_ren->frame_target_ms) < 0) {
-            ipo_syscall(IPO_SYSCALL_PROCESS_YIELD, 0, NULL);
-        }
-        return;
-    }
-
-    uint32_t end = timer_millis() + ms;
-    while ((int32_t)(timer_millis() - end) < 0) {
+    uint32_t start = timer_millis();
+    while ((uint32_t)(timer_millis() - start) < ms) {
         ipo_syscall(IPO_SYSCALL_PROCESS_YIELD, 0, NULL);
     }
 }
@@ -1699,10 +2095,13 @@ SDL_Surface *SDL_LoadBMP_RW(SDL_RWops *src, int freesrc) {
         return NULL;
     }
 
+    if ((uint64_t)bw * (uint64_t)bh > SIZE_MAX / sizeof(uint32_t)) {
+        if (freesrc) SDL_FreeRW(src);
+        return NULL;
+    }
     int step = 1;
-    while ((bw / step) > 64 || (bh / step) > 64) step++;
-    int ow = bw / step; if (ow < 1) ow = 1;
-    int oh = bh / step; if (oh < 1) oh = 1;
+    int ow = bw;
+    int oh = bh;
 
     uint32_t *pix = (uint32_t *)calloc((size_t)ow * (size_t)oh, sizeof(uint32_t));
     if (!pix) {
@@ -1815,7 +2214,6 @@ SDL_Texture *IMG_LoadTexture(SDL_Renderer *renderer, const char *file) {
  * Audio (SDL_mixer -> IPO_OS audio_stream 22050 Hz S16 mono)
  * ========================================================================= */
 #define MIX_TARGET_RATE 22050u
-#define MIX_MAX_SFX_CH  8
 
 struct Mix_Music {
     int16_t *pcm;
@@ -1842,7 +2240,8 @@ typedef struct {
 } MixChannelState;
 
 static Mix_Music *s_cur_music = NULL;
-static MixChannelState s_sfx_ch[MIX_MAX_SFX_CH];
+static MixChannelState *s_sfx_ch = NULL;
+static int s_sfx_cap = 0;
 
 static int16_t *decode_wav_to_s16_mono_22k(const uint8_t *data, size_t size,
                                            size_t *out_frames, uint32_t *out_ms) {
@@ -1929,9 +2328,8 @@ static int16_t *decode_wav_to_s16_mono_22k(const uint8_t *data, size_t size,
 static void pump_audio_state(void) {
     uint32_t now = timer_millis();
     if (s_cur_music && s_cur_music->stream && s_cur_music->playing && !s_cur_music->paused) {
-        double p = audio_stream_get_progress(s_cur_music->stream);
-        if (p >= 0.99 || (s_cur_music->duration_ms > 0 &&
-                          now - s_cur_music->play_start_ms >= s_cur_music->duration_ms + 40u)) {
+        if (s_cur_music->duration_ms > 0 &&
+            (uint32_t)(now - s_cur_music->play_start_ms) >= s_cur_music->duration_ms) {
             if (s_cur_music->loop) {
                 audio_stream_seek(s_cur_music->stream, 0.0);
                 audio_stream_play(s_cur_music->stream);
@@ -1942,13 +2340,14 @@ static void pump_audio_state(void) {
             }
         }
     }
-    for (int i = 0; i < MIX_MAX_SFX_CH; i++) {
-        if (s_sfx_ch[i].playing && s_sfx_ch[i].stream) {
-            double p = audio_stream_get_progress(s_sfx_ch[i].stream);
-            if (p >= 0.995 || (now - s_sfx_ch[i].start_ms >= s_sfx_ch[i].duration_ms + 120u)) {
-                audio_stream_stop(s_sfx_ch[i].stream);
-                audio_stream_destroy(s_sfx_ch[i].stream);
-                s_sfx_ch[i].stream = NULL;
+    for (int i = 0; i < s_sfx_cap; i++) {
+        if (s_sfx_ch[i].playing) {
+            if ((uint32_t)(now - s_sfx_ch[i].start_ms) >= s_sfx_ch[i].duration_ms) {
+                if (s_sfx_ch[i].stream) {
+                    audio_stream_stop(s_sfx_ch[i].stream);
+                    audio_stream_destroy(s_sfx_ch[i].stream);
+                    s_sfx_ch[i].stream = NULL;
+                }
                 s_sfx_ch[i].playing = false;
             }
         }
@@ -1965,7 +2364,7 @@ int Mix_OpenAudio(int frequency, Uint16 format, int channels, int chunksize) {
 
 void Mix_CloseAudio(void) {
     Mix_HaltMusic();
-    for (int i = 0; i < MIX_MAX_SFX_CH; i++) {
+    for (int i = 0; i < s_sfx_cap; i++) {
         if (s_sfx_ch[i].stream) {
             audio_stream_stop(s_sfx_ch[i].stream);
             audio_stream_destroy(s_sfx_ch[i].stream);
@@ -1973,6 +2372,9 @@ void Mix_CloseAudio(void) {
         }
         s_sfx_ch[i].playing = false;
     }
+    free(s_sfx_ch);
+    s_sfx_ch = NULL;
+    s_sfx_cap = 0;
 }
 
 Mix_Music *Mix_LoadMUS_RW(SDL_RWops *src, int freesrc) {
@@ -2081,14 +2483,36 @@ void Mix_FreeChunk(Mix_Chunk *chunk) {
     free(chunk);
 }
 
+static bool sfx_ensure_cap(int need) {
+    if (need <= s_sfx_cap) return true;
+    int new_cap = s_sfx_cap ? s_sfx_cap : 8;
+    while (new_cap < need) {
+        if (new_cap > INT32_MAX / 2) return false;
+        new_cap *= 2;
+    }
+    if ((size_t)new_cap > SIZE_MAX / sizeof(MixChannelState)) return false;
+    MixChannelState *ns = (MixChannelState *)realloc(s_sfx_ch, (size_t)new_cap * sizeof(MixChannelState));
+    if (!ns) return false;
+    memset(ns + s_sfx_cap, 0, (size_t)(new_cap - s_sfx_cap) * sizeof(MixChannelState));
+    s_sfx_ch = ns;
+    s_sfx_cap = new_cap;
+    return true;
+}
+
 int Mix_PlayChannel(int channel, Mix_Chunk *chunk, int loops) {
     (void)loops;
     if (!chunk || !chunk->pcm) return -1;
     int ch = channel;
-    if (ch < 0 || ch >= MIX_MAX_SFX_CH) {
-        ch = 0;
-        for (int i = 0; i < MIX_MAX_SFX_CH; i++) {
+    if (ch >= 0) {
+        if (!sfx_ensure_cap(ch + 1)) return -1;
+    } else {
+        ch = -1;
+        for (int i = 0; i < s_sfx_cap; i++) {
             if (!s_sfx_ch[i].playing) { ch = i; break; }
+        }
+        if (ch < 0) {
+            ch = s_sfx_cap;
+            if (!sfx_ensure_cap(ch + 1)) return -1;
         }
     }
     if (s_sfx_ch[ch].stream) {
@@ -2114,20 +2538,20 @@ int Mix_PlayChannel(int channel, Mix_Chunk *chunk, int loops) {
 int Mix_Playing(int channel) {
     pump_audio_state();
     if (channel < 0) {
-        for (int i = 0; i < MIX_MAX_SFX_CH; i++) {
+        for (int i = 0; i < s_sfx_cap; i++) {
             if (s_sfx_ch[i].playing) return 1;
         }
         return 0;
     }
-    if (channel >= MIX_MAX_SFX_CH) return 0;
+    if (channel >= s_sfx_cap) return 0;
     return s_sfx_ch[channel].playing ? 1 : 0;
 }
 
 /* =========================================================================
  * Event Queue + Keyboard / Gamepad (.kmd) / Touchpad (.kmd)
  * ========================================================================= */
-#define EVQ_CAP 256
-static SDL_Event s_evq[EVQ_CAP];
+static SDL_Event *s_evq = NULL;
+static int s_evq_cap = 0;
 static int s_evq_head = 0;
 static int s_evq_tail = 0;
 
@@ -2149,23 +2573,63 @@ typedef struct {
     float x, y;
 } TouchSlotState;
 
-static TouchSlotState s_tslots[8];
+static TouchSlotState *s_tslots = NULL;
+static int s_tslots_cap = 0;
 static int s_cur_tslot = 0;
+
+static bool ensure_tslot(int slot) {
+    if (slot < 0) return false;
+    if (slot < s_tslots_cap) return true;
+    int new_cap = s_tslots_cap ? s_tslots_cap : 8;
+    while (new_cap <= slot) {
+        if (new_cap > INT32_MAX / 2) return false;
+        new_cap *= 2;
+    }
+    if ((size_t)new_cap > SIZE_MAX / sizeof(TouchSlotState)) return false;
+    TouchSlotState *nt = (TouchSlotState *)realloc(s_tslots, (size_t)new_cap * sizeof(TouchSlotState));
+    if (!nt) return false;
+    memset(nt + s_tslots_cap, 0, (size_t)(new_cap - s_tslots_cap) * sizeof(TouchSlotState));
+    s_tslots = nt;
+    s_tslots_cap = new_cap;
+    return true;
+}
 
 static void sdl_push_event(const SDL_Event *ev) {
     if (ev->type == SDL_KEYDOWN) s_ev_kb++;
     else if (ev->type == SDL_CONTROLLERBUTTONDOWN) s_ev_gp++;
     else if (ev->type == SDL_FINGERDOWN) s_ev_tp++;
-    int nxt = (s_evq_head + 1) % EVQ_CAP;
-    if (nxt == s_evq_tail) return;
+    if (!s_evq) {
+        s_evq_cap = 256;
+        s_evq = (SDL_Event *)calloc((size_t)s_evq_cap, sizeof(SDL_Event));
+        if (!s_evq) { s_evq_cap = 0; return; }
+        s_evq_head = 0;
+        s_evq_tail = 0;
+    }
+    int nxt = (s_evq_head + 1) % s_evq_cap;
+    if (nxt == s_evq_tail) {
+        int new_cap = s_evq_cap * 2;
+        if (new_cap <= s_evq_cap || (size_t)new_cap > SIZE_MAX / sizeof(SDL_Event)) return;
+        SDL_Event *nq = (SDL_Event *)malloc((size_t)new_cap * sizeof(SDL_Event));
+        if (!nq) return;
+        int n = 0;
+        for (int idx = s_evq_tail; idx != s_evq_head; idx = (idx + 1) % s_evq_cap) {
+            nq[n++] = s_evq[idx];
+        }
+        free(s_evq);
+        s_evq = nq;
+        s_evq_tail = 0;
+        s_evq_head = n;
+        s_evq_cap = new_cap;
+        nxt = s_evq_head + 1;
+    }
     s_evq[s_evq_head] = *ev;
     s_evq_head = nxt;
 }
 
 static bool sdl_pop_event(SDL_Event *ev) {
-    if (s_evq_head == s_evq_tail) return false;
+    if (!s_evq || s_evq_head == s_evq_tail) return false;
     *ev = s_evq[s_evq_tail];
-    s_evq_tail = (s_evq_tail + 1) % EVQ_CAP;
+    s_evq_tail = (s_evq_tail + 1) % s_evq_cap;
     return true;
 }
 
@@ -2218,6 +2682,12 @@ static void handle_ps2_scancode(uint8_t sc) {
     } else {
         bool was_down = s_key_down[kidx];
         s_key_down[kidx] = true;
+        if (!e0 && make_sc == 0x2Eu && (s_key_down[0x1D] || s_key_down[256 | 0x1D])) {
+            SDL_Event q;
+            memset(&q, 0, sizeof(q));
+            q.type = SDL_QUIT;
+            sdl_push_event(&q);
+        }
         if (sym != SDLK_UNKNOWN) {
             SDL_Event ev;
             memset(&ev, 0, sizeof(ev));
@@ -2341,7 +2811,7 @@ static void flush_touch_slot(TouchSlotState *s, int slot_idx) {
 }
 
 static void flush_all_touch_slots(void) {
-    for (int i = 0; i < 8; i++) {
+    for (int i = 0; i < s_tslots_cap; i++) {
         flush_touch_slot(&s_tslots[i], i);
     }
 }
@@ -2356,7 +2826,8 @@ static void pump_all_inputs(void) {
 
     if (s_active_win) {
         if (s_active_win->wm_win) {
-            if (!wm_is_window_valid(s_active_win->wm_win) || !wm_session_active()) {
+            if (!wm_is_window_valid(s_active_win->wm_win) || !wm_session_active() ||
+                system_is_interrupted()) {
                 if (!s_active_win->closed) {
                     s_active_win->closed = true;
                     SDL_Event q;
@@ -2373,6 +2844,14 @@ static void pump_all_inputs(void) {
                         memset(&q, 0, sizeof(q));
                         q.type = SDL_QUIT;
                         sdl_push_event(&q);
+                    } else if (wev.type == WM_EVENT_KEY_EXT) {
+                        uint32_t kc = wev.data & 0x7FFFFFFFu;
+                        if ((kc & 0xFF00u) == 0xE000u) {
+                            handle_ps2_scancode(0xE0u);
+                        }
+                        uint8_t sc = (uint8_t)(kc & 0x7Fu);
+                        if (wev.data & 0x80000000u) sc |= 0x80u;
+                        handle_ps2_scancode(sc);
                     } else if (wev.type == WM_EVENT_KEY_DOWN || wev.type == WM_EVENT_KEY_UP) {
                         handle_ps2_scancode((uint8_t)(wev.data & 0xFFu));
                     }
@@ -2410,7 +2889,7 @@ static void pump_all_inputs(void) {
             } else if (s_touchpad_dev_id && iev.dev_id == s_touchpad_dev_id) {
                 if (iev.type == IPO_EV_SYN) {
                     if (!s_tp_logged) {
-                        for (int k = 0; k < 8; k++) {
+                        for (int k = 0; k < s_tslots_cap; k++) {
                             if (s_tslots[k].dirty && s_tslots[k].next_active) {
                                 s_tp_logged = true;
                                 printf("[SENSE: The Game] touchpad active slot=%d x_milli=%d\n",
@@ -2422,8 +2901,10 @@ static void pump_all_inputs(void) {
                     flush_all_touch_slots();
                 } else if (iev.type == IPO_EV_ABS) {
                     if (iev.code == 0x2Fu) {
-                        s_cur_tslot = (iev.value >= 0 && iev.value < 8) ? iev.value : 0;
-                    } else {
+                        if (ensure_tslot((int)iev.value)) {
+                            s_cur_tslot = (int)iev.value;
+                        }
+                    } else if (ensure_tslot(s_cur_tslot)) {
                         TouchSlotState *s = &s_tslots[s_cur_tslot];
                         if (iev.code == 0x39u) {
                             if (s->dirty) flush_touch_slot(s, s_cur_tslot);
@@ -2441,9 +2922,11 @@ static void pump_all_inputs(void) {
                         }
                     }
                 } else if (iev.type == IPO_EV_KEY && iev.code == 0x14Au) {
-                    s_tslots[0].next_active = (iev.value != 0);
-                    s_tslots[0].dirty = true;
-                    flush_touch_slot(&s_tslots[0], 0);
+                    if (ensure_tslot(0)) {
+                        s_tslots[0].next_active = (iev.value != 0);
+                        s_tslots[0].dirty = true;
+                        flush_touch_slot(&s_tslots[0], 0);
+                    }
                 }
             }
         }
@@ -2499,12 +2982,12 @@ SDL_JoystickID SDL_JoystickInstanceID(SDL_Joystick *joystick) {
 int SDL_Init(Uint32 flags) {
     (void)flags;
     init_palette_and_luts();
-    memset(s_evq, 0, sizeof(s_evq));
+    if (s_evq && s_evq_cap > 0) memset(s_evq, 0, (size_t)s_evq_cap * sizeof(SDL_Event));
     s_evq_head = s_evq_tail = 0;
     s_k_e0 = false;
     memset(s_key_down, 0, sizeof(s_key_down));
     memset(s_pad_btn_down, 0, sizeof(s_pad_btn_down));
-    memset(s_tslots, 0, sizeof(s_tslots));
+    if (s_tslots && s_tslots_cap > 0) memset(s_tslots, 0, (size_t)s_tslots_cap * sizeof(TouchSlotState));
     s_gamepad_announced = false;
     discover_input_devices(true);
     return 0;
@@ -2512,4 +2995,8 @@ int SDL_Init(Uint32 flags) {
 
 void SDL_Quit(void) {
     Mix_CloseAudio();
+    tex_surf_cache_free_all();
+    free(s_evq); s_evq = NULL; s_evq_cap = 0; s_evq_head = 0; s_evq_tail = 0;
+    free(s_tslots); s_tslots = NULL; s_tslots_cap = 0; s_cur_tslot = 0;
+    free(s_err_buf); s_err_buf = NULL;
 }

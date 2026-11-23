@@ -3,6 +3,7 @@
 
 #include <GL/gl.h>
 #include <GL/glu.h>
+#include <ipo/gpu_client.h>
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -53,6 +54,8 @@ typedef struct {
     GLenum    wrap_t;
     GLenum    wrap_r;
     bool      in_use;
+    uint32_t  gpu_res_id;
+    bool      gpu_dirty;
 } gl_texture_t;
 
 /* Light representation */
@@ -155,7 +158,8 @@ typedef struct GLContext {
     /* Lighting & Shading */
     GLboolean    lighting_enabled;
     GLenum       shade_model;
-    gl_light_t   lights[8];
+    gl_light_t  *lights;
+    int          light_capacity;
     gl_material_t front_material;
     gl_material_t back_material;
     GLboolean    color_material_enabled;
@@ -224,6 +228,29 @@ typedef struct GLContext {
 
     /* Error handling */
     GLenum       error_flag;
+
+    /* VirGL / VirtIO-GPU Hardware Acceleration State (falls back to CPU) */
+    uint32_t          gpu_ctx_id;
+    uint32_t          gpu_msaa_color_res;
+    uint32_t          gpu_msaa_depth_res;
+    uint32_t          gpu_color_res;
+    uint32_t          gpu_depth_res;
+    uint32_t          gpu_postfx_res;
+    int               gpu_rt_w;
+    int               gpu_rt_h;
+    bool              gpu_frame_active;
+    bool              gpu_dirty_content;
+    ipo_gpu_batch_t   gpu_batch;
+    ipo_gpu_dynbuf_t  gpu_vbo;
+    ipo_gpu_dynbuf_t  gpu_quad_vbo;
+    ipo_gpu_vertex_t *gpu_verts;
+    uint32_t          gpu_vert_count;
+    uint32_t          gpu_vert_cap;
+    uint8_t          *mode13h_frame;
+    size_t            mode13h_frame_cap;
+    uint32_t         *gpu_pending_destroy_res;
+    size_t            gpu_pending_destroy_cnt;
+    size_t            gpu_pending_destroy_cap;
 } GLContext;
 
 /* Context Management API */
@@ -233,6 +260,7 @@ bool       gl_resize_context(GLContext *ctx, int new_w, int new_h);
 void       gl_make_current(GLContext *ctx);
 GLContext *gl_get_current_context(void);
 void       gl_swap_buffers(GLContext *ctx, void *win);
+bool       gl_ensure_light_capacity(GLContext *ctx, int min_count);
 
 /* Internal Rasterizer and Pipeline Hooks */
 void gl_matrix_init_stack(gl_matrix_stack_t *stack);
@@ -248,10 +276,33 @@ void gl_rasterize_point(GLContext *ctx, gl_vertex_t *v0);
 
 void gl_clip_and_render_polygon(GLContext *ctx, gl_vertex_t *verts, int nverts);
 
+enum {
+    GL_DL_CMD_BEGIN = 1,
+    GL_DL_CMD_END = 2,
+    GL_DL_CMD_VERTEX4F = 3,
+    GL_DL_CMD_NORMAL3F = 4,
+    GL_DL_CMD_COLOR4F = 5,
+    GL_DL_CMD_TEXCOORD4F = 6,
+    GL_DL_CMD_SHADEMODEL = 7
+};
+
+void gl_list_record_cmd(GLContext *ctx, uint32_t op, GLenum mode, const GLfloat *vals, int nvals);
+
 /* Palette Dithering conversion for Mode 13h */
 void gl_palette_init(void);
 void gl_quantize_argb_to_palette(const uint32_t *src, uint8_t *dst, int w, int h);
 void gl_quantize_argb_to_palette_strided(const uint32_t *src, int src_stride, uint8_t *dst, int dst_stride, int w, int h);
+
+/* VirGL Hardware GPU Backend Hooks (gl_gpu.c) */
+bool gl_gpu_is_active(void);
+bool gl_gpu_try_clear(GLContext *ctx, GLbitfield mask);
+bool gl_gpu_try_draw_primitive(GLContext *ctx);
+bool gl_gpu_sync_readback(GLContext *ctx);
+void gl_gpu_flush(GLContext *ctx);
+bool gl_gpu_try_swap_buffers(GLContext *ctx, void *win_ptr);
+void gl_gpu_invalidate_rt(GLContext *ctx);
+void gl_gpu_destroy_texture(GLContext *ctx, gl_texture_t *tex);
+void gl_gpu_destroy_context_res(GLContext *ctx);
 
 #ifdef __cplusplus
 }

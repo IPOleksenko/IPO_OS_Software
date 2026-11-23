@@ -2,30 +2,70 @@
 #define _CPP_TYPEINFO_H
 
 #include <stddef.h>
+#include <string.h>
+#include <exception>
+
+namespace __cxxabiv1 {
+class __class_type_info;
+}
 
 namespace std {
 
 class type_info {
 public:
     virtual ~type_info();
+
     bool operator==(const type_info& rhs) const noexcept {
-        return __name == rhs.__name;
+        return (__name == rhs.__name) ||
+               (__name && rhs.__name && __name[0] != '*' && strcmp(__name, rhs.__name) == 0);
     }
+
     bool operator!=(const type_info& rhs) const noexcept {
-        return __name != rhs.__name;
+        return !(*this == rhs);
     }
+
+    bool before(const type_info& rhs) const noexcept {
+        if (__name == rhs.__name) return false;
+        if (!__name) return true;
+        if (!rhs.__name) return false;
+        if (__name[0] == '*' && rhs.__name[0] == '*') {
+            return __name < rhs.__name;
+        }
+        return strcmp(__name, rhs.__name) < 0;
+    }
+
     const char* name() const noexcept {
-        return __name;
+        return (__name && __name[0] == '*') ? (__name + 1) : __name;
     }
+
+    virtual bool __is_pointer_p() const;
+    virtual bool __is_function_p() const;
+    virtual bool __do_catch(const type_info* thr_type, void** thr_obj, unsigned outer) const;
+    virtual bool __do_upcast(const __cxxabiv1::__class_type_info* target, void** obj_ptr) const;
+
 protected:
-    const char *__name;
-    explicit type_info(const char *n) : __name(n) {}
+    const char* __name;
+    explicit type_info(const char* n) : __name(n) {}
+
 private:
     type_info(const type_info&) = delete;
     type_info& operator=(const type_info&) = delete;
 };
 
+class bad_cast : public exception {
+public:
+    bad_cast() noexcept {}
+    virtual ~bad_cast() noexcept;
+    virtual const char* what() const noexcept override;
+};
+
+class bad_typeid : public exception {
+public:
+    bad_typeid() noexcept {}
+    virtual ~bad_typeid() noexcept;
+    virtual const char* what() const noexcept override;
+};
+
 } // namespace std
 
 #endif
-

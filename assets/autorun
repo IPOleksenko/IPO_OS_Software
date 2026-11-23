@@ -1,7 +1,7 @@
 # IPO_OS Autorun Script
 
-drivers load /drivers/rtl8139.kmd
-drivers load /drivers/touchpad.kmd
-drivers load /drivers/gamepad.kmd
+/drivers/rtl8139
+/drivers/touchpad
+/drivers/gamepad
 /applications/binfmt
 

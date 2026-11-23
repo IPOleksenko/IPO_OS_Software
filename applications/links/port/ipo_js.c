@@ -400,7 +400,6 @@ static void decode_html_entities(const char *s, size_t len, dbuf_t *out) {
 
 static void parse_html_into(ipo_js_runtime_t *rt, dom_node_t *root, const char *html, size_t len) {
 	dom_node_t *cur = root;
-	int depth = 0;
 	const char *p = html ? html : "";
 	const char *end = p + len;
 
@@ -459,15 +458,12 @@ static void parse_html_into(ipo_js_runtime_t *rt, dom_node_t *root, const char *
 			p = gt ? gt + 1 : end;
 			/* Walk up to matching tag */
 			dom_node_t *m = cur;
-			int steps = 0;
 			while (m && m != root) {
-				steps++;
 				if (m->kind == DOM_ELEMENT && strcmp(m->tag, tname) == 0) break;
 				m = m->parent;
 			}
 			if (m && m != root && m->parent) {
 				cur = m->parent;
-				depth = (depth >= steps) ? (depth - steps) : 0;
 			}
 			free(tname);
 			continue;
@@ -529,20 +525,19 @@ static void parse_html_into(ipo_js_runtime_t *rt, dom_node_t *root, const char *
 		     ((strcmp(tname, "td") == 0 || strcmp(tname, "th") == 0) && (strcmp(cur->tag, "td") == 0 || strcmp(cur->tag, "th") == 0)) ||
 		     (strcmp(tname, "p") == 0 && strcmp(cur->tag, "p") == 0))) {
 			cur = cur->parent ? cur->parent : root;
-			if (depth > 0) depth--;
 		}
 		dom_append_child(cur, el);
 
 		if (strcmp(tname, "script") == 0 || strcmp(tname, "style") == 0) {
 			/* Scan raw text until </script> or </style> */
-			char ctag[16];
-			snprintf(ctag, sizeof(ctag), "</%s", tname);
-			size_t ctl = strlen(ctag);
+			size_t tlen = strlen(tname);
+			size_t ctl = 2u + tlen;
 			const char *rs = p;
 			const char *re = end;
-			for (const char *q = p; q + ctl < end; q++) {
-				if (q[0] == '<' && q[1] == '/' && strncasecmp(q + 2, tname, strlen(tname)) == 0) {
-					const char *gt = (const char *)memchr(q + 2 + strlen(tname), '>', (size_t)(end - (q + 2 + strlen(tname))));
+			for (const char *q = p; (size_t)(end - q) > ctl; q++) {
+				if (q[0] == '<' && q[1] == '/' && strncasecmp(q + 2, tname, tlen) == 0) {
+					const char *after = q + ctl;
+					const char *gt = (const char *)memchr(after, '>', (size_t)(end - after));
 					re = q;
 					p = gt ? gt + 1 : end;
 					break;
@@ -556,9 +551,8 @@ static void parse_html_into(ipo_js_runtime_t *rt, dom_node_t *root, const char *
 				memcpy(tn->text, rs, rl); tn->text[rl] = '\0';
 				dom_append_child(el, tn);
 			}
-		} else if (!self_close && !is_void_tag(tname) && depth < 128) {
+		} else if (!self_close && !is_void_tag(tname)) {
 			cur = el;
-			depth++;
 		}
 	}
 }
@@ -590,6 +584,47 @@ static int node_has_listener(const dom_node_t *n, const char *type) {
 	return 0;
 }
 
+static void db_add_int(dbuf_t *b, int v) {
+	unsigned int uv;
+	if (v < 0) {
+		db_addc(b, '-');
+		uv = (unsigned int)(-(long long)v);
+	} else {
+		uv = (unsigned int)v;
+	}
+	char rev[32];
+	size_t n = 0;
+	do {
+		rev[n++] = (char)('0' + (uv % 10u));
+		uv /= 10u;
+	} while (uv > 0);
+	while (n > 0) db_addc(b, rev[--n]);
+}
+
+static void db_add_dispatch_attr_val(dbuf_t *b, int elem_id, const char *ev, const char *av) {
+	db_add_attr_escaped(b, "__ipoDispatch(");
+	char rev[32];
+	unsigned int uv = elem_id < 0 ? (unsigned int)(-(long long)elem_id) : (unsigned int)elem_id;
+	size_t n = 0;
+	if (elem_id < 0) db_add_attr_escaped(b, "-");
+	do { rev[n++] = (char)('0' + (uv % 10u)); uv /= 10u; } while (uv > 0);
+	while (n > 0) { char ch[2] = { rev[--n], '\0' }; db_add_attr_escaped(b, ch); }
+	db_add_attr_escaped(b, ",'");
+	db_add_attr_escaped(b, ev);
+	db_add_attr_escaped(b, "');");
+	db_add_attr_escaped(b, av);
+}
+
+static void db_add_dispatch_attr(dbuf_t *b, int elem_id, const char *ev) {
+	db_adds(b, " on");
+	db_adds(b, ev);
+	db_adds(b, "=\"return __ipoDispatch(");
+	db_add_int(b, elem_id);
+	db_adds(b, ",'");
+	db_adds(b, ev);
+	db_adds(b, "')\"");
+}
+
 static void dom_serialize_open_tag(const dom_node_t *n, dbuf_t *b) {
 	const char *tag = n->tag ? n->tag : "div";
 	db_addc(b, '<');
@@ -607,19 +642,13 @@ static void dom_serialize_open_tag(const dom_node_t *n, dbuf_t *b) {
 		db_adds(b, an);
 		if (strcmp(an, "onclick") == 0 && node_has_listener(n, "click") &&
 		    strstr(av, "__ipoDispatch(") == NULL) {
-			char extra[96];
-			snprintf(extra, sizeof(extra), "__ipoDispatch(%d,'click');", n->elem_id);
 			db_adds(b, "=\"");
-			db_add_attr_escaped(b, extra);
-			db_add_attr_escaped(b, av);
+			db_add_dispatch_attr_val(b, n->elem_id, "click", av);
 			db_addc(b, '"');
 		} else if (strcmp(an, "onchange") == 0 && node_has_listener(n, "change") &&
 		           strstr(av, "__ipoDispatch(") == NULL) {
-			char extra[96];
-			snprintf(extra, sizeof(extra), "__ipoDispatch(%d,'change');", n->elem_id);
 			db_adds(b, "=\"");
-			db_add_attr_escaped(b, extra);
-			db_add_attr_escaped(b, av);
+			db_add_dispatch_attr_val(b, n->elem_id, "change", av);
 			db_addc(b, '"');
 		} else {
 			db_adds(b, "=\"");
@@ -629,19 +658,13 @@ static void dom_serialize_open_tag(const dom_node_t *n, dbuf_t *b) {
 	}
 
 	if (!has_onclick && node_has_listener(n, "click")) {
-		char attr[96];
-		snprintf(attr, sizeof(attr), " onclick=\"return __ipoDispatch(%d,'click')\"", n->elem_id);
-		db_adds(b, attr);
+		db_add_dispatch_attr(b, n->elem_id, "click");
 	}
 	if (!has_onchange && node_has_listener(n, "change")) {
-		char attr[96];
-		snprintf(attr, sizeof(attr), " onchange=\"return __ipoDispatch(%d,'change')\"", n->elem_id);
-		db_adds(b, attr);
+		db_add_dispatch_attr(b, n->elem_id, "change");
 	}
 	if (!has_onsubmit && node_has_listener(n, "submit")) {
-		char attr[96];
-		snprintf(attr, sizeof(attr), " onsubmit=\"return __ipoDispatch(%d,'submit')\"", n->elem_id);
-		db_adds(b, attr);
+		db_add_dispatch_attr(b, n->elem_id, "submit");
 	}
 	db_addc(b, '>');
 }
@@ -1049,13 +1072,13 @@ static int match_simple_selector(const dom_node_t *n, const char *sel, size_t le
 
 static int match_complex_selector(const dom_node_t *n, const char *sel, size_t len) {
 	/* Right-to-left combinator matcher (supports space and '>') */
-	const char *parts[16];
-	size_t plens[16];
-	char combs[16];
-	int np = 0;
+	const char **parts = NULL;
+	size_t *plens = NULL;
+	char *combs = NULL;
+	size_t np = 0, cap = 0;
 
 	const char *p = sel, *end = sel + len;
-	while (p < end && np < 16) {
+	while (p < end) {
 		while (p < end && isspace((unsigned char)*p)) p++;
 		if (p >= end) break;
 		char comb = ' ';
@@ -1069,24 +1092,48 @@ static int match_complex_selector(const dom_node_t *n, const char *sel, size_t l
 			p++;
 		}
 		if (p > s) {
+			if (np >= cap) {
+				size_t ncap = cap ? cap * 2u : 16u;
+				if (ncap > SIZE_MAX / sizeof(const char *)) {
+					free(parts); free(plens); free(combs);
+					return 0;
+				}
+				const char **np_arr = (const char **)realloc(parts, ncap * sizeof(const char *));
+				size_t *nl_arr = (size_t *)realloc(plens, ncap * sizeof(size_t));
+				char *nc_arr = (char *)realloc(combs, ncap * sizeof(char));
+				if (!np_arr || !nl_arr || !nc_arr) {
+					free(np_arr ? np_arr : parts);
+					free(nl_arr ? nl_arr : plens);
+					free(nc_arr ? nc_arr : combs);
+					return 0;
+				}
+				parts = np_arr; plens = nl_arr; combs = nc_arr;
+				cap = ncap;
+			}
 			parts[np] = s; plens[np] = (size_t)(p - s); combs[np] = comb; np++;
 		}
 	}
-	if (np == 0) return 0;
-	if (!match_simple_selector(n, parts[np - 1], plens[np - 1])) return 0;
-	const dom_node_t *cur = n;
-	for (int i = np - 2; i >= 0; i--) {
-		char comb = combs[i + 1];
-		if (comb == '>') {
-			cur = cur->parent;
-			if (!cur || !match_simple_selector(cur, parts[i], plens[i])) return 0;
-		} else {
-			cur = cur->parent;
-			while (cur && !match_simple_selector(cur, parts[i], plens[i])) cur = cur->parent;
-			if (!cur) return 0;
+	int ok = 0;
+	if (np > 0 && match_simple_selector(n, parts[np - 1], plens[np - 1])) {
+		ok = 1;
+		const dom_node_t *cur = n;
+		for (size_t idx = np - 1; idx > 0; idx--) {
+			size_t i = idx - 1;
+			char comb = combs[i + 1];
+			if (comb == '>') {
+				cur = cur->parent;
+				if (!cur || !match_simple_selector(cur, parts[i], plens[i])) { ok = 0; break; }
+			} else {
+				cur = cur->parent;
+				while (cur && !match_simple_selector(cur, parts[i], plens[i])) cur = cur->parent;
+				if (!cur) { ok = 0; break; }
+			}
 		}
 	}
-	return 1;
+	free(parts);
+	free(plens);
+	free(combs);
+	return ok;
 }
 
 static int dom_matches_selector(const dom_node_t *n, const char *sel_list) {
@@ -1106,9 +1153,14 @@ static int dom_matches_selector(const dom_node_t *n, const char *sel_list) {
  * CSS Inline Style Helper (camelCase <-> kebab-case)
  * ========================================================================= */
 
-static void camel_to_kebab(const char *s, char *out, size_t cap) {
+static char *camel_to_kebab_alloc(const char *s) {
+	if (!s) return xdup("");
+	size_t n = strlen(s);
+	if (n > (SIZE_MAX - 1u) / 2u) return NULL;
+	char *out = (char *)malloc(n * 2u + 1u);
+	if (!out) return NULL;
 	size_t j = 0;
-	for (size_t i = 0; s[i] && j + 2 < cap; i++) {
+	for (size_t i = 0; s[i]; i++) {
 		unsigned char c = (unsigned char)s[i];
 		if (isupper(c) && j > 0) {
 			out[j++] = '-';
@@ -1118,13 +1170,15 @@ static void camel_to_kebab(const char *s, char *out, size_t cap) {
 		}
 	}
 	out[j] = '\0';
+	return out;
 }
 
-static int style_get_decl(const char *style, const char *prop_kebab, char *out, size_t cap) {
-	if (out && cap) out[0] = '\0';
-	if (!style || !prop_kebab || !*prop_kebab) return 0;
+static char *style_get_decl_alloc(const char *style, const char *prop_kebab) {
+	if (!style || !prop_kebab || !*prop_kebab) return xdup("");
 	const char *p = style;
-	int found = 0;
+	const char *best_vs = NULL;
+	size_t best_vl = 0;
+	size_t pk_len = strlen(prop_kebab);
 	while (*p) {
 		while (*p && (isspace((unsigned char)*p) || *p == ';')) p++;
 		if (!*p) break;
@@ -1139,17 +1193,18 @@ static int style_get_decl(const char *style, const char *prop_kebab, char *out, 
 		while (*p && *p != ';') p++;
 		const char *ve = p;
 		while (ve > vs && isspace((unsigned char)ve[-1])) ve--;
-		if (strlen(prop_kebab) == (size_t)(ke - ks) &&
-		    strncasecmp(ks, prop_kebab, (size_t)(ke - ks)) == 0) {
-			if (out && cap) {
-				size_t vl = (size_t)(ve - vs);
-				if (vl >= cap) vl = cap - 1;
-				memcpy(out, vs, vl); out[vl] = '\0';
-			}
-			found = 1;
+		if (pk_len == (size_t)(ke - ks) &&
+		    strncasecmp(ks, prop_kebab, pk_len) == 0) {
+			best_vs = vs;
+			best_vl = (size_t)(ve - vs);
 		}
 	}
-	return found;
+	if (!best_vs) return xdup("");
+	char *out = (char *)malloc(best_vl + 1u);
+	if (!out) return NULL;
+	if (best_vl > 0) memcpy(out, best_vs, best_vl);
+	out[best_vl] = '\0';
+	return out;
 }
 
 static void style_set_decl(dom_node_t *n, const char *prop_kebab, const char *val) {
@@ -1275,11 +1330,16 @@ static int el_host_get(ipo_js_vm_t *vm, ipo_js_obj_t *obj, const char *key, ipo_
 	}
 	if (strcmp(key, "tagName") == 0 || strcmp(key, "nodeName") == 0) {
 		if (n->kind == DOM_ELEMENT && n->tag) {
-			char up[64];
-			size_t i = 0;
-			for (; n->tag[i] && i + 1 < sizeof(up); i++) up[i] = (char)toupper((unsigned char)n->tag[i]);
-			up[i] = '\0';
-			*out = ipo_js_str_cstr(vm, up);
+			size_t tl = strlen(n->tag);
+			char *up = (char *)malloc(tl + 1u);
+			if (up) {
+				for (size_t i = 0; i < tl; i++) up[i] = (char)toupper((unsigned char)n->tag[i]);
+				up[tl] = '\0';
+				*out = ipo_js_str_cstr(vm, up);
+				free(up);
+			} else {
+				*out = ipo_js_str_cstr(vm, n->tag);
+			}
 		} else {
 			*out = ipo_js_str_cstr(vm, n->kind == DOM_TEXT ? "#text" : "#comment");
 		}
@@ -1538,10 +1598,11 @@ static int style_host_get(ipo_js_vm_t *vm, ipo_js_obj_t *obj, const char *key, i
 	}
 	if (strcmp(key, "setProperty") == 0 || strcmp(key, "getPropertyValue") == 0 || strcmp(key, "removeProperty") == 0)
 		return 0;
-	char keb[96], val[256];
-	camel_to_kebab(key, keb, sizeof(keb));
-	style_get_decl(dom_get_attr(n, "style"), keb, val, sizeof(val));
-	*out = ipo_js_str_cstr(vm, val);
+	char *keb = camel_to_kebab_alloc(key);
+	char *val = keb ? style_get_decl_alloc(dom_get_attr(n, "style"), keb) : NULL;
+	*out = ipo_js_str_cstr(vm, val ? val : "");
+	free(keb);
+	free(val);
 	return 1;
 }
 
@@ -1556,9 +1617,11 @@ static int style_host_set(ipo_js_vm_t *vm, ipo_js_obj_t *obj, const char *key, i
 		rt->dom_dirty = 1;
 		return 1;
 	}
-	char keb[96];
-	camel_to_kebab(key, keb, sizeof(keb));
-	style_set_decl(n, keb, (val.type == JS_T_NULL || val.type == JS_T_UNDEFINED) ? "" : ipo_js_cstr(vm, val, NULL));
+	char *keb = camel_to_kebab_alloc(key);
+	if (keb) {
+		style_set_decl(n, keb, (val.type == JS_T_NULL || val.type == JS_T_UNDEFINED) ? "" : ipo_js_cstr(vm, val, NULL));
+		free(keb);
+	}
 	rt->dom_dirty = 1;
 	return 1;
 }
@@ -1570,9 +1633,10 @@ static ipo_js_val_t js_style_method(ipo_js_vm_t *vm, ipo_js_val_t tv, int argc, 
 	dom_node_t *n = (dom_node_t *)tv.u.obj->host_ptr;
 	const char *prop = (argc >= 1) ? ipo_js_cstr(vm, argv[0], NULL) : "";
 	if (mode == 0) {
-		char val[256];
-		style_get_decl(dom_get_attr(n, "style"), prop, val, sizeof(val));
-		return ipo_js_str_cstr(vm, val);
+		char *val = style_get_decl_alloc(dom_get_attr(n, "style"), prop);
+		ipo_js_val_t res = ipo_js_str_cstr(vm, val ? val : "");
+		free(val);
+		return res;
 	}
 	if (mode == 1) {
 		const char *v = (argc >= 2) ? ipo_js_cstr(vm, argv[1], NULL) : "";
@@ -1683,10 +1747,16 @@ static ipo_js_obj_t *wrap_classlist(ipo_js_runtime_t *rt, dom_node_t *n) {
 static int dataset_host_get(ipo_js_vm_t *vm, ipo_js_obj_t *obj, const char *key, ipo_js_val_t *out) {
 	dom_node_t *n = (dom_node_t *)obj->host_ptr;
 	if (!n) return 0;
-	char keb[96], full[112];
-	camel_to_kebab(key, keb, sizeof(keb));
-	snprintf(full, sizeof(full), "data-%s", keb);
+	char *keb = camel_to_kebab_alloc(key);
+	if (!keb) return 0;
+	size_t klen = strlen(keb);
+	char *full = (char *)malloc(5u + klen + 1u);
+	if (!full) { free(keb); return 0; }
+	memcpy(full, "data-", 5u);
+	memcpy(full + 5u, keb, klen + 1u);
+	free(keb);
 	const char *v = dom_get_attr(n, full);
+	free(full);
 	if (!v) return 0;
 	*out = ipo_js_str_cstr(vm, v);
 	return 1;
@@ -1696,10 +1766,17 @@ static int dataset_host_set(ipo_js_vm_t *vm, ipo_js_obj_t *obj, const char *key,
 	ipo_js_runtime_t *rt = (ipo_js_runtime_t *)ipo_js_vm_host_ctx(vm);
 	dom_node_t *n = (dom_node_t *)obj->host_ptr;
 	if (!n) return 0;
-	char keb[96], full[112];
-	camel_to_kebab(key, keb, sizeof(keb));
-	snprintf(full, sizeof(full), "data-%s", keb);
-	dom_set_attr(n, full, ipo_js_cstr(vm, val, NULL));
+	char *keb = camel_to_kebab_alloc(key);
+	if (!keb) return 0;
+	size_t klen = strlen(keb);
+	char *full = (char *)malloc(5u + klen + 1u);
+	if (full) {
+		memcpy(full, "data-", 5u);
+		memcpy(full + 5u, keb, klen + 1u);
+		dom_set_attr(n, full, ipo_js_cstr(vm, val, NULL));
+		free(full);
+	}
+	free(keb);
 	rt->dom_dirty = 1;
 	return 1;
 }
@@ -2174,14 +2251,15 @@ static ipo_js_val_t js_win_dialog(ipo_js_vm_t *vm, ipo_js_val_t tv, int argc, co
 	int kind = (int)(intptr_t)ud;
 	const char *msg = (argc >= 1) ? ipo_js_cstr(vm, argv[0], NULL) : "";
 	const char *def = (kind == 2 && argc >= 2) ? ipo_js_cstr(vm, argv[1], NULL) : "";
-	char out[512];
-	out[0] = '\0';
+	char *out = NULL;
 	int ok = ipo_gui_run_js_dialog(kind,
 	                               kind == 0 ? "Alert" : (kind == 1 ? "Confirm" : "Prompt"),
-	                               msg, def, out, sizeof(out));
-	if (kind == 0) return ipo_js_undef();
-	if (kind == 1) return ipo_js_bool(ok);
-	return ok ? ipo_js_str_cstr(vm, out) : ipo_js_null();
+	                               msg, def, kind == 2 ? &out : NULL);
+	if (kind == 0) { free(out); return ipo_js_undef(); }
+	if (kind == 1) { free(out); return ipo_js_bool(ok); }
+	ipo_js_val_t r = ok ? ipo_js_str_cstr(vm, out ? out : "") : ipo_js_null();
+	free(out);
+	return r;
 }
 
 /* Timers: setTimeout / setInterval / clearTimeout / clearInterval */
@@ -2392,11 +2470,12 @@ static int sync_http_get(const char *abs_url, const char *method, const char *ct
 	if (yt_http_stream_open(&st, method ? method : "GET", abs_url, ctype, body, blen,
 	                        "Mozilla/5.0 (IPO_OS; Links)", false, 0) < 0) {
 		*out_status = 0;
+		yt_http_stream_close(&st);
 		return -1;
 	}
 	uint8_t buf[8192];
 	bool eof = false;
-	for (int iter = 0; iter < 4000 && !eof && out_body->len < 2 * 1024 * 1024; iter++) {
+	while (!eof) {
 		int r = yt_http_stream_read(&st, buf, sizeof(buf), &eof);
 		if (r > 0) db_add(out_body, (const char *)buf, (size_t)r);
 		else if (r < 0) break;
@@ -2562,6 +2641,23 @@ static ipo_js_val_t js_usp_op(ipo_js_vm_t *vm, ipo_js_val_t tv, int argc, const 
 	return r;
 }
 
+static char *usp_decode(const char *s, size_t n) {
+	char *d = (char *)malloc(n + 1);
+	size_t j = 0;
+	for (size_t i = 0; i < n; i++) {
+		if (s[i] == '+') d[j++] = ' ';
+		else if (s[i] == '%' && i + 2 < n && isxdigit((unsigned char)s[i + 1]) && isxdigit((unsigned char)s[i + 2])) {
+			char hx[3] = { s[i + 1], s[i + 2], '\0' };
+			d[j++] = (char)strtol(hx, NULL, 16);
+			i += 2;
+		} else {
+			d[j++] = s[i];
+		}
+	}
+	d[j] = '\0';
+	return d;
+}
+
 static ipo_js_val_t js_usp_ctor(ipo_js_vm_t *vm, ipo_js_val_t tv, int argc, const ipo_js_val_t *argv, void *ud) {
 	(void)ud;
 	ipo_js_obj_t *o = (tv.type == JS_T_OBJECT && tv.u.obj) ? tv.u.obj : ipo_js_new_object(vm, NULL);
@@ -2574,12 +2670,8 @@ static ipo_js_val_t js_usp_ctor(ipo_js_vm_t *vm, ipo_js_val_t tv, int argc, cons
 			size_t pl = amp ? (size_t)(amp - s) : strlen(s);
 			const char *eq = (const char *)memchr(s, '=', pl);
 			if (eq) {
-				char *k = xdupn_lower(s, (size_t)(eq - s));
-				/* keep original key case */
-				memcpy(k, s, (size_t)(eq - s));
-				char *v = (char *)malloc(pl - (size_t)(eq + 1 - s) + 1);
-				memcpy(v, eq + 1, pl - (size_t)(eq + 1 - s));
-				v[pl - (size_t)(eq + 1 - s)] = '\0';
+				char *k = usp_decode(s, (size_t)(eq - s));
+				char *v = usp_decode(eq + 1, pl - (size_t)(eq + 1 - s));
 				ipo_js_set_prop(vm, m, k, ipo_js_str_cstr(vm, v));
 				free(k); free(v);
 			}
@@ -2592,6 +2684,276 @@ static ipo_js_val_t js_usp_ctor(ipo_js_vm_t *vm, ipo_js_val_t tv, int argc, cons
 	ipo_js_set_prop(vm, o, "set", ipo_js_obj_val(ipo_js_new_native_fn(vm, "set", js_usp_op, (void *)1, 0)));
 	ipo_js_set_prop(vm, o, "has", ipo_js_obj_val(ipo_js_new_native_fn(vm, "has", js_usp_op, (void *)2, 0)));
 	ipo_js_set_prop(vm, o, "toString", ipo_js_obj_val(ipo_js_new_native_fn(vm, "toString", js_usp_op, (void *)3, 0)));
+	return ipo_js_obj_val(o);
+}
+
+/* URL */
+static ipo_js_val_t js_url_to_string(ipo_js_vm_t *vm, ipo_js_val_t tv, int argc, const ipo_js_val_t *argv, void *ud) {
+	(void)argc; (void)argv; (void)ud;
+	if (tv.type != JS_T_OBJECT || !tv.u.obj) return ipo_js_str_cstr(vm, "");
+	ipo_js_val_t hv = ipo_js_undef();
+	return ipo_js_get_prop(vm, tv.u.obj, "href", &hv) ? hv : ipo_js_str_cstr(vm, "");
+}
+
+static char *js_xdupn(const char *s, size_t n) {
+	if (!s || n == SIZE_MAX) return NULL;
+	char *p = (char *)malloc(n + 1u);
+	if (!p) return NULL;
+	if (n > 0) memcpy(p, s, n);
+	p[n] = '\0';
+	return p;
+}
+
+static ipo_js_val_t js_url_ctor(ipo_js_vm_t *vm, ipo_js_val_t tv, int argc, const ipo_js_val_t *argv, void *ud) {
+	(void)ud;
+	ipo_js_obj_t *o = (tv.type == JS_T_OBJECT && tv.u.obj) ? tv.u.obj : ipo_js_new_object(vm, NULL);
+	const char *raw = (argc >= 1) ? ipo_js_cstr(vm, argv[0], NULL) : "";
+	const char *base = (argc >= 2 && argv[1].type != JS_T_UNDEFINED) ? ipo_js_cstr(vm, argv[1], NULL) : NULL;
+	dbuf_t b_full; db_init(&b_full);
+	if (strstr(raw, "://")) {
+		db_adds(&b_full, raw);
+	} else if (base && strstr(base, "://")) {
+		const char *scheme_end = strstr(base, "://");
+		const char *host_start = scheme_end + 3;
+		const char *path_start = strchr(host_start, '/');
+		size_t origin_len = path_start ? (size_t)(path_start - base) : strlen(base);
+		db_add(&b_full, base, origin_len);
+		if (raw[0] != '/') db_addc(&b_full, '/');
+		db_adds(&b_full, raw);
+	} else {
+		db_adds(&b_full, raw);
+	}
+	const char *full = b_full.data ? b_full.data : "";
+	char *proto = js_xdupn("https:", 6);
+	char *host = js_xdupn("", 0);
+	char *hostname = js_xdupn("", 0);
+	char *port = js_xdupn("", 0);
+	char *pathname = js_xdupn("/", 1);
+	char *search = js_xdupn("", 0);
+	char *hash = js_xdupn("", 0);
+
+	const char *p = full;
+	const char *sc = strstr(p, "://");
+	if (sc) {
+		size_t slen = (size_t)(sc - p);
+		if (slen < SIZE_MAX - 2u) {
+			char *np = (char *)malloc(slen + 2u);
+			if (np) {
+				if (slen > 0) memcpy(np, p, slen);
+				np[slen] = ':';
+				np[slen + 1] = '\0';
+				free(proto);
+				proto = np;
+			}
+		}
+		p = sc + 3;
+		const char *p_end = p;
+		while (*p_end && *p_end != '/' && *p_end != '?' && *p_end != '#') p_end++;
+		size_t hlen = (size_t)(p_end - p);
+		free(host);
+		host = js_xdupn(p, hlen);
+		if (host) {
+			const char *col = strchr(host, ':');
+			if (col) {
+				free(hostname);
+				hostname = js_xdupn(host, (size_t)(col - host));
+				free(port);
+				port = js_xdupn(col + 1, strlen(col + 1));
+			} else {
+				free(hostname);
+				hostname = js_xdupn(host, strlen(host));
+			}
+		}
+		p = p_end;
+	}
+	const char *q = strchr(p, '?');
+	const char *h = strchr(p, '#');
+	const char *path_end = q ? q : (h ? h : p + strlen(p));
+	if (path_end > p) {
+		free(pathname);
+		pathname = js_xdupn(p, (size_t)(path_end - p));
+	}
+	if (q && (!h || q < h)) {
+		const char *send = h ? h : q + strlen(q);
+		free(search);
+		search = js_xdupn(q, (size_t)(send - q));
+	}
+	if (h) {
+		free(hash);
+		hash = js_xdupn(h, strlen(h));
+	}
+	dbuf_t b_origin; db_init(&b_origin);
+	db_adds(&b_origin, proto ? proto : "");
+	db_adds(&b_origin, "//");
+	db_adds(&b_origin, host ? host : "");
+
+	ipo_js_set_prop(vm, o, "href",     ipo_js_str_cstr(vm, full));
+	ipo_js_set_prop(vm, o, "origin",   ipo_js_str_cstr(vm, b_origin.data ? b_origin.data : ""));
+	ipo_js_set_prop(vm, o, "protocol", ipo_js_str_cstr(vm, proto ? proto : ""));
+	ipo_js_set_prop(vm, o, "host",     ipo_js_str_cstr(vm, host ? host : ""));
+	ipo_js_set_prop(vm, o, "hostname", ipo_js_str_cstr(vm, hostname ? hostname : ""));
+	ipo_js_set_prop(vm, o, "port",     ipo_js_str_cstr(vm, port ? port : ""));
+	ipo_js_set_prop(vm, o, "pathname", ipo_js_str_cstr(vm, pathname ? pathname : "/"));
+	ipo_js_set_prop(vm, o, "search",   ipo_js_str_cstr(vm, search ? search : ""));
+	ipo_js_set_prop(vm, o, "hash",     ipo_js_str_cstr(vm, hash ? hash : ""));
+	ipo_js_val_t sp_arg = ipo_js_str_cstr(vm, search ? search : "");
+	ipo_js_set_prop(vm, o, "searchParams", js_usp_ctor(vm, ipo_js_undef(), 1, &sp_arg, NULL));
+	ipo_js_set_prop(vm, o, "toString", ipo_js_obj_val(ipo_js_new_native_fn(vm, "toString", js_url_to_string, NULL, 0)));
+
+	db_free(&b_origin);
+	db_free(&b_full);
+	free(proto); free(host); free(hostname); free(port);
+	free(pathname); free(search); free(hash);
+	return ipo_js_obj_val(o);
+}
+
+/* Observers (MutationObserver / ResizeObserver / IntersectionObserver) */
+static ipo_js_val_t js_obs_noop(ipo_js_vm_t *vm, ipo_js_val_t tv, int argc, const ipo_js_val_t *argv, void *ud) {
+	(void)vm; (void)tv; (void)argc; (void)argv; (void)ud;
+	return ipo_js_undef();
+}
+
+static ipo_js_val_t js_obs_take(ipo_js_vm_t *vm, ipo_js_val_t tv, int argc, const ipo_js_val_t *argv, void *ud) {
+	(void)tv; (void)argc; (void)argv; (void)ud;
+	return ipo_js_obj_val(ipo_js_new_array(vm, 0));
+}
+
+static ipo_js_val_t js_obs_ctor(ipo_js_vm_t *vm, ipo_js_val_t tv, int argc, const ipo_js_val_t *argv, void *ud) {
+	(void)argc; (void)argv; (void)ud;
+	ipo_js_obj_t *o = (tv.type == JS_T_OBJECT && tv.u.obj) ? tv.u.obj : ipo_js_new_object(vm, NULL);
+	ipo_js_set_prop(vm, o, "observe",     ipo_js_obj_val(ipo_js_new_native_fn(vm, "observe",     js_obs_noop, NULL, 0)));
+	ipo_js_set_prop(vm, o, "unobserve",   ipo_js_obj_val(ipo_js_new_native_fn(vm, "unobserve",   js_obs_noop, NULL, 0)));
+	ipo_js_set_prop(vm, o, "disconnect",  ipo_js_obj_val(ipo_js_new_native_fn(vm, "disconnect",  js_obs_noop, NULL, 0)));
+	ipo_js_set_prop(vm, o, "takeRecords", ipo_js_obj_val(ipo_js_new_native_fn(vm, "takeRecords", js_obs_take, NULL, 0)));
+	return ipo_js_obj_val(o);
+}
+
+static ipo_js_val_t js_match_media(ipo_js_vm_t *vm, ipo_js_val_t tv, int argc, const ipo_js_val_t *argv, void *ud) {
+	(void)tv; (void)ud;
+	const char *q = (argc >= 1) ? ipo_js_cstr(vm, argv[0], NULL) : "";
+	ipo_js_obj_t *o = ipo_js_new_object(vm, NULL);
+	int matches = (strstr(q, "min-width: 1200") || strstr(q, "prefers-color-scheme: dark")) ? 0 : 1;
+	ipo_js_set_prop(vm, o, "matches",             ipo_js_bool(matches));
+	ipo_js_set_prop(vm, o, "media",               ipo_js_str_cstr(vm, q));
+	ipo_js_set_prop(vm, o, "onchange",            ipo_js_null());
+	ipo_js_set_prop(vm, o, "addListener",         ipo_js_obj_val(ipo_js_new_native_fn(vm, "addListener", js_obs_noop, NULL, 0)));
+	ipo_js_set_prop(vm, o, "removeListener",      ipo_js_obj_val(ipo_js_new_native_fn(vm, "removeListener", js_obs_noop, NULL, 0)));
+	ipo_js_set_prop(vm, o, "addEventListener",    ipo_js_obj_val(ipo_js_new_native_fn(vm, "addEventListener", js_obs_noop, NULL, 0)));
+	ipo_js_set_prop(vm, o, "removeEventListener", ipo_js_obj_val(ipo_js_new_native_fn(vm, "removeEventListener", js_obs_noop, NULL, 0)));
+	return ipo_js_obj_val(o);
+}
+
+static ipo_js_val_t js_get_comp_prop(ipo_js_vm_t *vm, ipo_js_val_t tv, int argc, const ipo_js_val_t *argv, void *ud) {
+	(void)ud;
+	if (argc < 1 || tv.type != JS_T_OBJECT || !tv.u.obj) return ipo_js_str_cstr(vm, "");
+	ipo_js_val_t v = ipo_js_undef();
+	return ipo_js_get_prop(vm, tv.u.obj, ipo_js_cstr(vm, argv[0], NULL), &v) ? v : ipo_js_str_cstr(vm, "");
+}
+
+static ipo_js_val_t js_get_computed_style(ipo_js_vm_t *vm, ipo_js_val_t tv, int argc, const ipo_js_val_t *argv, void *ud) {
+	(void)tv; (void)ud;
+	ipo_js_obj_t *s = ipo_js_new_object(vm, NULL);
+	ipo_js_set_prop(vm, s, "display",         ipo_js_str_cstr(vm, "block"));
+	ipo_js_set_prop(vm, s, "visibility",      ipo_js_str_cstr(vm, "visible"));
+	ipo_js_set_prop(vm, s, "opacity",         ipo_js_str_cstr(vm, "1"));
+	ipo_js_set_prop(vm, s, "position",        ipo_js_str_cstr(vm, "static"));
+	ipo_js_set_prop(vm, s, "fontSize",        ipo_js_str_cstr(vm, "16px"));
+	ipo_js_set_prop(vm, s, "getPropertyValue",ipo_js_obj_val(ipo_js_new_native_fn(vm, "getPropertyValue", js_get_comp_prop, NULL, 0)));
+	if (argc >= 1 && argv[0].type == JS_T_OBJECT && argv[0].u.obj) {
+		ipo_js_val_t st = ipo_js_undef();
+		if (ipo_js_get_prop(vm, argv[0].u.obj, "style", &st) && st.type == JS_T_OBJECT && st.u.obj) {
+			for (size_t i = 0; i < st.u.obj->prop_len; i++) {
+				ipo_js_set_prop(vm, s, st.u.obj->props[i].key->data, st.u.obj->props[i].val);
+			}
+		}
+	}
+	return ipo_js_obj_val(s);
+}
+
+static ipo_js_val_t js_queue_microtask_fn(ipo_js_vm_t *vm, ipo_js_val_t tv, int argc, const ipo_js_val_t *argv, void *ud) {
+	(void)tv; (void)ud;
+	if (argc >= 1 && ipo_js_is_callable(argv[0])) ipo_js_vm_queue_microtask(vm, argv[0]);
+	return ipo_js_undef();
+}
+
+static ipo_js_val_t js_structured_clone(ipo_js_vm_t *vm, ipo_js_val_t tv, int argc, const ipo_js_val_t *argv, void *ud) {
+	(void)tv; (void)ud;
+	if (argc < 1) return ipo_js_undef();
+	if (argv[0].type != JS_T_OBJECT) return argv[0];
+	ipo_js_str_t *js = ipo_js_json_stringify(vm, argv[0], 0);
+	if (!js) return argv[0];
+	ipo_js_val_t out = ipo_js_undef();
+	if (ipo_js_json_parse(vm, js->data, js->len, &out) == 0) return out;
+	return argv[0];
+}
+
+static ipo_js_val_t js_crypto_rand_vals(ipo_js_vm_t *vm, ipo_js_val_t tv, int argc, const ipo_js_val_t *argv, void *ud) {
+	(void)tv; (void)ud;
+	if (argc < 1 || argv[0].type != JS_T_OBJECT || !argv[0].u.obj) return ipo_js_undef();
+	ipo_js_val_t lv = ipo_js_undef();
+	if (ipo_js_get_prop(vm, argv[0].u.obj, "length", &lv) && lv.type == JS_T_NUMBER) {
+		size_t n = (size_t)lv.u.num;
+		static uint32_t rng = 0x5A17C0DEu;
+		for (size_t i = 0; i < n; i++) {
+			rng = rng * 1664525u + 1013904223u;
+			char nb[24]; snprintf(nb, sizeof(nb), "%lu", (unsigned long)i);
+			ipo_js_set_prop(vm, argv[0].u.obj, nb, ipo_js_num((double)(rng & 0xFF)));
+		}
+	}
+	return argv[0];
+}
+
+static ipo_js_val_t js_crypto_uuid(ipo_js_vm_t *vm, ipo_js_val_t tv, int argc, const ipo_js_val_t *argv, void *ud) {
+	(void)tv; (void)argc; (void)argv; (void)ud;
+	static uint32_t s = 0x13572468u;
+	uint8_t b[16];
+	for (int i = 0; i < 16; i++) { s = s * 1664525u + 1013904223u; b[i] = (uint8_t)(s >> 24); }
+	b[6] = (b[6] & 0x0F) | 0x40;
+	b[8] = (b[8] & 0x3F) | 0x80;
+	char buf[40];
+	snprintf(buf, sizeof(buf), "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+	         b[0],b[1],b[2],b[3],b[4],b[5],b[6],b[7],b[8],b[9],b[10],b[11],b[12],b[13],b[14],b[15]);
+	return ipo_js_str_cstr(vm, buf);
+}
+
+static ipo_js_val_t js_event_ctor(ipo_js_vm_t *vm, ipo_js_val_t tv, int argc, const ipo_js_val_t *argv, void *ud) {
+	(void)ud;
+	ipo_js_obj_t *o = (tv.type == JS_T_OBJECT && tv.u.obj) ? tv.u.obj : ipo_js_new_object(vm, NULL);
+	const char *tp = (argc >= 1) ? ipo_js_cstr(vm, argv[0], NULL) : "";
+	ipo_js_set_prop(vm, o, "type", ipo_js_str_cstr(vm, tp));
+	ipo_js_set_prop(vm, o, "defaultPrevented", ipo_js_bool(0));
+	ipo_js_set_prop(vm, o, "preventDefault", ipo_js_obj_val(ipo_js_new_native_fn(vm, "preventDefault", js_obs_noop, NULL, 0)));
+	ipo_js_set_prop(vm, o, "stopPropagation", ipo_js_obj_val(ipo_js_new_native_fn(vm, "stopPropagation", js_obs_noop, NULL, 0)));
+	if (argc >= 2 && argv[1].type == JS_T_OBJECT && argv[1].u.obj) {
+		ipo_js_val_t d = ipo_js_undef();
+		if (ipo_js_get_prop(vm, argv[1].u.obj, "detail", &d)) ipo_js_set_prop(vm, o, "detail", d);
+	}
+	return ipo_js_obj_val(o);
+}
+
+static ipo_js_val_t js_abort_ctor(ipo_js_vm_t *vm, ipo_js_val_t tv, int argc, const ipo_js_val_t *argv, void *ud) {
+	(void)argc; (void)argv; (void)ud;
+	ipo_js_obj_t *o = (tv.type == JS_T_OBJECT && tv.u.obj) ? tv.u.obj : ipo_js_new_object(vm, NULL);
+	ipo_js_obj_t *sig = ipo_js_new_object(vm, NULL);
+	ipo_js_set_prop(vm, sig, "aborted", ipo_js_bool(0));
+	ipo_js_set_prop(vm, sig, "addEventListener", ipo_js_obj_val(ipo_js_new_native_fn(vm, "addEventListener", js_obs_noop, NULL, 0)));
+	ipo_js_set_prop(vm, sig, "removeEventListener", ipo_js_obj_val(ipo_js_new_native_fn(vm, "removeEventListener", js_obs_noop, NULL, 0)));
+	ipo_js_set_prop(vm, o, "signal", ipo_js_obj_val(sig));
+	ipo_js_set_prop(vm, o, "abort", ipo_js_obj_val(ipo_js_new_native_fn(vm, "abort", js_obs_noop, NULL, 0)));
+	return ipo_js_obj_val(o);
+}
+
+static ipo_js_val_t js_image_ctor(ipo_js_vm_t *vm, ipo_js_val_t tv, int argc, const ipo_js_val_t *argv, void *ud) {
+	(void)ud;
+	ipo_js_obj_t *o = (tv.type == JS_T_OBJECT && tv.u.obj) ? tv.u.obj : ipo_js_new_object(vm, NULL);
+	int w = (argc >= 1) ? ipo_js_to_i32(vm, argv[0]) : 0;
+	int h = (argc >= 2) ? ipo_js_to_i32(vm, argv[1]) : 0;
+	ipo_js_set_prop(vm, o, "tagName", ipo_js_str_cstr(vm, "IMG"));
+	ipo_js_set_prop(vm, o, "width",   ipo_js_num((double)w));
+	ipo_js_set_prop(vm, o, "height",  ipo_js_num((double)h));
+	ipo_js_set_prop(vm, o, "complete",ipo_js_bool(1));
+	ipo_js_set_prop(vm, o, "src",     ipo_js_str_cstr(vm, ""));
+	ipo_js_set_prop(vm, o, "addEventListener", ipo_js_obj_val(ipo_js_new_native_fn(vm, "addEventListener", js_obs_noop, NULL, 0)));
 	return ipo_js_obj_val(o);
 }
 
@@ -2788,7 +3150,29 @@ static void setup_browser_globals(ipo_js_runtime_t *rt) {
 	ipo_js_set_prop(vm, g, "fetch",                 ipo_js_obj_val(ipo_js_new_native_fn(vm, "fetch",                 js_fetch,           NULL, 0)));
 	ipo_js_set_prop(vm, g, "XMLHttpRequest",        ipo_js_obj_val(ipo_js_new_native_fn(vm, "XMLHttpRequest",        js_xhr_ctor,        NULL, 1)));
 	ipo_js_set_prop(vm, g, "URLSearchParams",       ipo_js_obj_val(ipo_js_new_native_fn(vm, "URLSearchParams",       js_usp_ctor,        NULL, 1)));
+	ipo_js_set_prop(vm, g, "URL",                   ipo_js_obj_val(ipo_js_new_native_fn(vm, "URL",                   js_url_ctor,        NULL, 1)));
+	ipo_js_set_prop(vm, g, "MutationObserver",      ipo_js_obj_val(ipo_js_new_native_fn(vm, "MutationObserver",      js_obs_ctor,        NULL, 1)));
+	ipo_js_set_prop(vm, g, "ResizeObserver",        ipo_js_obj_val(ipo_js_new_native_fn(vm, "ResizeObserver",        js_obs_ctor,        NULL, 1)));
+	ipo_js_set_prop(vm, g, "IntersectionObserver",  ipo_js_obj_val(ipo_js_new_native_fn(vm, "IntersectionObserver",  js_obs_ctor,        NULL, 1)));
+	ipo_js_set_prop(vm, g, "matchMedia",            ipo_js_obj_val(ipo_js_new_native_fn(vm, "matchMedia",            js_match_media,     NULL, 0)));
+	ipo_js_set_prop(vm, g, "getComputedStyle",      ipo_js_obj_val(ipo_js_new_native_fn(vm, "getComputedStyle",      js_get_computed_style, NULL, 0)));
+	ipo_js_set_prop(vm, g, "queueMicrotask",        ipo_js_obj_val(ipo_js_new_native_fn(vm, "queueMicrotask",        js_queue_microtask_fn, NULL, 0)));
+	ipo_js_set_prop(vm, g, "structuredClone",       ipo_js_obj_val(ipo_js_new_native_fn(vm, "structuredClone",       js_structured_clone, NULL, 0)));
+	ipo_js_set_prop(vm, g, "requestIdleCallback",   ipo_js_obj_val(ipo_js_new_native_fn(vm, "requestIdleCallback",   js_set_timer,       (void *)2, 0)));
+	ipo_js_set_prop(vm, g, "cancelIdleCallback",    ipo_js_obj_val(ipo_js_new_native_fn(vm, "cancelIdleCallback",    js_clear_timer,     NULL, 0)));
+	ipo_js_set_prop(vm, g, "Event",                 ipo_js_obj_val(ipo_js_new_native_fn(vm, "Event",                 js_event_ctor,      NULL, 1)));
+	ipo_js_set_prop(vm, g, "CustomEvent",           ipo_js_obj_val(ipo_js_new_native_fn(vm, "CustomEvent",           js_event_ctor,      NULL, 1)));
+	ipo_js_set_prop(vm, g, "AbortController",       ipo_js_obj_val(ipo_js_new_native_fn(vm, "AbortController",       js_abort_ctor,      NULL, 1)));
+	ipo_js_set_prop(vm, g, "Image",                 ipo_js_obj_val(ipo_js_new_native_fn(vm, "Image",                 js_image_ctor,      NULL, 1)));
+	ipo_js_set_prop(vm, g, "HTMLImageElement",      ipo_js_obj_val(ipo_js_new_native_fn(vm, "HTMLImageElement",      js_image_ctor,      NULL, 1)));
+	{
+		ipo_js_obj_t *cr = ipo_js_new_object(vm, NULL);
+		ipo_js_set_prop(vm, cr, "getRandomValues", ipo_js_obj_val(ipo_js_new_native_fn(vm, "getRandomValues", js_crypto_rand_vals, NULL, 0)));
+		ipo_js_set_prop(vm, cr, "randomUUID",      ipo_js_obj_val(ipo_js_new_native_fn(vm, "randomUUID",      js_crypto_uuid,      NULL, 0)));
+		ipo_js_set_prop(vm, g, "crypto", ipo_js_obj_val(cr));
+	}
 	ipo_js_set_prop(vm, g, "addEventListener",      ipo_js_obj_val(ipo_js_new_native_fn(vm, "addEventListener",      js_el_add_listener, NULL, 0)));
+	ipo_js_set_prop(vm, g, "removeEventListener",   ipo_js_obj_val(ipo_js_new_native_fn(vm, "removeEventListener",   js_obs_noop,        NULL, 0)));
 	ipo_js_set_prop(vm, g, "__ipoDispatch",         ipo_js_obj_val(ipo_js_new_native_fn(vm, "__ipoDispatch",         js_ipo_dispatch,    NULL, 0)));
 }
 

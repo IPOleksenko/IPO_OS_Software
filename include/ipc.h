@@ -8,15 +8,16 @@
 #include <stdint.h>
 #include <syscall.h>
 
-#define IPO_IPC_NAME_MAX 31u
-
 #define IPO_IPC_RIGHT_SEND    0x01u
 #define IPO_IPC_RIGHT_RECEIVE 0x02u
 #define IPO_IPC_PIPE_RIGHT_WRITE IPO_IPC_RIGHT_SEND
 #define IPO_IPC_PIPE_RIGHT_READ  IPO_IPC_RIGHT_RECEIVE
 
 #define IPO_IPC_NONBLOCK 0x01u
-#define IPO_IPC_PIPE_CAPACITY 4096u
+
+#define IPO_IPC_POLL_IN  0x01u
+#define IPO_IPC_POLL_OUT 0x02u
+#define IPO_IPC_POLL_HUP 0x04u
 
 #define IPO_IPC_EVENT_PROCESS_EXIT      1u
 #define IPO_IPC_EVENT_ENDPOINT_CLOSED   2u
@@ -24,7 +25,6 @@
 
 #define IPO_SHM_RIGHT_READ  0x01u
 #define IPO_SHM_RIGHT_WRITE 0x02u
-#define IPO_SHM_SIZE_MAX    (256u * 1024u)
 
 #define IPO_IPC_OK                0
 #define IPO_IPC_ERR_INVALID      -1
@@ -122,6 +122,11 @@ static inline int ipo_ipc_pipe_close(int pipe_handle, uint32_t rights) {
 static inline int ipo_ipc_pipe_destroy(int pipe_handle) {
     uint32_t args[1] = {(uint32_t)pipe_handle};
     return ipo_syscall(IPO_SYSCALL_IPC_PIPE_DESTROY, 1u, args);
+}
+
+static inline int ipo_ipc_pipe_poll(int pipe_handle) {
+    uint32_t args[1] = {(uint32_t)pipe_handle};
+    return ipo_syscall(IPO_SYSCALL_IPC_PIPE_POLL, 1u, args);
 }
 
 static inline int ipo_ipc_pipe_read(int pipe_handle, void *buffer,

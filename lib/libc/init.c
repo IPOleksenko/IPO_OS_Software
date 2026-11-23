@@ -3,6 +3,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <syscall.h>
+#include "ipo_libc_internal.h"
 
 typedef void (*func_ptr)(void);
 
@@ -50,6 +51,10 @@ void __libc_init_array(void) {
 }
 
 void __libc_fini_array(void) {
+    static volatile uint32_t s_fini_ran = 0u;
+    if (__atomic_exchange_n(&s_fini_ran, 1u, __ATOMIC_ACQ_REL) != 0u) {
+        return;
+    }
     size_t count;
     size_t i;
 
@@ -78,12 +83,28 @@ static bool is_func_struct_return(void *func_ptr) {
         int32_t rel = *(const int32_t *)(code + 1);
         code = code + 5 + rel;
     }
-    for (int i = 0; i < 512; i++) {
+    for (int i = 0; i + 2 < 512; i++) {
         if (code[i] == 0xC2 && code[i + 1] == 0x04 && code[i + 2] == 0x00) {
             return true;
         }
         if (code[i] == 0xC3) {
-            if (i + 3 < 512 && code[i + 1] == 0x55 && code[i + 2] == 0x89 && code[i + 3] == 0xE5) {
+            if (i >= 1 && (code[i - 1] == 0x5D || code[i - 1] == 0xC9)) {
+                return false;
+            }
+            if (i >= 3 && code[i - 3] == 0x8D && code[i - 2] == 0x61 && code[i - 1] == 0xFC) {
+                return false;
+            }
+            int j = i + 1;
+            while (j < 512 && (code[j] == 0x90 || code[j] == 0xCC || code[j] == 0x00)) {
+                j++;
+            }
+            if (j + 1 < 512 && code[j] == 0x66 && code[j + 1] == 0x90) {
+                j += 2;
+            }
+            if (j >= 512 ||
+                (j + 2 < 512 && code[j] == 0x55 && code[j + 1] == 0x89 && code[j + 2] == 0xE5) ||
+                (j + 3 < 512 && code[j] == 0x8D && code[j + 1] == 0x4C && code[j + 2] == 0x24 && code[j + 3] == 0x04) ||
+                (j + 1 < 512 && code[j] == 0x0F && code[j + 1] == 0x1F)) {
                 return false;
             }
         }
@@ -92,7 +113,17 @@ static bool is_func_struct_return(void *func_ptr) {
 }
 
 uint64_t __libc_start_main(void *main_func, int argc, char **argv, char **envp) {
-    environ = envp;
+    if (envp && envp[0]) {
+        environ = envp;
+    } else if (!environ || !environ[0]) {
+        static char *const s_default_env[] = {
+            "PATH=/applications",
+            "HOME=/data",
+            "TERM=xterm",
+            NULL
+        };
+        environ = (char **)s_default_env;
+    }
     if (argv && argv[0]) {
         __progname = argv[0];
     }
@@ -116,9 +147,27 @@ uint64_t __libc_start_main(void *main_func, int argc, char **argv, char **envp) 
                 struct_buf[i] = 0xDD;
             }
 
-            typedef void* (*struct_main_fn)(void *ret_buf, int argc, char **argv, char **envp);
-            struct_main_fn s_main = (struct_main_fn)main_func;
-            s_main(struct_buf, argc, argv, envp);
+            uint32_t c_args[5] = {
+                (uint32_t)(uintptr_t)struct_buf,
+                (uint32_t)argc,
+                (uint32_t)(uintptr_t)argv,
+                (uint32_t)(uintptr_t)envp,
+                (uint32_t)(uintptr_t)main_func
+            };
+            uint32_t tmp_a = 0, tmp_d = 0;
+            /* i386 SysV ABI sret callee cleans only the hidden struct pointer (ret $4),
+             * so clean the remaining 12 bytes (argc, argv, envp) instead of 16 bytes. */
+            __asm__ volatile(
+                "pushl 12(%2)\n\t"
+                "pushl 8(%2)\n\t"
+                "pushl 4(%2)\n\t"
+                "pushl (%2)\n\t"
+                "call *16(%2)\n\t"
+                "addl $12, %%esp\n\t"
+                : "=a"(tmp_a), "=d"(tmp_d)
+                : "r"(c_args), "m"(c_args)
+                : "ecx", "memory", "cc"
+            );
 
             ret_eax = (uint32_t)(uintptr_t)struct_buf;
             ret_edx = 0;
@@ -149,8 +198,8 @@ uint64_t __libc_start_main(void *main_func, int argc, char **argv, char **envp) 
         );
     }
 
-    /* Run global destructors (.fini / .fini_array) */
-    __libc_fini_array();
+    /* Run atexit handlers and global destructors (.fini / .fini_array) */
+    ipo_libc_run_atexit_and_fini();
 
     /* Flush stdio */
     fflush(NULL);

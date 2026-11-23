@@ -33,8 +33,11 @@ SECTIONS
 
     .eh_frame : ALIGN(4)
     {
+        PROVIDE_HIDDEN(__eh_frame_start = .);
         KEEP(*(.eh_frame))
         *(.eh_frame.*)
+        LONG(0);
+        PROVIDE_HIDDEN(__eh_frame_end = .);
     } :text
 
     .gcc_except_table : ALIGN(4)

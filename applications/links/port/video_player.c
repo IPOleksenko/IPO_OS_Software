@@ -2,6 +2,7 @@
 #include "youtube_client.h"
 
 #include <stdio.h>
+#include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
@@ -88,19 +89,41 @@ static void put_str(int x, int y, const char *str, uint8_t fg, uint8_t bg) {
     }
 }
 
+static char *vp_fmt_alloc(const char *fmt, ...) {
+    va_list ap, ap2;
+    va_start(ap, fmt);
+    va_copy(ap2, ap);
+    int need = vsnprintf(NULL, 0, fmt, ap2);
+    va_end(ap2);
+    if (need < 0) {
+        va_end(ap);
+        return NULL;
+    }
+    char *buf = (char *)malloc((size_t)need + 1u);
+    if (buf) {
+        vsnprintf(buf, (size_t)need + 1u, fmt, ap);
+    }
+    va_end(ap);
+    return buf;
+}
+
 int links_play_youtube_video(const char *url) {
     /* 1. Extract video title / ID from URL */
-    char video_title[64] = "Rick Astley - Never Gonna Give You Up (Official Music Video)";
-    const char *v_param = strstr(url, "v=");
+    char *video_title = NULL;
+    const char *v_param = url ? strstr(url, "v=") : NULL;
     if (v_param) {
-        char vid[16] = {0};
-        strncpy(vid, v_param + 2, 11);
-        snprintf(video_title, sizeof(video_title), "YouTube Video [%s] - 1080p HD", vid);
-    } else if (strstr(url, "youtu.be/")) {
+        const char *id = v_param + 2;
+        size_t len = 0;
+        while (id[len] && id[len] != '&' && id[len] != '#' && len < 64u) len++;
+        video_title = vp_fmt_alloc("YouTube Video [%.*s] - 1080p HD", (int)len, id);
+    } else if (url && strstr(url, "youtu.be/")) {
         const char *id = strstr(url, "youtu.be/") + 9;
-        char vid[16] = {0};
-        strncpy(vid, id, 11);
-        snprintf(video_title, sizeof(video_title), "YouTube Video [%s] - 1080p HD", vid);
+        size_t len = 0;
+        while (id[len] && id[len] != '?' && id[len] != '#' && id[len] != '/' && len < 64u) len++;
+        video_title = vp_fmt_alloc("YouTube Video [%.*s] - 1080p HD", (int)len, id);
+    }
+    if (!video_title) {
+        video_title = vp_fmt_alloc("Rick Astley - Never Gonna Give You Up (Official Music Video)");
     }
 
     /* 2. Save existing screen */
@@ -108,12 +131,16 @@ int links_play_youtube_video(const char *url) {
     s_scr_h = (int)VGA_HEIGHT;
     volatile uint16_t *vga = VGA_MEMORY;
     size_t scr_cells = (size_t)s_scr_w * (size_t)s_scr_h;
-    if (!vga || s_scr_w <= 0 || s_scr_h <= 0) return -1;
+    if (!vga || s_scr_w <= 0 || s_scr_h <= 0) {
+        free(video_title);
+        return -1;
+    }
     s_back_buf = (uint16_t *)malloc(scr_cells * sizeof(uint16_t));
     uint16_t *saved_screen = (uint16_t *)malloc(scr_cells * sizeof(uint16_t));
     if (!s_back_buf || !saved_screen) {
         free(s_back_buf); s_back_buf = NULL;
         free(saved_screen);
+        free(video_title);
         return -1;
     }
     for (size_t i = 0; i < scr_cells; i++) {
@@ -200,15 +227,14 @@ int links_play_youtube_video(const char *url) {
         /* Row 0: YouTube Header Bar */
         for (int x = 0; x < s_scr_w; x++) put_cell(x, 0, ' ', VGA_COLOR_WHITE, VGA_COLOR_RED);
         put_str(2, 0, "[▶ YouTube]", VGA_COLOR_WHITE, VGA_COLOR_DARK_GREY);
-        char header_title[70];
-        snprintf(header_title, sizeof(header_title), " %s", video_title);
-        put_str(14, 0, header_title, VGA_COLOR_WHITE, VGA_COLOR_RED);
+        if (video_title) {
+            put_str(15, 0, video_title, VGA_COLOR_WHITE, VGA_COLOR_RED);
+        }
 
         /* Row 1: Stream info */
         for (int x = 0; x < s_scr_w; x++) put_cell(x, 1, ' ', VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
-        char meta_info[80];
-        snprintf(meta_info, sizeof(meta_info), "Stream: HTTPS TLS 1.2 • 1080p60 HD • VP9/H.264 • Audio: SB16 Stereo 22.05kHz");
-        put_str(2, 1, meta_info, VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK);
+        put_str(2, 1, "Stream: HTTPS TLS 1.2 • 1080p60 HD • VP9/H.264 • Audio: SB16 Stereo 22.05kHz",
+                VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK);
 
         /* Rows 2..18: Video Display Viewport */
         int vid_x0 = 4, vid_x1 = 75;
@@ -323,10 +349,12 @@ int links_play_youtube_video(const char *url) {
                 VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK);
 
         /* Row 22: Footer Info */
-        char footer[80];
-        snprintf(footer, sizeof(footer), "Links Web Browser v2.22 YouTube Subsystem | Hardware Audio: SB16 DMA | %u FPS",
-                 current_fps);
-        put_str(2, 22, footer, VGA_COLOR_WHITE, VGA_COLOR_DARK_GREY);
+        char *footer = vp_fmt_alloc("Links Web Browser v2.22 YouTube Subsystem | Hardware Audio: SB16 DMA | %u FPS",
+                                    current_fps);
+        if (footer) {
+            put_str(2, 22, footer, VGA_COLOR_WHITE, VGA_COLOR_DARK_GREY);
+            free(footer);
+        }
 
         /* Blit back_buf to physical VGA memory */
         for (size_t i = 0; i < scr_cells; i++) {
@@ -351,6 +379,7 @@ int links_play_youtube_video(const char *url) {
     free(s_back_buf);
     s_back_buf = NULL;
     free(saved_screen);
+    free(video_title);
     return 0;
 }
 
@@ -375,8 +404,10 @@ static const char *ci_strstr(const char *hay, const char *needle) {
     return NULL;
 }
 
-static int parse_download_url(const char *url, char *host, size_t host_sz,
-                              char *path, size_t path_sz, uint16_t *port, bool *is_https) {
+static int parse_download_url_alloc(const char *url, char **out_host, char **out_path,
+                                    uint16_t *port, bool *is_https) {
+    *out_host = NULL;
+    *out_path = NULL;
     if (!url || !*url) return -1;
     const char *p = url;
     *is_https = false;
@@ -393,23 +424,33 @@ static int parse_download_url(const char *url, char *host, size_t host_sz,
     const char *path_start = slash;
     if (!path_start || (qmark && qmark < path_start)) path_start = qmark;
     size_t host_len = path_start ? (size_t)(path_start - p) : strlen(p);
-    if (host_len == 0 || host_len >= host_sz) return -1;
+    if (host_len == 0) return -1;
+    char *host = (char *)malloc(host_len + 1u);
+    if (!host) return -1;
     memcpy(host, p, host_len);
     host[host_len] = '\0';
+
+    char *path = NULL;
     if (path_start && *path_start) {
         if (path_start[0] == '?') {
-            snprintf(path, path_sz, "/%s", path_start);
+            path = vp_fmt_alloc("/%s", path_start);
         } else {
-            snprintf(path, path_sz, "%s", path_start);
+            path = strdup(path_start);
         }
     } else {
-        snprintf(path, path_sz, "/");
+        path = strdup("/");
+    }
+    if (!path) {
+        free(host);
+        return -1;
     }
     char *colon = strchr(host, ':');
     if (colon) {
         *colon = '\0';
         *port = (uint16_t)atoi(colon + 1);
     }
+    *out_host = host;
+    *out_path = path;
     return 0;
 }
 
@@ -480,20 +521,42 @@ int links_download_file(const char *url, const char *outfile) {
     printf("URL    : %s\n", url);
     printf("Target : %s\n\n", dest);
 
-    char cur_url[1024];
-    snprintf(cur_url, sizeof(cur_url), "%s", url);
+    char *cur_url = strdup(url);
+    if (!cur_url) return -1;
 
+    char **seen_urls = NULL;
+    size_t n_seen = 0, cap_seen = 0;
     int status_code = 0;
     ssize_t final_bytes = 0;
 
-    for (int hop = 0; hop < 6; hop++) {
-        char host[192] = {0};
-        char path[768] = {0};
+    for (;;) {
+        bool cycle = false;
+        for (size_t si = 0; si < n_seen; si++) {
+            if (strcmp(seen_urls[si], cur_url) == 0) { cycle = true; break; }
+        }
+        if (cycle) {
+            printf("[Error] Redirect loop detected downloading %s\n", url);
+            break;
+        }
+        if (n_seen >= cap_seen) {
+            size_t nc = cap_seen ? cap_seen * 2u : 8u;
+            char **ns = (char **)realloc(seen_urls, nc * sizeof(char *));
+            if (!ns) break;
+            seen_urls = ns;
+            cap_seen = nc;
+        }
+        seen_urls[n_seen] = strdup(cur_url);
+        if (!seen_urls[n_seen]) break;
+        n_seen++;
+
+        char *host = NULL;
+        char *path = NULL;
         uint16_t port = 80;
         bool is_https = false;
-        if (parse_download_url(cur_url, host, sizeof(host), path, sizeof(path), &port, &is_https) != 0) {
+        if (parse_download_url_alloc(cur_url, &host, &path, &port, &is_https) != 0) {
             printf("[Error] Invalid URL: %s\n", cur_url);
-            return -1;
+            free(host); free(path);
+            break;
         }
 
         printf("[Download] Connecting to %s:%u (%s)...\n", host, port, is_https ? "HTTPS TLS 1.2" : "HTTP");
@@ -501,14 +564,16 @@ int links_download_file(const char *url, const char *outfile) {
         int sock = socket(AF_INET, SOCK_STREAM, 0);
         if (sock < 0) {
             printf("[Error] Failed to create socket\n");
-            return -1;
+            free(host); free(path);
+            break;
         }
 
         struct hostent *he = gethostbyname(host);
         if (!he) {
             printf("[Error] DNS resolution failed for: %s\n", host);
             close(sock);
-            return -1;
+            free(host); free(path);
+            break;
         }
 
         struct sockaddr_in sin;
@@ -520,7 +585,8 @@ int links_download_file(const char *url, const char *outfile) {
         if (connect(sock, (struct sockaddr *)&sin, sizeof(sin)) != 0) {
             printf("[Error] Failed to connect to %s:%u\n", host, port);
             close(sock);
-            return -1;
+            free(host); free(path);
+            break;
         }
 
         SSL_CTX *ssl_ctx = NULL;
@@ -530,7 +596,8 @@ int links_download_file(const char *url, const char *outfile) {
             if (!ssl_ctx) {
                 printf("[Error] Failed to create SSL context\n");
                 close(sock);
-                return -1;
+                free(host); free(path);
+                break;
             }
             ssl = SSL_new(ssl_ctx);
             SSL_set_fd(ssl, sock);
@@ -554,25 +621,25 @@ int links_download_file(const char *url, const char *outfile) {
                 SSL_free(ssl);
                 SSL_CTX_free(ssl_ctx);
                 close(sock);
-                return -1;
+                free(host); free(path);
+                break;
             }
             printf("[Download] TLS 1.2 encrypted handshake successful!\n");
         }
 
         printf("[Download] Connected! Sending GET %s HTTP/1.1...\n", path);
 
-        char req[1280];
-        int req_len = snprintf(req, sizeof(req),
-                 "GET %s HTTP/1.1\r\n"
-                 "Host: %s\r\n"
-                 "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36\r\n"
-                 "Accept: */*\r\n"
-                 "Accept-Encoding: identity\r\n"
-                 "Connection: close\r\n\r\n",
-                 path, host);
-        if (req_len < 0) req_len = 0;
+        char *req = vp_fmt_alloc(
+            "GET %s HTTP/1.1\r\n"
+            "Host: %s\r\n"
+            "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36\r\n"
+            "Accept: */*\r\n"
+            "Accept-Encoding: identity\r\n"
+            "Connection: close\r\n\r\n",
+            path, host);
+        int req_len = req ? (int)strlen(req) : 0;
 
-        if (is_https) {
+        if (req && is_https) {
             int sent = 0;
             uint32_t wr_start = get_time_ms();
             while (sent < req_len) {
@@ -590,25 +657,27 @@ int links_download_file(const char *url, const char *outfile) {
                     break;
                 }
             }
-        } else {
+        } else if (req) {
             send(sock, req, (size_t)req_len, 0);
         }
+        free(req);
 
-        size_t hdr_cap = 32768;
+        size_t hdr_cap = 8192;
         char *hdr_buf = (char *)malloc(hdr_cap);
         unsigned char *buf = (unsigned char *)malloc(8192);
         if (!hdr_buf || !buf) {
-            if (hdr_buf) free(hdr_buf);
-            if (buf) free(buf);
+            free(hdr_buf);
+            free(buf);
             if (is_https) { SSL_free(ssl); SSL_CTX_free(ssl_ctx); }
             close(sock);
-            return -1;
+            free(host); free(path);
+            break;
         }
         size_t hdr_len = 0;
         hdr_buf[0] = '\0';
         bool headers_done = false;
         bool redirect = false;
-        char redirect_url[1024] = {0};
+        char *redirect_url = NULL;
         dl_body_writer_t writer;
         memset(&writer, 0, sizeof(writer));
         writer.out_fd = -1;
@@ -638,8 +707,19 @@ int links_download_file(const char *url, const char *outfile) {
 
             if (!headers_done) {
                 size_t copy_len = (size_t)r;
-                if (hdr_len + copy_len >= hdr_cap) {
-                    copy_len = hdr_cap - 1 - hdr_len;
+                if (hdr_len + copy_len + 1u > hdr_cap) {
+                    size_t nc = hdr_cap * 2u;
+                    while (nc < hdr_len + copy_len + 1u) {
+                        if (nc > SIZE_MAX / 2u) { nc = hdr_len + copy_len + 1u; break; }
+                        nc *= 2u;
+                    }
+                    char *nh = (char *)realloc(hdr_buf, nc);
+                    if (nh) {
+                        hdr_buf = nh;
+                        hdr_cap = nc;
+                    } else {
+                        copy_len = hdr_cap - 1u - hdr_len;
+                    }
                 }
                 if (copy_len > 0) {
                     memcpy(hdr_buf + hdr_len, buf, copy_len);
@@ -665,22 +745,24 @@ int links_download_file(const char *url, const char *outfile) {
                             while (*loc == ' ' || *loc == '\t') loc++;
                             const char *eol = strpbrk(loc, "\r\n");
                             size_t llen = eol ? (size_t)(eol - loc) : strlen(loc);
-                            if (llen > 0 && llen < sizeof(redirect_url)) {
+                            if (llen > 0) {
                                 if (strncmp(loc, "http://", 7) == 0 || strncmp(loc, "https://", 8) == 0) {
-                                    memcpy(redirect_url, loc, llen);
-                                    redirect_url[llen] = '\0';
-                                } else if (loc[0] == '/' && llen + 256 < sizeof(redirect_url)) {
-                                    char tmp[768];
-                                    if (llen >= sizeof(tmp)) llen = sizeof(tmp) - 1;
-                                    memcpy(tmp, loc, llen);
-                                    tmp[llen] = '\0';
-                                    snprintf(redirect_url, sizeof(redirect_url), "%s://%s%s",
-                                             is_https ? "https" : "http", host, tmp);
+                                    redirect_url = (char *)malloc(llen + 1u);
+                                    if (redirect_url) {
+                                        memcpy(redirect_url, loc, llen);
+                                        redirect_url[llen] = '\0';
+                                    }
+                                } else if (loc[0] == '/') {
+                                    redirect_url = vp_fmt_alloc("%s://%s%.*s",
+                                                                is_https ? "https" : "http",
+                                                                host, (int)llen, loc);
                                 }
-                                if (redirect_url[0]) {
+                                if (redirect_url && redirect_url[0]) {
                                     redirect = true;
                                     break;
                                 }
+                                free(redirect_url);
+                                redirect_url = NULL;
                             }
                         }
                     }
@@ -694,6 +776,10 @@ int links_download_file(const char *url, const char *outfile) {
                         free(buf);
                         if (is_https) { SSL_free(ssl); SSL_CTX_free(ssl_ctx); }
                         close(sock);
+                        free(host); free(path);
+                        for (size_t si = 0; si < n_seen; si++) free(seen_urls[si]);
+                        free(seen_urls);
+                        free(cur_url);
                         return -1;
                     }
 
@@ -733,22 +819,31 @@ int links_download_file(const char *url, const char *outfile) {
         }
         close(sock);
 
-        if (redirect && redirect_url[0]) {
+        if (redirect && redirect_url) {
             printf("[Download] HTTP %d Redirect -> %s\n", status_code, redirect_url);
-            snprintf(cur_url, sizeof(cur_url), "%s", redirect_url);
+            free(cur_url);
+            cur_url = redirect_url;
+            free(host); free(path);
             continue;
         }
 
         final_bytes = writer.total_written;
         if (!headers_done) {
             printf("[Error] No valid HTTP response headers received from %s\n", host);
-            return -1;
+            free(host); free(path);
+            break;
         }
+        free(host); free(path);
+        for (size_t si = 0; si < n_seen; si++) free(seen_urls[si]);
+        free(seen_urls);
+        free(cur_url);
         printf("\n[Success] HTTP %d Download complete: %ld bytes written to %s\n",
                status_code, (long)final_bytes, dest);
         return 0;
     }
 
-    printf("[Error] Too many redirects downloading %s\n", url);
+    for (size_t si = 0; si < n_seen; si++) free(seen_urls[si]);
+    free(seen_urls);
+    free(cur_url);
     return -1;
 }

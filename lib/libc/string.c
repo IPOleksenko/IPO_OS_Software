@@ -2,6 +2,9 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <ctype.h>
+#include <errno.h>
+#include <pthread.h>
+#include "ipo_libc_internal.h"
 
 void *memcpy(void *dest, const void *src, size_t n) {
     uint8_t *d = (uint8_t *)dest;
@@ -230,8 +233,7 @@ char *strtok_r(char *str, const char *delim, char **saveptr) {
 }
 
 char *strtok(char *str, const char *delim) {
-    static char *last = NULL;
-    return strtok_r(str, delim, &last);
+    return strtok_r(str, delim, &ipo_libc_get_tcb()->strtok_last);
 }
 
 char *strdup(const char *s) {
@@ -259,17 +261,73 @@ char *strndup(const char *s, size_t n) {
 char *strerror(int errnum) {
     switch (errnum) {
         case 0: return "Success";
-        case 1: return "Operation not permitted";
-        case 2: return "No such file or directory";
-        case 5: return "Input/output error";
-        case 12: return "Cannot allocate memory";
-        case 13: return "Permission denied";
-        case 17: return "File exists";
-        case 22: return "Invalid argument";
-        case 28: return "No space left on device";
-        case 38: return "Function not implemented";
+        case EPERM: return "Operation not permitted";
+        case ENOENT: return "No such file or directory";
+        case ESRCH: return "No such process";
+        case EINTR: return "Interrupted system call";
+        case EIO: return "Input/output error";
+        case ENXIO: return "No such device or address";
+        case E2BIG: return "Argument list too long";
+        case ENOEXEC: return "Exec format error";
+        case EBADF: return "Bad file descriptor";
+        case ECHILD: return "No child processes";
+        case EAGAIN: return "Resource temporarily unavailable";
+        case ENOMEM: return "Cannot allocate memory";
+        case EACCES: return "Permission denied";
+        case EFAULT: return "Bad address";
+        case EBUSY: return "Device or resource busy";
+        case EEXIST: return "File exists";
+        case EXDEV: return "Invalid cross-device link";
+        case ENODEV: return "No such device";
+        case ENOTDIR: return "Not a directory";
+        case EISDIR: return "Is a directory";
+        case EINVAL: return "Invalid argument";
+        case ENFILE: return "Too many open files in system";
+        case EMFILE: return "Too many open files";
+        case ENOTTY: return "Inappropriate ioctl for device";
+        case EFBIG: return "File too large";
+        case ENOSPC: return "No space left on device";
+        case ESPIPE: return "Illegal seek";
+        case EROFS: return "Read-only file system";
+        case EMLINK: return "Too many links";
+        case EPIPE: return "Broken pipe";
+        case EDOM: return "Numerical argument out of domain";
+        case ERANGE: return "Numerical result out of range";
+        case EDEADLK: return "Resource deadlock avoided";
+        case ENAMETOOLONG: return "File name too long";
+        case ENOSYS: return "Function not implemented";
+        case ENOTEMPTY: return "Directory not empty";
+        case ELOOP: return "Too many levels of symbolic links";
+        case EOVERFLOW: return "Value too large for defined data type";
+        case ECANCELED: return "Operation canceled";
+        case ENOTSOCK: return "Socket operation on non-socket";
+        case EOPNOTSUPP: return "Operation not supported";
+        case EAFNOSUPPORT: return "Address family not supported by protocol";
+        case EADDRINUSE: return "Address already in use";
+        case EADDRNOTAVAIL: return "Cannot assign requested address";
+        case ENETUNREACH: return "Network is unreachable";
+        case ECONNRESET: return "Connection reset by peer";
+        case ENOBUFS: return "No buffer space available";
+        case EISCONN: return "Transport endpoint is already connected";
+        case ENOTCONN: return "Transport endpoint is not connected";
+        case ETIMEDOUT: return "Connection timed out";
+        case ECONNREFUSED: return "Connection refused";
+        case EINPROGRESS: return "Operation now in progress";
         default: return "Unknown error";
     }
+}
+
+int strerror_r(int errnum, char *buf, size_t buflen) {
+    if (!buf || buflen == 0u) return EINVAL;
+    const char *msg = strerror(errnum);
+    size_t len = strlen(msg);
+    if (len >= buflen) {
+        memcpy(buf, msg, buflen - 1u);
+        buf[buflen - 1u] = '\0';
+        return ERANGE;
+    }
+    memcpy(buf, msg, len + 1u);
+    return 0;
 }
 
 int strcoll(const char *s1, const char *s2) {
@@ -388,10 +446,12 @@ size_t strnlen(const char *s, size_t maxlen) {
 static int32_t *toupper_table = NULL;
 static int32_t *tolower_table = NULL;
 static unsigned short *ctype_b_table = NULL;
-static int ctype_tables_initialized = 0;
+static const int32_t *s_toupper_loc = NULL;
+static const int32_t *s_tolower_loc = NULL;
+static const unsigned short *s_ctype_b_loc = NULL;
+static pthread_once_t s_ctype_once = PTHREAD_ONCE_INIT;
 
 static void init_ctype_tables(void) {
-    if (ctype_tables_initialized) return;
     toupper_table = (int32_t *)malloc(384 * sizeof(int32_t));
     tolower_table = (int32_t *)malloc(384 * sizeof(int32_t));
     ctype_b_table = (unsigned short *)malloc(384 * sizeof(unsigned short));
@@ -423,26 +483,22 @@ static void init_ctype_tables(void) {
         if ((mask & 0x0400) || (mask & 0x0800)) mask |= 0x0008;
         ctype_b_table[i] = mask;
     }
-    ctype_tables_initialized = 1;
+    s_toupper_loc = &toupper_table[128];
+    s_tolower_loc = &tolower_table[128];
+    s_ctype_b_loc = &ctype_b_table[128];
 }
 
 const int32_t **__ctype_toupper_loc(void) {
-    init_ctype_tables();
-    static const int32_t *p = NULL;
-    if (toupper_table) p = &toupper_table[128];
-    return &p;
+    pthread_once(&s_ctype_once, init_ctype_tables);
+    return &s_toupper_loc;
 }
 
 const int32_t **__ctype_tolower_loc(void) {
-    init_ctype_tables();
-    static const int32_t *p = NULL;
-    if (tolower_table) p = &tolower_table[128];
-    return &p;
+    pthread_once(&s_ctype_once, init_ctype_tables);
+    return &s_tolower_loc;
 }
 
 const unsigned short **__ctype_b_loc(void) {
-    init_ctype_tables();
-    static const unsigned short *p = NULL;
-    if (ctype_b_table) p = &ctype_b_table[128];
-    return &p;
+    pthread_once(&s_ctype_once, init_ctype_tables);
+    return &s_ctype_b_loc;
 }

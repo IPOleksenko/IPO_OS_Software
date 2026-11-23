@@ -6,13 +6,28 @@ namespace std {
 class exception {
 public:
     exception() noexcept {}
-    virtual ~exception() noexcept {}
-    virtual const char* what() const noexcept {
-        return "std::exception";
-    }
+    exception(const exception&) noexcept = default;
+    exception& operator=(const exception&) noexcept = default;
+    virtual ~exception() noexcept;
+    virtual const char* what() const noexcept;
 };
+
+class bad_exception : public exception {
+public:
+    bad_exception() noexcept {}
+    virtual ~bad_exception() noexcept;
+    virtual const char* what() const noexcept override;
+};
+
+typedef void (*terminate_handler)();
+
+terminate_handler set_terminate(terminate_handler f) noexcept;
+terminate_handler get_terminate() noexcept;
+[[noreturn]] void terminate() noexcept;
+
+bool uncaught_exception() noexcept;
+int uncaught_exceptions() noexcept;
 
 } // namespace std
 
 #endif
-

@@ -186,7 +186,7 @@ static int gp_on_command(const char *cmd, int argc, char **argv) {
     return 0;
 }
 
-static int gp_read(void *buf, size_t size, uint32_t offset) {
+static int gp_read(void *buf, size_t size, uint64_t offset) {
     (void)offset;
     if (!buf || size < sizeof(uint32_t)) return -1;
     memcpy(buf, &s_btn_mask, sizeof(s_btn_mask));

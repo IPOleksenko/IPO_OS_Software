@@ -2,13 +2,46 @@
 #define _CPP_NEW_H
 
 #include <stddef.h>
+#include <exception>
+
+namespace std {
+
+struct nothrow_t {
+    explicit nothrow_t() = default;
+};
+extern const nothrow_t nothrow;
+
+class bad_alloc : public exception {
+public:
+    bad_alloc() noexcept {}
+    virtual ~bad_alloc() noexcept;
+    virtual const char* what() const noexcept override;
+};
+
+class bad_array_new_length : public bad_alloc {
+public:
+    bad_array_new_length() noexcept {}
+    virtual ~bad_array_new_length() noexcept;
+    virtual const char* what() const noexcept override;
+};
+
+typedef void (*new_handler)();
+new_handler set_new_handler(new_handler handler) noexcept;
+new_handler get_new_handler() noexcept;
+
+} // namespace std
 
 void* operator new(size_t size);
 void* operator new[](size_t size);
+void* operator new(size_t size, const std::nothrow_t&) noexcept;
+void* operator new[](size_t size, const std::nothrow_t&) noexcept;
+
 void operator delete(void* ptr) noexcept;
 void operator delete[](void* ptr) noexcept;
 void operator delete(void* ptr, size_t size) noexcept;
 void operator delete[](void* ptr, size_t size) noexcept;
+void operator delete(void* ptr, const std::nothrow_t&) noexcept;
+void operator delete[](void* ptr, const std::nothrow_t&) noexcept;
 
 inline void* operator new(size_t size, void* ptr) noexcept {
     (void)size;
@@ -29,4 +62,3 @@ inline void operator delete[](void* ptr, void* place) noexcept {
 }
 
 #endif
-

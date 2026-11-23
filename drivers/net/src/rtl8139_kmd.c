@@ -1,6 +1,9 @@
 #include <driver/net/rtl8139.h>
+#include <driver/net/nic_ops.h>
 #include <driver/net/pci.h>
+#include <net/ethernet.h>
 #include <net/net.h>
+#include <net/net_lock.h>
 #include <net/net_state.h>
 #include <net/dns.h>
 #include <net/icmp.h>
@@ -44,10 +47,14 @@ static uint32_t kmd_sys_net_dns_resolve(uint32_t num, uint32_t argc, uint32_t *a
     uint32_t retry_interval_ms = (argc >= 5u) ? argv[4] : 0u;
 
     ip4_addr_t resolved_ip = 0u;
+    net_lock_acquire();
     bool ok = dns_resolve_ex(hostname, &resolved_ip, timeout_ms, max_retries, retry_interval_ms);
+    net_lock_release();
     kfree(hostname);
     if (!ok) return 0u;
-    *(ip4_addr_t *)(uintptr_t)argv[1] = resolved_ip;
+    ip4_addr_t *user_out = (ip4_addr_t *)(uintptr_t)argv[1];
+    if (!ipo_syscall_user_buf_ok(user_out, sizeof(ip4_addr_t))) return 0u;
+    *user_out = resolved_ip;
     return 1u;
 }
 
@@ -58,22 +65,38 @@ static uint32_t kmd_sys_net_icmp_send(uint32_t num, uint32_t argc, uint32_t *arg
     }
     const void *data = (const void *)(uintptr_t)argv[4];
     if (!ipo_syscall_user_buf_ok(data, argv[5])) return (uint32_t)-1;
-    return (uint32_t)icmp_send_echo(argv[0], (uint16_t)argv[1], (uint16_t)argv[2],
-                                    (uint8_t)argv[3], data, (uint16_t)argv[5]);
+    void *copy = (argv[5] > 0u) ? kmalloc(argv[5]) : NULL;
+    if (argv[5] > 0u && !copy) return (uint32_t)-1;
+    if (copy) memcpy(copy, data, argv[5]);
+    net_lock_acquire();
+    int rc = icmp_send_echo(argv[0], (uint16_t)argv[1], (uint16_t)argv[2],
+                            (uint8_t)argv[3], copy, (uint16_t)argv[5]);
+    net_lock_release();
+    if (copy) kfree(copy);
+    return (uint32_t)rc;
 }
 
 static uint32_t kmd_sys_net_icmp_poll(uint32_t num, uint32_t argc, uint32_t *argv) {
     (void)num;
     if (argc < 4u || !argv || !argv[2]) return 0u;
-    icmp_echo_reply_t *reply = (icmp_echo_reply_t *)(uintptr_t)argv[2];
-    if (!ipo_syscall_user_buf_ok(reply, sizeof(*reply))) return 0u;
-    return icmp_poll_reply((uint16_t)argv[0], (uint16_t)argv[1], reply, argv[3]) ? 1u : 0u;
+    icmp_echo_reply_t *user_reply = (icmp_echo_reply_t *)(uintptr_t)argv[2];
+    if (!ipo_syscall_user_buf_ok(user_reply, sizeof(*user_reply))) return 0u;
+    icmp_echo_reply_t reply_tmp;
+    net_lock_acquire();
+    bool ok = icmp_poll_reply((uint16_t)argv[0], (uint16_t)argv[1], &reply_tmp, argv[3]);
+    net_lock_release();
+    if (!ok) return 0u;
+    memcpy(user_reply, &reply_tmp, sizeof(reply_tmp));
+    return 1u;
 }
 
 static uint32_t kmd_sys_net_socket(uint32_t num, uint32_t argc, uint32_t *argv) {
     (void)num;
     if (argc < 3u || !argv) return (uint32_t)-1;
-    return (uint32_t)socket((int)argv[0], (int)argv[1], (int)argv[2]);
+    net_lock_acquire();
+    int fd = socket((int)argv[0], (int)argv[1], (int)argv[2]);
+    net_lock_release();
+    return (uint32_t)fd;
 }
 
 static uint32_t kmd_sys_net_bind(uint32_t num, uint32_t argc, uint32_t *argv) {
@@ -83,13 +106,19 @@ static uint32_t kmd_sys_net_bind(uint32_t num, uint32_t argc, uint32_t *argv) {
     if (!ipo_syscall_user_buf_ok(user_addr, sizeof(struct sockaddr_in))) return (uint32_t)-1;
     struct sockaddr_in address;
     memcpy(&address, user_addr, sizeof(address));
-    return (uint32_t)bind((int)argv[0], (const struct sockaddr *)&address, sizeof(address));
+    net_lock_acquire();
+    int rc = bind((int)argv[0], (const struct sockaddr *)&address, sizeof(address));
+    net_lock_release();
+    return (uint32_t)rc;
 }
 
 static uint32_t kmd_sys_net_listen(uint32_t num, uint32_t argc, uint32_t *argv) {
     (void)num;
     if (argc < 2u || !argv) return (uint32_t)-1;
-    return (uint32_t)listen((int)argv[0], (int)argv[1]);
+    net_lock_acquire();
+    int rc = listen((int)argv[0], (int)argv[1]);
+    net_lock_release();
+    return (uint32_t)rc;
 }
 
 static uint32_t kmd_sys_net_accept(uint32_t num, uint32_t argc, uint32_t *argv) {
@@ -99,10 +128,12 @@ static uint32_t kmd_sys_net_accept(uint32_t num, uint32_t argc, uint32_t *argv) 
     if (argv[2] && !ipo_syscall_user_buf_ok((void *)(uintptr_t)argv[2], sizeof(socklen_t))) return (uint32_t)-1;
     struct sockaddr_in address;
     socklen_t address_len = sizeof(address);
+    net_lock_acquire();
     int client_fd = accept_timeout((int)argv[0],
                                    argv[1] ? (struct sockaddr *)&address : NULL,
                                    argv[1] ? &address_len : NULL,
                                    argv[3]);
+    net_lock_release();
     if (client_fd >= 0 && argv[1]) {
         memcpy((void *)(uintptr_t)argv[1], &address, sizeof(address));
         if (argv[2]) *(socklen_t *)(uintptr_t)argv[2] = address_len;
@@ -117,7 +148,10 @@ static uint32_t kmd_sys_net_connect(uint32_t num, uint32_t argc, uint32_t *argv)
     if (!ipo_syscall_user_buf_ok(user_addr, sizeof(struct sockaddr_in))) return (uint32_t)-1;
     struct sockaddr_in address;
     memcpy(&address, user_addr, sizeof(address));
-    return (uint32_t)connect((int)argv[0], (const struct sockaddr *)&address, sizeof(address));
+    net_lock_acquire();
+    int rc = connect((int)argv[0], (const struct sockaddr *)&address, sizeof(address));
+    net_lock_release();
+    return (uint32_t)rc;
 }
 
 static uint32_t kmd_sys_net_connect_endpoint(uint32_t num, uint32_t argc, uint32_t *argv) {
@@ -129,7 +163,9 @@ static uint32_t kmd_sys_net_connect_endpoint(uint32_t num, uint32_t argc, uint32
     char *host = (char *)kmalloc(host_len + 1u);
     if (!host) return (uint32_t)-1;
     memcpy(host, user_host, host_len + 1u);
+    net_lock_acquire();
     uint32_t ret = (uint32_t)connect_endpoint((int)argv[0], host, (uint16_t)argv[2]);
+    net_lock_release();
     kfree(host);
     return ret;
 }
@@ -142,7 +178,9 @@ static uint32_t kmd_sys_net_send(uint32_t num, uint32_t argc, uint32_t *argv) {
     void *buffer = kmalloc(argv[2]);
     if (!buffer) return (uint32_t)-1;
     memcpy(buffer, user_buf, argv[2]);
+    net_lock_acquire();
     ssize_t result = send((int)argv[0], buffer, argv[2], (int)argv[3]);
+    net_lock_release();
     kfree(buffer);
     return (uint32_t)result;
 }
@@ -154,7 +192,9 @@ static uint32_t kmd_sys_net_recv(uint32_t num, uint32_t argc, uint32_t *argv) {
     if (!ipo_syscall_user_buf_ok(user_buf, argv[2])) return (uint32_t)-1;
     void *buffer = kmalloc(argv[2]);
     if (!buffer) return (uint32_t)-1;
+    net_lock_acquire();
     ssize_t result = recv((int)argv[0], buffer, argv[2], (int)argv[3]);
+    net_lock_release();
     if (result > 0) memcpy(user_buf, buffer, (size_t)result);
     kfree(buffer);
     return (uint32_t)result;
@@ -163,35 +203,51 @@ static uint32_t kmd_sys_net_recv(uint32_t num, uint32_t argc, uint32_t *argv) {
 static uint32_t kmd_sys_net_close(uint32_t num, uint32_t argc, uint32_t *argv) {
     (void)num;
     if (argc < 1u || !argv) return (uint32_t)-1;
-    return (uint32_t)socket_close((int)argv[0]);
+    net_lock_acquire();
+    int rc = socket_close((int)argv[0]);
+    net_lock_release();
+    return (uint32_t)rc;
 }
 
 static uint32_t kmd_sys_net_poll(uint32_t num, uint32_t argc, uint32_t *argv) {
     (void)num; (void)argc; (void)argv;
+    net_lock_acquire();
     net_poll();
+    net_lock_release();
     return 0u;
 }
 
 static uint32_t kmd_sys_net_get_interface(uint32_t num, uint32_t argc, uint32_t *argv) {
     (void)num;
     if (argc < 1u || !argv || !argv[0]) return 0u;
-    net_if_t *netif = net_get_interface();
-    if (!netif) return 0u;
     net_if_t *out = (net_if_t *)(uintptr_t)argv[0];
     if (!ipo_syscall_user_buf_ok(out, sizeof(*out))) return 0u;
-    memcpy(out, netif, sizeof(*netif));
+    net_lock_acquire();
+    net_if_t *netif = net_get_interface();
+    if (!netif) {
+        net_lock_release();
+        return 0u;
+    }
+    net_if_t tmp = *netif;
+    net_lock_release();
+    memcpy(out, &tmp, sizeof(tmp));
     return 1u;
 }
 
 static uint32_t kmd_sys_net_init(uint32_t num, uint32_t argc, uint32_t *argv) {
     (void)num; (void)argc; (void)argv;
-    return net_init() ? 1u : 0u;
+    net_lock_acquire();
+    bool ok = net_init();
+    net_lock_release();
+    return ok ? 1u : 0u;
 }
 
 static uint32_t kmd_sys_net_set_ip(uint32_t num, uint32_t argc, uint32_t *argv) {
     (void)num;
     if (argc < 4u || !argv) return (uint32_t)-1;
+    net_lock_acquire();
     net_set_ip(argv[0], argv[1], argv[2], argv[3]);
+    net_lock_release();
     return 0u;
 }
 
@@ -240,42 +296,73 @@ static void unregister_net_syscalls(void) {
 static int rtl_chan_tx(const void *frame, uint32_t len, void *priv) {
     (void)priv;
     if (len > 0xFFFFu) return -1;
-    return rtl8139_send_packet(frame, (uint16_t)len);
+    net_lock_acquire();
+    int rc = rtl8139_send_packet(frame, (uint16_t)len);
+    net_lock_release();
+    return rc;
 }
+
+static uint16_t s_bound_vid = 0u;
+static uint16_t s_bound_did = 0u;
+static uint8_t  s_bound_bus = 0u;
+static uint8_t  s_bound_slot = 0u;
+static uint8_t  s_bound_func = 0u;
+static bool     s_bound_valid = false;
 
 static int rtl_chan_rx(void *buf, uint32_t max_len, void *priv) {
     (void)priv;
-    return rtl8139_receive_packet(buf, max_len);
+    net_lock_acquire();
+    int got = rtl8139_receive_packet(buf, max_len);
+    if (got > 0 && got <= 65535 && net_get_interface() != NULL) {
+        eth_receive(buf, (uint16_t)got);
+    }
+    net_lock_release();
+    return got;
 }
 
 static int rtl_chan_peek(void *priv) {
     (void)priv;
-    return rtl8139_peek_packet_size();
+    net_lock_acquire();
+    int rc = rtl8139_peek_packet_size();
+    net_lock_release();
+    return rc;
 }
 
 static bool rtl_chan_link_up(void *priv) {
     (void)priv;
-    return rtl8139_is_link_up();
+    net_lock_acquire();
+    bool up = rtl8139_is_link_up();
+    net_lock_release();
+    return up;
 }
 
 static int rtl_ext_invoke(uint32_t op, uintptr_t a0, uintptr_t a1,
                           uintptr_t a2, uintptr_t a3, void *priv) {
     (void)priv;
+    int rc = -1;
+    net_lock_acquire();
     switch (op) {
         case 0u: /* Query link status */
-            return rtl8139_is_link_up() ? 1 : 0;
+            rc = rtl8139_is_link_up() ? 1 : 0;
+            break;
         case 1u: { /* Query IPv4 address */
             net_if_t *nif = net_get_interface();
-            return nif ? (int)nif->ip : 0;
+            rc = nif ? (int)nif->ip : 0;
+            break;
         }
         case 2u: /* Send raw Ethernet frame */
-            return rtl8139_send_packet((const void *)a0, (uint16_t)a1);
+            rc = rtl8139_send_packet((const void *)a0, (uint16_t)a1);
+            break;
         case 3u: /* Set IPv4 config */
             net_set_ip((ip4_addr_t)a0, (ip4_addr_t)a1, (ip4_addr_t)a2, (ip4_addr_t)a3);
-            return 0;
+            rc = 0;
+            break;
         default:
-            return -1;
+            rc = -1;
+            break;
     }
+    net_lock_release();
+    return rc;
 }
 
 /* ============================================================================
@@ -283,7 +370,9 @@ static int rtl_ext_invoke(uint32_t op, uintptr_t a0, uintptr_t a1,
  * ============================================================================ */
 
 static void rtl8139_kmd_tick(void) {
+    if (!net_lock_trylock()) return;
     net_poll();
+    net_lock_release();
 }
 
 static int rtl8139_kmd_command(const char *cmd, int argc, char **argv) {
@@ -294,8 +383,10 @@ static int rtl8139_kmd_command(const char *cmd, int argc, char **argv) {
         return 0;
     }
 
+    net_lock_acquire();
     net_if_t *netif = net_get_interface();
     if (!netif) {
+        net_lock_release();
         printf("ifconfig: no network interface available\n");
         return 0;
     }
@@ -307,25 +398,32 @@ static int rtl8139_kmd_command(const char *cmd, int argc, char **argv) {
         ip4_addr_t new_dns = netif->dns;
 
         if (!str_to_ip(argv[1], &new_ip)) {
+            net_lock_release();
             printf("ifconfig: invalid IP address '%s'\n", argv[1]);
             return 0;
         }
         if (argc >= 3 && !str_to_ip(argv[2], &new_mask)) {
+            net_lock_release();
             printf("ifconfig: invalid netmask '%s'\n", argv[2]);
             return 0;
         }
         if (argc >= 4 && !str_to_ip(argv[3], &new_gw)) {
+            net_lock_release();
             printf("ifconfig: invalid gateway '%s'\n", argv[3]);
             return 0;
         }
         if (argc >= 5 && !str_to_ip(argv[4], &new_dns)) {
+            net_lock_release();
             printf("ifconfig: invalid DNS '%s'\n", argv[4]);
             return 0;
         }
 
         net_set_ip(new_ip, new_mask, new_gw, new_dns);
         netif = net_get_interface();
-        if (!netif) return 0;
+        if (!netif) {
+            net_lock_release();
+            return 0;
+        }
         printf("[ifconfig] Network settings updated.\n");
     }
 
@@ -334,14 +432,17 @@ static int rtl8139_kmd_command(const char *cmd, int argc, char **argv) {
     char *gw_str   = ip_to_str_dyn(netif->gateway);
     char *dns_str  = ip_to_str_dyn(netif->dns);
     char *mac_str  = mac_format_dyn(&netif->mac);
+    bool link_up   = netif->link_up;
+    const char *drv_name = nic_get_driver_name();
+    net_lock_release();
 
     ipo_chan_info_t cinfo;
     memset(&cinfo, 0, sizeof(cinfo));
     bool has_chan = (g_rtl8139_chan_id != 0u && ipo_chan_get_info(g_rtl8139_chan_id, &cinfo) == 0);
     uint32_t mtu = (has_chan && cinfo.mtu > 0u) ? cinfo.mtu : 1500u;
 
-    printf("eth0: flags=%s  mtu %u  (rtl8139.kmd)\n",
-           netif->link_up ? "UP,RUNNING" : "DOWN", mtu);
+    printf("eth0: flags=%s  mtu %u  (%s / rtl8139.kmd)\n",
+           link_up ? "UP,RUNNING" : "DOWN", mtu, drv_name);
     printf("        inet %s  netmask %s\n",
            ip_str ? ip_str : "0.0.0.0",
            mask_str ? mask_str : "0.0.0.0");
@@ -365,12 +466,31 @@ static int rtl8139_kmd_command(const char *cmd, int argc, char **argv) {
 }
 
 static void update_pci_network_device_binding(bool attached) {
+    uint16_t target_vid = attached ? rtl8139_get_vendor_id() : s_bound_vid;
+    uint16_t target_did = attached ? rtl8139_get_device_id() : s_bound_did;
+    uint8_t  target_bus = attached ? rtl8139_get_bus()       : s_bound_bus;
+    uint8_t  target_slt = attached ? rtl8139_get_slot()      : s_bound_slot;
+    uint8_t  target_fn  = attached ? rtl8139_get_func()      : s_bound_func;
+
+    if (attached) {
+        s_bound_vid = target_vid;
+        s_bound_did = target_did;
+        s_bound_bus = target_bus;
+        s_bound_slot = target_slt;
+        s_bound_func = target_fn;
+        s_bound_valid = (target_vid != 0u && target_did != 0u);
+    } else if (!s_bound_valid) {
+        return;
+    }
+
     const device_node_t *curr = device_get_list();
     while (curr) {
         if (curr->type == DEVICE_TYPE_NETWORK &&
-            curr->res.vendor_id == 0x10ECu && curr->res.device_id == 0x8139u) {
+            curr->res.vendor_id == target_vid && curr->res.device_id == target_did &&
+            curr->res.pci_bus == target_bus && curr->res.pci_slot == target_slt &&
+            curr->res.pci_func == target_fn) {
             if (attached) {
-                device_set_driver(curr->id, "rtl8139", &s_rtl8139_drv);
+                device_set_driver(curr->id, nic_get_driver_name(), &s_rtl8139_drv);
                 device_set_state(curr->id, DEVICE_STATE_ACTIVE);
             } else {
                 device_set_driver(curr->id, "", NULL);
@@ -378,6 +498,9 @@ static void update_pci_network_device_binding(bool attached) {
             }
         }
         curr = curr->next;
+    }
+    if (!attached) {
+        s_bound_valid = false;
     }
 }
 
@@ -389,7 +512,7 @@ int kmd_main_init(void) {
 
     if (!rtl8139_is_present()) {
         net_shutdown();
-        printf("[rtl8139.kmd] Error: RTL8139 hardware not present or failed initialization\n");
+        printf("[rtl8139.kmd] Error: No supported NIC hardware (RTL8139/E1000/VirtIO-Net) present or failed initialization\n");
         return -2;
     }
 
@@ -426,7 +549,7 @@ int kmd_main_init(void) {
     /* Register driver descriptor (continuous polling tick + dynamic ifconfig hook) */
     memset(&s_rtl8139_drv, 0, sizeof(s_rtl8139_drv));
     s_rtl8139_drv.name        = "rtl8139";
-    s_rtl8139_drv.description = "Realtek RTL8139 PCI NIC + Modular Network Stack (eth0)";
+    s_rtl8139_drv.description = "Multi-NIC PCI Driver (RTL8139/E1000/VirtIO-Net) + Modular Network Stack (eth0)";
     s_rtl8139_drv.flags       = DRIVER_FLAG_KERNEL | DRIVER_FLAG_ACTIVE | DRIVER_FLAG_CONTINUOUS_TICK;
     s_rtl8139_drv.on_tick     = rtl8139_kmd_tick;
     s_rtl8139_drv.on_command  = rtl8139_kmd_command;
@@ -435,8 +558,8 @@ int kmd_main_init(void) {
     update_pci_network_device_binding(true);
     async_start_task("rtl8139_poll", 10u, rtl8139_kmd_tick);
 
-    printf("[rtl8139.kmd] Network driver and modular stack registered (chan_id=%u, ext_id=%u)\n",
-           g_rtl8139_chan_id, s_rtl8139_ext_id);
+    printf("[rtl8139.kmd] Network driver (%s) and modular stack registered (chan_id=%u, ext_id=%u)\n",
+           nic_get_driver_name(), g_rtl8139_chan_id, s_rtl8139_ext_id);
     return 0;
 }
 

@@ -7,6 +7,19 @@
 
 #define CLOCKS_PER_SEC 1000UL
 
+#ifndef CLOCK_REALTIME
+#define CLOCK_REALTIME  0
+#define CLOCK_MONOTONIC 1
+#endif
+
+#ifndef _TIMESPEC_DEFINED
+#define _TIMESPEC_DEFINED
+struct timespec {
+    long tv_sec;
+    long tv_nsec;
+};
+#endif
+
 struct tm {
     int tm_sec;
     int tm_min;
@@ -33,8 +46,12 @@ struct tm *gmtime(const time_t *timep);
 struct tm *localtime_r(const time_t *timep, struct tm *result);
 struct tm *gmtime_r(const time_t *timep, struct tm *result);
 char *asctime(const struct tm *timeptr);
+char *asctime_r(const struct tm *timeptr, char *buf);
 char *ctime(const time_t *timep);
+char *ctime_r(const time_t *timep, char *buf);
 size_t strftime(char *s, size_t max, const char *format, const struct tm *tm);
+int clock_gettime(int clk_id, struct timespec *tp);
+int nanosleep(const struct timespec *req, struct timespec *rem);
 
 #ifdef __cplusplus
 }

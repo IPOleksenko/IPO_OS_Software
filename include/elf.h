@@ -107,8 +107,11 @@ typedef struct {
 #define SHT_NOTE     7
 #define SHT_NOBITS   8
 #define SHT_REL      9
-#define SHT_SHLIB    10
-#define SHT_DYNSYM   11
+#define SHT_SHLIB         10
+#define SHT_DYNSYM        11
+#define SHT_INIT_ARRAY    14
+#define SHT_FINI_ARRAY    15
+#define SHT_PREINIT_ARRAY 16
 
 #define SHF_WRITE     0x1
 #define SHF_ALLOC     0x2
